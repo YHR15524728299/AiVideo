@@ -1,0 +1,9 @@
+edge-tts<8,>=7.0
+Pillow<12,>=10.4
+pydantic<3,>=2.7
+PyYAML<7,>=6.0
+python-dotenv<2,>=1.0
+
+[dev]
+pytest<9,>=8.2
+pytest-cov<6,>=5

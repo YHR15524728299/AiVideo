@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.env
+data/*.db
+data/cache/
+data/openrouter_cache/
+data/dreamina_cache/
+outputs/
+workspaces/
+*.log

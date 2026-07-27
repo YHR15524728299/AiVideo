@@ -17,8 +17,17 @@ from aicf.cache import FileCache
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 load_dotenv(os.path.join(_PROJECT_ROOT, ".env"), override=False)
 
-# 默认使用 OpenRouter 免费模型（强制 :free 后缀，优先中文支持好的模型）
-DEFAULT_FREE_MODEL = "tencent/hy3:free"
+# 默认使用 OpenRouter 免费模型（强制 :free 后缀，优先能力强的中文模型）
+DEFAULT_FREE_MODEL = "deepseek/deepseek-chat-v3-0324:free"
+_MODEL_VERIFY_CACHE: dict[str, tuple[float, bool]] = {}
+_MODEL_VERIFY_CACHE_TTL = 300.0  # 缓存 5 分钟
+
+
+class UpstreamRateLimitError(RuntimeError):
+    """OpenRouter 返回 200 但 body 中包含上游 5xx/限流错误，可重试。"""
+    def __init__(self, code: int, message: str) -> None:
+        self.upstream_code = code
+        super().__init__(f"上游错误 {code}: {message}")
 
 
 class OpenRouterHTTPError(RuntimeError):
@@ -126,7 +135,7 @@ class OpenRouterClient:
         model: str | None = None,
         cache: FileCache | None = None,
         *,
-        max_retries: int = 2,
+        max_retries: int = 4,
         timeout: float = 60.0,
         transport: Transport = _http_transport,
         model_catalog_transport: ModelCatalogTransport | None = None,
@@ -201,13 +210,29 @@ class OpenRouterClient:
         if self.site_url:
             headers["HTTP-Referer"] = self.site_url
 
-        response = self._request_with_fallback(headers, base_body, json_schema)
+        # 对 HTTP 200 但 body 含上游 5xx/限流错误的情况，增加退避重试
+        # （_request_with_retry 只处理 HTTP 状态码层面的错误）
+        max_attempts = self.max_retries + 1
+        for attempt in range(max_attempts):
+            try:
+                response = self._request_with_fallback(headers, base_body, json_schema)
+                break
+            except UpstreamRateLimitError:
+                if attempt >= self.max_retries:
+                    raise
+                wait = float(min(60, 5 * (2**attempt)))  # 5s, 10s, 20s, 40s... 上限 60s
+                self.sleep(wait)
+        else:
+            raise RuntimeError("OpenRouter 重试流程异常结束")
         choices = response.get("choices")
         if not isinstance(choices, list) or not choices:
             error_detail = response.get("error", {})
             if isinstance(error_detail, dict):
-                msg = error_detail.get("message", "")
-                code = error_detail.get("code", "")
+                msg = str(error_detail.get("message", ""))
+                code = error_detail.get("code")
+                # 上游返回 200 但 body 中包含 5xx/429 错误（如 Nvidia worker 限流），需要退避重试
+                if isinstance(code, int) and (code == 429 or code >= 500):
+                    raise UpstreamRateLimitError(code, msg)
                 raise ValueError(
                     f"OpenRouter 响应缺少 choices（模型: {self.model}，"
                     f"错误码: {code}，错误信息: {msg}）"
@@ -235,20 +260,47 @@ class OpenRouterClient:
         )
 
     def _verify_free_model_from_live_catalog(self) -> None:
+        # 先查缓存
+        cache_key = self.model
+        now = time.time()
+        cached = _MODEL_VERIFY_CACHE.get(cache_key)
+        if cached is not None:
+            ts, ok = cached
+            if ok and now - ts < _MODEL_VERIFY_CACHE_TTL:
+                return  # 缓存命中且未过期，直接放行
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Accept": "application/json",
         }
-        try:
-            payload = self.model_catalog_transport(
-                self.models_endpoint,
-                headers,
-                self.timeout,
-            )
-        except (HTTPError, URLError, TimeoutError, OSError, ValueError) as error:
-            raise ModelCatalogVerificationError(
-                "无法实时验证 OpenRouter 模型是否免费，M2 已阻断"
-            ) from error
+        # 模型目录请求也做重试（网络波动时避免整个流程中断）
+        max_catalog_attempts = 2
+        payload = None
+        last_error: Exception | None = None
+        for attempt in range(max_catalog_attempts):
+            try:
+                payload = self.model_catalog_transport(
+                    self.models_endpoint,
+                    headers,
+                    self.timeout,
+                )
+                break
+            except (HTTPError, URLError, TimeoutError, OSError, ValueError) as error:
+                last_error = error
+                if attempt < max_catalog_attempts - 1:
+                    self.sleep(2.0 * (attempt + 1))
+                    continue
+                # 获取目录失败时，如果缓存中曾经验证通过（即使过期），则放行并警告
+                if cached is not None and cached[1]:
+                    return
+                raise ModelCatalogVerificationError(
+                    "无法实时验证 OpenRouter 模型是否免费（网络请求失败），M2 已阻断"
+                ) from error
+        if payload is None:
+            if last_error:
+                raise ModelCatalogVerificationError(
+                    "无法实时验证 OpenRouter 模型是否免费，M2 已阻断"
+                ) from last_error
+            raise ModelCatalogVerificationError("获取模型目录返回空结果，M2 已阻断")
         models = payload.get("data")
         if not isinstance(models, list):
             raise ModelCatalogVerificationError(
@@ -263,29 +315,37 @@ class OpenRouterClient:
             None,
         )
         if selected is None:
+            # 模型不在目录中，清除缓存并报错
+            _MODEL_VERIFY_CACHE.pop(cache_key, None)
             raise ModelCatalogVerificationError(
                 f"模型 {self.model} 不在实时模型目录中，M2 已阻断"
             )
         pricing = selected.get("pricing")
         if not isinstance(pricing, dict):
+            _MODEL_VERIFY_CACHE.pop(cache_key, None)
             raise ModelCatalogVerificationError(
                 f"模型 {self.model} 缺少实时价格，无法证明免费，M2 已阻断"
             )
         required_prices = ("prompt", "completion")
         if any(field not in pricing for field in required_prices):
+            _MODEL_VERIFY_CACHE.pop(cache_key, None)
             raise ModelCatalogVerificationError(
                 f"模型 {self.model} 价格字段不完整，无法证明免费，M2 已阻断"
             )
         try:
             prices = [Decimal(str(value)) for value in pricing.values()]
         except (InvalidOperation, ValueError):
+            _MODEL_VERIFY_CACHE.pop(cache_key, None)
             raise ModelCatalogVerificationError(
                 f"模型 {self.model} 价格格式无效，无法证明免费，M2 已阻断"
             ) from None
         if not prices or any(price != 0 for price in prices):
+            _MODEL_VERIFY_CACHE.pop(cache_key, None)
             raise ModelCatalogVerificationError(
                 f"模型 {self.model} 不是免费模型，M2 已阻断"
             )
+        # 验证通过，写入缓存
+        _MODEL_VERIFY_CACHE[cache_key] = (now, True)
 
     def _request_with_fallback(
         self,
@@ -375,10 +435,12 @@ class OpenRouterClient:
                 retryable = error.code in {408, 409, 429} or error.code >= 500
                 if not retryable or attempt >= self.max_retries:
                     raise
-            except (URLError, TimeoutError):
+            except (URLError, TimeoutError, OSError):
                 if attempt >= self.max_retries:
                     raise
-            self.sleep(float(2**attempt))
+            # 指数退避：HTTP 错误用更长等待（5s, 10s, 20s, 40s），网络错误用短等待（2s, 4s, 8s）
+            wait = float(min(60, 5 * (2**attempt)))
+            self.sleep(wait)
         raise RuntimeError("OpenRouter 重试流程异常结束")
 
     @staticmethod

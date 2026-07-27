@@ -16,12 +16,14 @@ SupportedPlatform = Literal[
     "xiaohongshu",
     "youtube_shorts",
     "tiktok",
+    "youtube",
 ]
 SUPPORTED_PLATFORMS: tuple[SupportedPlatform, ...] = (
     "douyin",
     "xiaohongshu",
     "youtube_shorts",
     "tiktok",
+    "youtube",
 )
 NonBlankText = Annotated[
     str,
@@ -209,3 +211,4 @@ class PackageResult(BaseModel):
     xiaohongshu: PlatformCopy
     youtube_shorts: PlatformCopy
     tiktok: PlatformCopy
+    youtube: PlatformCopy | None = None

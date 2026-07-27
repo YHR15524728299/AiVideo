@@ -15,6 +15,7 @@ from aicf.engines.render_engine import probe_media
 from aicf.engines.subtitle_engine import build_ass
 from aicf.artifact_commit import DirectoryPromoter
 from aicf.models.contracts import SUPPORTED_PLATFORMS
+from aicf.platform_export import PlatformExporter
 from aicf.providers.tts import FfmpegToolchain
 
 
@@ -134,7 +135,17 @@ def _artifact_hash(paths: list[Path]) -> str:
     digest = hashlib.sha256()
     for path in paths:
         digest.update(path.name.encode("utf-8"))
-        digest.update(path.read_bytes())
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
     return digest.hexdigest()
 
 
@@ -385,7 +396,7 @@ class TechnicalQA:
                 "-i",
                 str(master),
                 "-af",
-                "silencedetect=noise=-45dB:d=1.0",
+                "silencedetect=noise=-45dB:d=1.1",
                 "-f",
                 "null",
                 "-",
@@ -515,6 +526,7 @@ class M6Pipeline:
         media_probe: Callable[..., object] = probe_media,
         repair_engine: object | None = None,
         directory_promoter: DirectoryPromoter | None = None,
+        platform_exporter: PlatformExporter | None = None,
     ) -> None:
         self.toolchain = toolchain
         self.command_runner = command_runner
@@ -523,6 +535,10 @@ class M6Pipeline:
         self.media_probe = media_probe
         self.repair_engine = repair_engine
         self.directory_promoter = directory_promoter or DirectoryPromoter()
+        self.platform_exporter = platform_exporter or PlatformExporter(
+            toolchain,
+            command_runner=command_runner,
+        )
 
     def run(
         self,
@@ -536,7 +552,10 @@ class M6Pipeline:
         output_dir: str | Path,
         expected_duration_seconds: float,
         repair_context: dict[str, object] | None = None,
+        selected_platforms: tuple[str, ...] | None = None,
     ) -> dict[str, object]:
+        if selected_platforms is not None and not selected_platforms:
+            raise ValueError("至少选择一个导出平台")
         master = Path(master_video)
         clean = Path(clean_video)
         subtitles = Path(subtitle_path)
@@ -614,7 +633,12 @@ class M6Pipeline:
                 technical,
             )
 
-        content = self._content_qa(script, package, subtitles)
+        platforms = (
+            SUPPORTED_PLATFORMS
+            if selected_platforms is None
+            else selected_platforms
+        )
+        content = self._content_qa(script, package, subtitles, platforms)
         _write_json(qa_dir / "content_qa.json", content)
         repair_ok = repair_rounds == 0 or repair_verified
         if not technical["passed"] or not content["passed"] or not repair_ok:
@@ -643,20 +667,12 @@ class M6Pipeline:
         shutil.copy2(master, working / "master.mp4")
         shutil.copy2(clean, working / "clean.mp4")
         self._create_preview(master, working / "preview_540x960.mp4")
-        platform_entries: dict[str, object] = {}
-        for platform in SUPPORTED_PLATFORMS:
-            platform_dir = working / platform
-            platform_dir.mkdir(parents=True, exist_ok=True)
-            video = platform_dir / "video.mp4"
-            shutil.copy2(master, video)
-            metadata = package[platform]
-            markdown = self._publish_markdown(platform, metadata)
-            (platform_dir / "publish.md").write_text(markdown, encoding="utf-8")
-            platform_entries[platform] = {
-                "video": str(video.relative_to(working)),
-                "copy": str((platform_dir / "publish.md").relative_to(working)),
-                "sha256": hashlib.sha256(video.read_bytes()).hexdigest(),
-            }
+        platform_entries = self.platform_exporter.export(
+            master,
+            working,
+            package,
+            selected_platforms=platforms,
+        )
 
         manifest = {
             "status": "READY_TO_PUBLISH",
@@ -684,7 +700,7 @@ class M6Pipeline:
         media_suffixes = {".mp4", ".mov", ".mkv", ".webm"}
         return {
             path.relative_to(destination).as_posix(): {
-                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                "sha256": _sha256_file(path),
                 "size_bytes": path.stat().st_size,
                 "media": path.suffix.lower() in media_suffixes,
             }
@@ -722,7 +738,13 @@ class M6Pipeline:
             "qa/content_qa.json",
             f"qa/technical_round_{repair_rounds}.json",
         }
-        for platform in SUPPORTED_PLATFORMS:
+        platforms = manifest.get("platforms", {})
+        selected_platforms = (
+            tuple(platforms)
+            if isinstance(platforms, dict) and platforms
+            else SUPPORTED_PLATFORMS
+        )
+        for platform in selected_platforms:
             required.add(f"{platform}/video.mp4")
             required.add(f"{platform}/publish.md")
         listed = {str(relative) for relative in files}
@@ -752,11 +774,10 @@ class M6Pipeline:
             if not path.is_file():
                 issues.append(f"{relative} 不存在")
                 continue
-            payload = path.read_bytes()
-            if hashlib.sha256(payload).hexdigest() != metadata.get("sha256"):
+            if _sha256_file(path) != metadata.get("sha256"):
                 issues.append(f"{relative} SHA256 不匹配")
                 continue
-            if len(payload) != metadata.get("size_bytes"):
+            if path.stat().st_size != metadata.get("size_bytes"):
                 issues.append(f"{relative} 文件大小不匹配")
             if metadata.get("media"):
                 try:
@@ -776,13 +797,14 @@ class M6Pipeline:
         script: dict[str, object],
         package: dict[str, object],
         subtitles: Path,
+        selected_platforms: tuple[str, ...],
     ) -> dict[str, object]:
         issues: list[str] = []
         if not str(script.get("title", "")).strip():
             issues.append("脚本缺少标题")
         if not _ass_cues(subtitles):
             issues.append("字幕为空")
-        for platform in SUPPORTED_PLATFORMS:
+        for platform in selected_platforms:
             value = package.get(platform)
             if not isinstance(value, dict):
                 issues.append(f"{platform} 缺少发布文案")

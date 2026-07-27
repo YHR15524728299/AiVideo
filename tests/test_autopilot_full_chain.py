@@ -11,7 +11,9 @@ from aicf.config import AppConfig
 from aicf.database import JobRepository
 from aicf.engines.narration_engine import NeedsScriptDurationRevision
 from aicf.file_lock import os_file_lock
+from aicf.providers.openrouter import UpstreamRateLimitError
 from aicf.state_machine import ORDERED_STAGES, PipelineStage
+from aicf.voice_validation import VoiceValidator
 
 
 CONTENT_PACKAGED = getattr(PipelineStage, "CONTENT_PACKAGED", "CONTENT_PACKAGED")
@@ -60,6 +62,7 @@ class FakeContentRunner:
                             }
                         ],
                         "call_to_action": "完成。",
+                        "key_phrases": ["全链"],
                         "estimated_duration_seconds": 3,
                     },
                     ensure_ascii=False,
@@ -98,6 +101,29 @@ class FakeContentRunner:
             encoding="utf-8",
         )
         return {"passed": True, "round": round_number}
+
+
+class TransientDurationRevisionRunner(FakeContentRunner):
+    def __init__(
+        self,
+        repository: JobRepository,
+        output_dir: Path,
+        failures: int,
+    ) -> None:
+        super().__init__(repository, output_dir)
+        self.failures = failures
+        self.revision_attempts = 0
+
+    def revise_for_duration(
+        self,
+        job_id: str,
+        error: NeedsScriptDurationRevision,
+        round_number: int,
+    ) -> dict[str, object]:
+        self.revision_attempts += 1
+        if self.revision_attempts <= self.failures:
+            raise UpstreamRateLimitError(502, "temporary capacity")
+        return super().revise_for_duration(job_id, error, round_number)
 
 
 class FakeNarration:
@@ -294,6 +320,7 @@ def _autopilot(
         m6_pipeline=dependencies["m6"],
         config=config or AppConfig(direction="Fake"),
     )
+    autopilot.sleep = lambda _: None
     return repository, autopilot, dependencies
 
 
@@ -399,6 +426,82 @@ def test_autopilot_stops_after_two_duration_revisions_with_reopen_command(
         "python -m aicf reopen --job FAKE001 --confirm-artifacts-fixed"
     )
     assert "resume" not in result["recovery_command"]
+
+
+def test_duration_revision_round_ignores_unreviewed_candidate(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "outputs" / "FAKE001"
+    output.mkdir(parents=True)
+    (output / "duration_revision_1.json").write_text("{}", encoding="utf-8")
+    (output / "review_duration_1.json").write_text("{}", encoding="utf-8")
+    (output / "duration_revision_2.json").write_text("{}", encoding="utf-8")
+
+    assert Autopilot._next_duration_revision_round(output) == 2
+
+
+def test_duration_revision_retries_transient_upstream_error(
+    tmp_path: Path,
+) -> None:
+    repository, autopilot, dependencies = _autopilot(
+        tmp_path,
+        narration_durations=[110.0],
+    )
+    output = tmp_path / "outputs" / "FAKE001"
+    runner = TransientDurationRevisionRunner(repository, output, failures=1)
+    dependencies["content"] = runner
+    autopilot.content_runner = runner
+    autopilot.sleep = lambda _: None
+
+    result = autopilot.run("FAKE001")
+
+    assert result["status"] == "READY_TO_PUBLISH"
+    assert runner.revision_attempts == 2
+
+
+def test_asr_failure_stops_before_visual_generation(tmp_path: Path) -> None:
+    repository, autopilot, dependencies = _autopilot(tmp_path)
+
+    class MissingContentAsr:
+        def transcribe(self, _audio_path: Path) -> tuple[str, str]:
+            return "无法识别关键内容", "zh-CN"
+
+    autopilot.voice_validator = VoiceValidator(MissingContentAsr())
+    result = autopilot.run("FAKE001")
+
+    assert result["status"] == "FAILED_NEEDS_ATTENTION"
+    assert "旁白 ASR 验收失败" in result["reason"]
+    assert dependencies["visual"].calls == 0
+
+
+def test_formal_script_derives_key_phrases_without_non_contract_field() -> None:
+    script = {
+        "title": "正式标题",
+        "hook": "问题可能根本不在模型。",
+        "segments": [
+            {
+                "segment_id": "SEG001",
+                "purpose": "hook",
+                "narration": "问题可能根本不在模型。",
+                "visual_brief": "画面",
+                "fact_refs": [],
+            },
+            {
+                "segment_id": "SEG002",
+                "purpose": "call_to_action",
+                "narration": "关注内容工厂。",
+                "visual_brief": "画面",
+                "fact_refs": [],
+            },
+        ],
+        "call_to_action": "关注内容工厂。",
+        "estimated_duration_seconds": 3,
+    }
+
+    assert Autopilot._key_phrases(script) == (
+        "问题可能根本不在模型。",
+        "关注内容工厂。",
+    )
 
 
 def test_completed_job_revalidates_manifest_and_transitions_to_attention(

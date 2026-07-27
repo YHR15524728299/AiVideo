@@ -24,8 +24,11 @@ src/aicf/m2_promotion.py
 src/aicf/m2_runner.py
 src/aicf/m4_asset_runner.py
 src/aicf/m5_runner.py
+src/aicf/platform_export.py
+src/aicf/production_settings.py
 src/aicf/source_verifier.py
 src/aicf/state_machine.py
+src/aicf/voice_validation.py
 src/aicf/engines/__init__.py
 src/aicf/engines/clip_planner.py
 src/aicf/engines/direction_engine.py
@@ -51,6 +54,8 @@ tests/test_atomic_io.py
 tests/test_autopilot_full_chain.py
 tests/test_cli_and_logging.py
 tests/test_dreamina_protocol.py
+tests/test_file_lock.py
+tests/test_gui_settings.py
 tests/test_m0_m1.py
 tests/test_m2_content_pipeline.py
 tests/test_m2_content_run.py
@@ -62,5 +67,8 @@ tests/test_m5_render_assets.py
 tests/test_m5_visual_plan.py
 tests/test_m6_delivery.py
 tests/test_pipeline_core.py
+tests/test_platform_export.py
+tests/test_production_settings.py
 tests/test_source_verifier.py
 tests/test_tts.py
+tests/test_voice_validation.py

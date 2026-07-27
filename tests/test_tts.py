@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import subprocess
 from pathlib import Path
@@ -84,13 +85,28 @@ def test_all_provider_failures_are_reported_without_stale_output(tmp_path: Path)
     ]
 
 
-def test_default_service_orders_edge_before_sapi() -> None:
+def test_default_service_orders_kokoro_first() -> None:
     service = build_default_tts_service()
 
-    assert [provider.name for provider in service.providers] == [
-        "edge_tts",
-        "windows_sapi",
-    ]
+    provider_names = [provider.name for provider in service.providers]
+    # Kokoro（本地神经网络TTS）优先，然后是 Edge TTS，最后是 Windows SAPI 回退
+    assert provider_names[0] == "kokoro"
+    assert "edge_tts" in provider_names
+    assert "windows_sapi" in provider_names
+
+
+def test_select_voice_routes_to_matching_provider_family() -> None:
+    edge = EdgeTtsProvider()
+    sapi = SapiTtsProvider()
+    service = TtsService([edge, sapi])
+
+    service.select_voice("Microsoft Huihui Desktop")
+    assert service.providers[0] is sapi
+    assert sapi.voice == "Microsoft Huihui Desktop"
+
+    service.select_voice("zh-CN-YunxiNeural")
+    assert service.providers[0] is edge
+    assert edge.voice == "zh-CN-YunxiNeural"
 
 
 def test_edge_provider_generates_audio_then_converts_to_wav(tmp_path: Path) -> None:
@@ -118,6 +134,27 @@ def test_edge_provider_generates_audio_then_converts_to_wav(tmp_path: Path) -> N
 
     assert calls == [("Edge 测试", "zh-CN-XiaoxiaoNeural")]
     assert output.read_bytes() == b"RIFF-edge"
+    assert not output.with_suffix(".edge.mp3").exists()
+
+
+def test_edge_provider_times_out_and_cleans_temporary_file(tmp_path: Path) -> None:
+    class HangingCommunicate:
+        def __init__(self, text: str, voice: str) -> None:
+            pass
+
+        async def save(self, path: str) -> None:
+            Path(path).write_bytes(b"partial")
+            await asyncio.Event().wait()
+
+    output = tmp_path / "edge.wav"
+    provider = EdgeTtsProvider(
+        communicate_factory=HangingCommunicate,
+        request_timeout_seconds=0.01,
+    )
+
+    with pytest.raises(TimeoutError, match="Edge TTS 请求超时"):
+        provider.synthesize(TtsRequest("超时测试", output))
+
     assert not output.with_suffix(".edge.mp3").exists()
 
 

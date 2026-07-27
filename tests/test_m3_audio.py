@@ -141,9 +141,12 @@ def test_ass_uses_real_timeline_timestamps() -> None:
 def test_batch_synthesize_creates_segments_voiceover_timeline_and_subtitles(
     tmp_path: Path,
 ) -> None:
+    synthesized_texts: list[str] = []
+
     class FakeService:
         def synthesize(self, text: str, output_path: Path):
-            _write_wav(output_path, duration=0.25)
+            synthesized_texts.append(text)
+            _write_wav(output_path, duration=0.75)
             return type("Result", (), {"provider": "fake", "degraded": False})()
 
     ffmpeg_commands: list[list[str]] = []
@@ -182,7 +185,8 @@ def test_batch_synthesize_creates_segments_voiceover_timeline_and_subtitles(
         max_duration_seconds=2.0,
     )
 
-    assert len(list((tmp_path / "segments").glob("*.wav"))) == 3
+    assert synthesized_texts == ["第一句。第二句！最后一句。"]
+    assert len(list((tmp_path / "segments").glob("*.wav"))) == 1
     assert result.voiceover_path == tmp_path / "voiceover.wav"
     assert result.voiceover_path.exists()
     timeline = json.loads((tmp_path / "timeline.json").read_text(encoding="utf-8"))
@@ -191,8 +195,9 @@ def test_batch_synthesize_creates_segments_voiceover_timeline_and_subtitles(
         "SEG001",
         "SEG002",
     ]
-    assert timeline[0]["duration_seconds"] == pytest.approx(0.25)
-    assert timeline[1]["start_seconds"] == pytest.approx(0.60)
+    assert timeline[0]["duration_seconds"] > 0
+    assert timeline[1]["start_seconds"] == pytest.approx(timeline[0]["end_seconds"])
+    assert timeline[-1]["end_seconds"] == pytest.approx(1.45)
     assert (tmp_path / "subtitles.srt").exists()
     assert (tmp_path / "subtitles.ass").exists()
     assert any(
@@ -248,10 +253,10 @@ def test_batch_synthesize_compresses_to_target_and_rescales_timeline(
     assert atempo_command[atempo_command.index("-af") + 1] == "atempo=1.333333"
     assert result.voiceover_path.exists()
     timeline = json.loads(result.timeline_path.read_text(encoding="utf-8"))
-    assert timeline[0]["duration_seconds"] == pytest.approx(0.75)
-    assert timeline[1]["start_seconds"] == pytest.approx(1.0125)
-    assert timeline[1]["end_seconds"] == pytest.approx(1.7625)
-    assert "00:00:00,750" in result.srt_path.read_text(encoding="utf-8-sig")
+    assert timeline[0]["duration_seconds"] == pytest.approx(3.0)
+    assert timeline[1]["start_seconds"] == pytest.approx(3.0)
+    assert timeline[1]["end_seconds"] == pytest.approx(6.0)
+    assert "00:00:03,000" in result.srt_path.read_text(encoding="utf-8-sig")
 
 
 def test_batch_synthesize_uses_max_when_target_would_exceed_atempo_limit(

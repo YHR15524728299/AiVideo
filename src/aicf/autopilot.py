@@ -3,15 +3,20 @@ from __future__ import annotations
 import json
 import hashlib
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
+from urllib.error import URLError
 
 from aicf.config import AppConfig
 from aicf.database import JobRepository
 from aicf.engines.narration_engine import NeedsScriptDurationRevision
 from aicf.file_lock import os_file_lock
 from aicf.logging_utils import sanitize_error
+from aicf.providers.openrouter import OpenRouterHTTPError, UpstreamRateLimitError
+from aicf.production_settings import ProductionSettings
 from aicf.state_machine import PipelineStage
+from aicf.voice_validation import VoiceValidator
 
 
 class NeedsAttention(RuntimeError):
@@ -32,6 +37,7 @@ class Autopilot:
         asset_runner: object | None = None,
         renderer: object | None = None,
         config: AppConfig | None = None,
+        voice_validator: VoiceValidator | None = None,
     ) -> None:
         self.repository = repository
         self.m6_pipeline = m6_pipeline
@@ -41,6 +47,8 @@ class Autopilot:
         self.asset_runner = asset_runner
         self.renderer = renderer
         self.config = config
+        self.voice_validator = voice_validator or VoiceValidator()
+        self.sleep = time.sleep
 
     def run(self, job_id: str) -> dict[str, Any]:
         status = self.repository.get_job(job_id)
@@ -59,69 +67,131 @@ class Autopilot:
             lock.__exit__(None, None, None)
 
     def _run_locked(self, job_id: str) -> dict[str, Any]:
-        status = self.repository.get_job(job_id)
-        job_dir = Path(status.output_dir)
-        if status.current_stage == PipelineStage.COMPLETED:
-            return self._completed_manifest(job_id, job_dir)
+        max_auto_retries = 3
+        for retry_attempt in range(max_auto_retries + 1):
+            status = self.repository.get_job(job_id)
+            job_dir = Path(status.output_dir)
+            if status.current_stage == PipelineStage.COMPLETED:
+                return self._completed_manifest(job_id, job_dir)
 
-        content_result = self._ensure_content(job_id, job_dir)
-        if content_result is not None:
-            return content_result
+            content_result = self._ensure_content(job_id, job_dir)
+            if content_result is not None:
+                if content_result.get("status") == "FAILED_RETRYABLE" and retry_attempt < max_auto_retries:
+                    wait = min(60, 10 * (2**retry_attempt))  # 10s, 20s, 40s
+                    print(f"[autopilot] 内容阶段可重试失败，{wait}s 后自动重试 (第{retry_attempt+1}次)", flush=True)
+                    self.sleep(wait)
+                    # 重置失败阶段状态以重试
+                    self._reset_failed_stage(job_id)
+                    continue
+                return content_result
 
-        manifest: dict[str, Any] | None = None
-        stages = [
-            PipelineStage.AUDIO_GENERATED,
-            PipelineStage.NARRATION_TIMELINE_CREATED,
-            PipelineStage.STORYBOARD_GENERATED,
-            PipelineStage.CLIP_PLAN_CREATED,
-            PipelineStage.KEYFRAMES_GENERATED,
-            PipelineStage.VIDEO_CLIPS_GENERATED,
-            PipelineStage.SUBTITLES_GENERATED,
-            PipelineStage.MASTER_TIMELINE_ASSEMBLED,
-            PipelineStage.RENDERED,
-            PipelineStage.QA_CHECKED,
-        ]
-        start = self._resume_index(job_id, stages)
-        for stage in stages[start:]:
-            try:
-                result = self._run_stage(job_id, job_dir, stage)
-            except NeedsScriptDurationRevision as error:
-                return self._handle_duration_revision(job_id, job_dir, error)
-            if result.get("status") in {
-                "WAITING_EXTERNAL",
-                "FAILED_NEEDS_ATTENTION",
-                "FAILED_RETRYABLE",
-            }:
-                return result
-            if stage == PipelineStage.QA_CHECKED:
-                manifest = result
+            manifest: dict[str, Any] | None = None
+            stages = [
+                PipelineStage.AUDIO_GENERATED,
+                PipelineStage.NARRATION_TIMELINE_CREATED,
+                PipelineStage.STORYBOARD_GENERATED,
+                PipelineStage.CLIP_PLAN_CREATED,
+                PipelineStage.KEYFRAMES_GENERATED,
+                PipelineStage.VIDEO_CLIPS_GENERATED,
+                PipelineStage.SUBTITLES_GENERATED,
+                PipelineStage.MASTER_TIMELINE_ASSEMBLED,
+                PipelineStage.RENDERED,
+                PipelineStage.QA_CHECKED,
+            ]
+            failed_retryable = False
+            start = self._resume_index(job_id, stages)
+            for stage in stages[start:]:
+                try:
+                    result = self._run_stage(job_id, job_dir, stage)
+                except NeedsScriptDurationRevision as error:
+                    return self._handle_duration_revision(job_id, job_dir, error)
+                if result.get("status") == "WAITING_EXTERNAL":
+                    return result
+                if result.get("status") == "FAILED_NEEDS_ATTENTION":
+                    return result
+                if result.get("status") == "FAILED_RETRYABLE":
+                    failed_retryable = True
+                    break
+                if stage == PipelineStage.QA_CHECKED:
+                    manifest = result
 
-        if manifest is None:
-            manifest = self._load_delivery_manifest(job_dir)
-        if int(manifest.get("repair_rounds", 0)) > 0:
-            repair = self._complete_marker_stage(
+            if failed_retryable:
+                if retry_attempt < max_auto_retries:
+                    wait = min(60, 10 * (2**retry_attempt))
+                    failed_stage_info = self.repository.get_job(job_id)
+                    failed_name = failed_stage_info.failed_stage.value if failed_stage_info.failed_stage else "未知"
+                    print(f"[autopilot] 阶段 {failed_name} 可重试失败，{wait}s 后自动重试 (第{retry_attempt+1}次)", flush=True)
+                    self.sleep(wait)
+                    self._reset_failed_stage(job_id)
+                    continue
+                # 超过最大重试次数，返回 FAILED_RETRYABLE 让用户手动决定
+                status = self.repository.get_job(job_id)
+                failed = status.failed_stage
+                reason = (
+                    str(status.stages.get(failed.value, {}).get("error", ""))
+                    if failed is not None
+                    else "自动重试耗尽"
+                )
+                return {
+                    "status": "FAILED_RETRYABLE",
+                    "reason": reason,
+                    "recovery_command": f"python -m aicf resume --job {job_id}",
+                }
+
+            if manifest is None:
+                manifest = self._load_delivery_manifest(job_dir)
+            if int(manifest.get("repair_rounds", 0)) > 0:
+                repair = self._complete_marker_stage(
+                    job_id,
+                    job_dir,
+                    PipelineStage.AUTO_REPAIRED,
+                    [job_dir / "delivery" / "publish_manifest.json"],
+                )
+                if repair:
+                    if repair.get("status") == "FAILED_RETRYABLE" and retry_attempt < max_auto_retries:
+                        wait = min(60, 10 * (2**retry_attempt))
+                        self.sleep(wait)
+                        self._reset_failed_stage(job_id)
+                        continue
+                    return repair
+            packaged = self._complete_marker_stage(
                 job_id,
                 job_dir,
-                PipelineStage.AUTO_REPAIRED,
+                PipelineStage.PACKAGED,
                 [job_dir / "delivery" / "publish_manifest.json"],
             )
-            if repair:
-                return repair
-        packaged = self._complete_marker_stage(
-            job_id,
-            job_dir,
-            PipelineStage.PACKAGED,
-            [job_dir / "delivery" / "publish_manifest.json"],
-        )
-        if packaged:
-            return packaged
-        completed = self._complete_marker_stage(
-            job_id,
-            job_dir,
-            PipelineStage.COMPLETED,
-            [job_dir / "delivery" / "publish_manifest.json"],
-        )
-        return completed or manifest
+            if packaged:
+                if packaged.get("status") == "FAILED_RETRYABLE" and retry_attempt < max_auto_retries:
+                    wait = min(60, 10 * (2**retry_attempt))
+                    self.sleep(wait)
+                    self._reset_failed_stage(job_id)
+                    continue
+                return packaged
+            completed = self._complete_marker_stage(
+                job_id,
+                job_dir,
+                PipelineStage.COMPLETED,
+                [job_dir / "delivery" / "publish_manifest.json"],
+            )
+            return completed or manifest
+        # 理论上不会到这里
+        return {"status": "FAILED_RETRYABLE", "reason": "重试耗尽", "recovery_command": f"python -m aicf resume --job {job_id}"}
+
+    def _reset_failed_stage(self, job_id: str) -> None:
+        """重置失败阶段，使其可以重新运行。"""
+        status = self.repository.get_job(job_id)
+        failed = status.failed_stage
+        if failed is None:
+            return
+        # 把失败阶段从 stages 记录中移除，重置到该阶段之前
+        # 使用 reopen 机制
+        try:
+            self.repository.reopen_failed_attention(
+                job_id,
+                recoverable_reason="auto_retry",
+            )
+        except Exception:
+            pass
 
     def _ensure_content(
         self,
@@ -241,7 +311,23 @@ class Autopilot:
                 else f"python -m aicf resume --job {job_id}"
             )
             details = self._error_details(error)
-            retryable = not isinstance(error, NeedsAttention)
+            # 只有明确的临时性/网络错误才可重试；ffmpeg 失败、文件缺失、配置错误、NeedsAttention 等不可重试
+            retryable = isinstance(
+                error,
+                (URLError, TimeoutError, OSError, UpstreamRateLimitError),
+            ) or (
+                isinstance(error, OpenRouterHTTPError)
+                and (error.status_code == 429 or error.status_code >= 500)
+            ) or (
+                stage == PipelineStage.RENDERED
+                and isinstance(
+                    error,
+                    (RuntimeError, subprocess.CalledProcessError),
+                )
+            ) or (
+                stage == PipelineStage.QA_CHECKED
+                and isinstance(error, subprocess.CalledProcessError)
+            )
             self.repository.fail_stage(
                 job_id,
                 stage,
@@ -302,7 +388,41 @@ class Autopilot:
                 recovery_command=recovery,
             )
             return self._failure_result(recovery, RuntimeError(reason))
-        revision = reviser(job_id, error, round_number)
+        revision: dict[str, object] | None = None
+        for retry_attempt in range(4):
+            try:
+                revision = reviser(job_id, error, round_number)
+                break
+            except (
+                URLError,
+                TimeoutError,
+                OSError,
+                UpstreamRateLimitError,
+            ):
+                if retry_attempt >= 3:
+                    raise
+                wait = min(60, 10 * (2**retry_attempt))
+                print(
+                    "[autopilot] 时长修订遇到临时上游错误，"
+                    f"{wait}s 后自动重试 (第{retry_attempt + 1}次)",
+                    flush=True,
+                )
+                self.sleep(wait)
+            except OpenRouterHTTPError as upstream_error:
+                retryable = (
+                    upstream_error.status_code == 429
+                    or upstream_error.status_code >= 500
+                )
+                if not retryable or retry_attempt >= 3:
+                    raise
+                wait = min(60, 10 * (2**retry_attempt))
+                print(
+                    "[autopilot] 时长修订遇到临时上游错误，"
+                    f"{wait}s 后自动重试 (第{retry_attempt + 1}次)",
+                    flush=True,
+                )
+                self.sleep(wait)
+        assert revision is not None
         if not bool(revision.get("passed")):
             if round_number < 2:
                 return self._handle_duration_revision(job_id, job_dir, error)
@@ -324,8 +444,8 @@ class Autopilot:
     @staticmethod
     def _next_duration_revision_round(job_dir: Path) -> int:
         rounds: list[int] = []
-        for path in job_dir.glob("duration_revision_*.json"):
-            suffix = path.stem.removeprefix("duration_revision_")
+        for path in job_dir.glob("review_duration_*.json"):
+            suffix = path.stem.removeprefix("review_duration_")
             if suffix.isdigit():
                 rounds.append(int(suffix))
         return max(rounds, default=0) + 1
@@ -342,6 +462,11 @@ class Autopilot:
             if self.narration_pipeline is None or self.config is None:
                 raise NeedsAttention("缺少 M3 旁白处理器", "")
             script = self._read_json(job_dir / "script.json")
+            production = ProductionSettings.load_for_job(job_dir)
+            service = getattr(self.narration_pipeline, "service", None)
+            select_voice = getattr(service, "select_voice", None)
+            if callable(select_voice):
+                select_voice(production.narration_voice)
             video = self.config.video
             self.narration_pipeline.batch_synthesize(
                 script,
@@ -350,6 +475,25 @@ class Autopilot:
                 min_duration_seconds=video.min_duration_seconds,
                 max_duration_seconds=video.max_duration_seconds,
             )
+            validation = self.voice_validator.validate(
+                job_dir / "audio" / "voiceover.wav",
+                expected_text=self._narration_text(script),
+                key_phrases=self._key_phrases(script),
+            )
+            (job_dir / "audio" / "voice_validation.json").write_text(
+                json.dumps(
+                    validation.as_dict(),
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            if validation.available and not validation.passed:
+                raise NeedsAttention(
+                    "旁白 ASR 验收失败：关键数字、短语或语种不匹配",
+                    f"python -m aicf resume --job {job_id}",
+                )
             return {"status": "COMPLETED"}
         if stage == PipelineStage.STORYBOARD_GENERATED:
             if self.visual_plan_runner is None:
@@ -384,7 +528,12 @@ class Autopilot:
         if stage == PipelineStage.QA_CHECKED:
             if self.m6_pipeline is None:
                 raise NeedsAttention("缺少 M6 QA/package 处理器", "")
-            return self.m6_pipeline.run(**self._load_inputs("", job_dir))
+            return self.m6_pipeline.run(
+                **self._load_inputs("", job_dir),
+                selected_platforms=ProductionSettings.load_for_job(
+                    job_dir
+                ).selected_platforms,
+            )
         return {"status": "COMPLETED"}
 
     def _m4_usage_recorder(self, job_id: str) -> object:
@@ -700,6 +849,30 @@ class Autopilot:
                 "title": str(self._read_json(job_dir / "script.json").get("title", "")),
             },
         }
+
+    @staticmethod
+    def _narration_text(script: dict[str, object]) -> str:
+        segments = script.get("segments", [])
+        if not isinstance(segments, list):
+            return ""
+        return "".join(
+            str(segment.get("narration", ""))
+            for segment in segments
+            if isinstance(segment, dict)
+        )
+
+    @staticmethod
+    def _key_phrases(script: dict[str, object]) -> tuple[str, ...]:
+        value = script.get("key_phrases", [])
+        if isinstance(value, list) and value:
+            return tuple(str(item) for item in value if str(item).strip())
+        narration = Autopilot._narration_text(script)
+        candidates = (script.get("hook"), script.get("call_to_action"))
+        return tuple(
+            text
+            for candidate in candidates
+            if (text := str(candidate or "").strip()) and text in narration
+        )
 
     @staticmethod
     def _first_existing(*paths: Path) -> Path | None:

@@ -9,6 +9,7 @@ data/*.db
 data/cache/
 data/openrouter_cache/
 data/dreamina_cache/
+data/dreamina_asset_cache/
 outputs/
 workspaces/
 *.log

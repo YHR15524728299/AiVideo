@@ -14,7 +14,6 @@ from typing import Callable, Iterable, Sequence
 import yaml
 from PIL import Image, UnidentifiedImageError
 from aicf.atomic_io import atomic_replace
-from PIL import Image, UnidentifiedImageError
 
 from aicf.engines.clip_planner import choose_generation_duration
 from aicf.logging_utils import sanitize_error
@@ -109,6 +108,8 @@ def parse_jimeng_help(help_text: str) -> JimengCapabilities:
                 "{ratio}",
                 "--model_version",
                 "{model}",
+                "--resolution_type",
+                "{resolution}",
                 "--poll",
                 "0",
             ]
@@ -126,6 +127,8 @@ def parse_jimeng_help(help_text: str) -> JimengCapabilities:
                 "{ratio}",
                 "--model_version",
                 "{model}",
+                "--video_resolution",
+                "{resolution}",
                 "--poll",
                 "0",
             ]
@@ -409,6 +412,9 @@ class JimengCliAdapter:
         model: str,
         ratio: str,
         duration: float | None,
+        *,
+        kind: str,
+        resolution: str,
     ) -> str:
         payload = json.dumps(
             {
@@ -416,6 +422,8 @@ class JimengCliAdapter:
                 "model": model,
                 "ratio": ratio,
                 "duration": duration,
+                "kind": kind,
+                "resolution": resolution,
             },
             ensure_ascii=False,
             sort_keys=True,
@@ -430,10 +438,21 @@ class JimengCliAdapter:
         ratio: str,
         duration: float | None,
         suffix: str,
+        *,
+        kind: str,
+        resolution: str,
     ) -> Path | None:
         if self.cache_dir is None:
             return None
-        return self.cache_dir / f"{self._cache_key(prompt, model, ratio, duration)}{suffix}"
+        key = self._cache_key(
+            prompt,
+            model,
+            ratio,
+            duration,
+            kind=kind,
+            resolution=resolution,
+        )
+        return self.cache_dir / f"{key}{suffix}"
 
     def _restore_cache(
         self,
@@ -444,8 +463,17 @@ class JimengCliAdapter:
         target: Path,
         *,
         kind: str,
+        resolution: str,
     ) -> bool:
-        cached = self._cache_path(prompt, model, ratio, duration, target.suffix)
+        cached = self._cache_path(
+            prompt,
+            model,
+            ratio,
+            duration,
+            target.suffix,
+            kind=kind,
+            resolution=resolution,
+        )
         if cached is None or not cached.is_file():
             return False
         valid = self.validate_image(cached) if kind == "image" else self.validate_video(cached)
@@ -463,8 +491,19 @@ class JimengCliAdapter:
         ratio: str,
         duration: float | None,
         target: Path,
+        *,
+        kind: str,
+        resolution: str,
     ) -> None:
-        cached = self._cache_path(prompt, model, ratio, duration, target.suffix)
+        cached = self._cache_path(
+            prompt,
+            model,
+            ratio,
+            duration,
+            target.suffix,
+            kind=kind,
+            resolution=resolution,
+        )
         if cached is not None:
             shutil.copy2(target, cached)
 
@@ -475,11 +514,17 @@ class JimengCliAdapter:
         *,
         model: str = "4.1",
         ratio: str = "9:16",
+        resolution: str = "2k",
     ) -> list[str]:
         del output_path
         return self._build_command(
             self.capabilities.image_command,
-            {"prompt": prompt, "model": model, "ratio": ratio},
+            {
+                "prompt": prompt,
+                "model": model,
+                "ratio": ratio,
+                "resolution": resolution,
+            },
             "text2image",
         )
 
@@ -491,6 +536,7 @@ class JimengCliAdapter:
         *,
         model: str = "seedance2.0fast",
         ratio: str = "9:16",
+        resolution: str = "720p",
     ) -> list[str]:
         del output_path
         duration = self._generation_duration(required_seconds)
@@ -501,6 +547,7 @@ class JimengCliAdapter:
                 "duration": str(int(duration)),
                 "model": model,
                 "ratio": ratio,
+                "resolution": resolution,
             },
             "text2video",
         )
@@ -620,19 +667,41 @@ class JimengCliAdapter:
         *,
         model: str = "4.1",
         ratio: str = "9:16",
+        resolution: str = "2k",
     ) -> GenerationResult:
         target = Path(output_path)
-        if self._restore_cache(prompt, model, ratio, None, target, kind="image"):
+        if self._restore_cache(
+            prompt,
+            model,
+            ratio,
+            None,
+            target,
+            kind="image",
+            resolution=resolution,
+        ):
             return GenerationResult("image", target, cached=True)
         submit_id = self._submit(
-            self.build_image_command(prompt, model=model, ratio=ratio)
+            self.build_image_command(
+                prompt,
+                model=model,
+                ratio=ratio,
+                resolution=resolution,
+            )
         )
         self._poll(submit_id)
         self._download(submit_id, target, kind="image")
         if not self.validate_image(target):
             target.unlink(missing_ok=True)
             raise RuntimeError("Dreamina 下载了无效图片")
-        self._store_cache(prompt, model, ratio, None, target)
+        self._store_cache(
+            prompt,
+            model,
+            ratio,
+            None,
+            target,
+            kind="image",
+            resolution=resolution,
+        )
         return GenerationResult("image", target, submit_id=submit_id)
 
     def generate_video(
@@ -643,6 +712,7 @@ class JimengCliAdapter:
         *,
         model: str = "seedance2.0fast",
         ratio: str = "9:16",
+        resolution: str = "720p",
         fallback_to_keyframe: bool = True,
     ) -> GenerationResult:
         target = Path(output_path)
@@ -654,6 +724,7 @@ class JimengCliAdapter:
             duration,
             target,
             kind="video",
+            resolution=resolution,
         ):
             return GenerationResult("video", target, cached=True)
         try:
@@ -663,6 +734,7 @@ class JimengCliAdapter:
                     required_seconds,
                     model=model,
                     ratio=ratio,
+                    resolution=resolution,
                 )
             )
             self._poll(submit_id)
@@ -718,7 +790,15 @@ class JimengCliAdapter:
                 ken_burns_plan_path=plan_path,
                 submit_id=image_result.submit_id,
             )
-        self._store_cache(prompt, model, ratio, duration, target)
+        self._store_cache(
+            prompt,
+            model,
+            ratio,
+            duration,
+            target,
+            kind="video",
+            resolution=resolution,
+        )
         return GenerationResult("video", target, submit_id=submit_id)
 
     def submit_image(
@@ -727,9 +807,15 @@ class JimengCliAdapter:
         *,
         model: str = "4.1",
         ratio: str = "9:16",
+        resolution: str = "2k",
     ) -> str:
         return self._submit(
-            self.build_image_command(prompt, model=model, ratio=ratio)
+            self.build_image_command(
+                prompt,
+                model=model,
+                ratio=ratio,
+                resolution=resolution,
+            )
         )
 
     def submit_video(
@@ -739,6 +825,7 @@ class JimengCliAdapter:
         *,
         model: str = "seedance2.0fast",
         ratio: str = "9:16",
+        resolution: str = "720p",
     ) -> str:
         return self._submit(
             self.build_video_command(
@@ -746,6 +833,7 @@ class JimengCliAdapter:
                 required_seconds,
                 model=model,
                 ratio=ratio,
+                resolution=resolution,
             )
         )
 

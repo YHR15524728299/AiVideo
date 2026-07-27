@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from dataclasses import asdict
 from pathlib import Path
 from typing import Sequence
@@ -33,6 +34,16 @@ from .providers.tts import (
     discover_ffmpeg_toolchain,
 )
 from .state_machine import PipelineStage
+from .voice_validation import VoiceValidator, build_optional_asr
+
+
+def _configure_windows_stdio() -> None:
+    if sys.platform != "win32":
+        return
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8", errors="replace")
 
 
 def project_root() -> Path:
@@ -148,6 +159,7 @@ def build_autopilot(job_repository: JobRepository) -> Autopilot:
             repair_engine=RepairEngine(toolchain, renderer=renderer),
         ),
         config=config,
+        voice_validator=VoiceValidator(build_optional_asr()),
     )
 
 
@@ -227,6 +239,7 @@ def _print_status(status) -> None:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    _configure_windows_stdio()
     args = build_parser().parse_args(argv)
     if args.command == "doctor":
         report = Doctor().run()
@@ -342,6 +355,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "reason": sanitize_error(error),
                 "recovery_command": recovery,
             }
+        except Exception as error:
+            result = {
+                "status": "FAILED_NEEDS_ATTENTION",
+                "reason": sanitize_error(error),
+                "recovery_command": f"python -m aicf resume --job {args.job}",
+            }
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0 if result.get("status") == "READY_TO_PUBLISH" else 1
     if args.command == "init-job":
@@ -365,17 +384,49 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "resume":
         status = repo.get_job(args.job)
         if status.current_stage == PipelineStage.FAILED_NEEDS_ATTENTION:
+            # 自动尝试 reopen：外部服务/网络问题导致的失败不需要人工确认
+            failed_stage = status.failed_stage
+            can_auto_reopen = False
+            if failed_stage is not None:
+                record = status.stages.get(failed_stage.value, {})
+                error_msg = str(record.get("error", "")).lower()
+                # 网络/HTTP/验证类错误自动重试
+                network_errors = ("http ", "url ", "timeout", "connection", "不可达", "403", "429", "502", "503", "504", "拦截", "验证")
+                if any(kw in error_msg for kw in network_errors):
+                    can_auto_reopen = True
+            if can_auto_reopen:
+                try:
+                    repo.reopen_failed_attention(
+                        args.job,
+                        recoverable_reason="external_service_restored",
+                    )
+                except Exception:
+                    result = {
+                        "status": PipelineStage.FAILED_NEEDS_ATTENTION.value,
+                        "reason": "自动恢复失败，请手动检查",
+                        "recovery_command": status.next_resume_command,
+                    }
+                    print(json.dumps(result, ensure_ascii=False, indent=2))
+                    return 2
+            else:
+                result = {
+                    "status": PipelineStage.FAILED_NEEDS_ATTENTION.value,
+                    "reason": (
+                        "该 Job 需要人工确认后才能重开；"
+                        "resume 不会执行不可恢复阶段"
+                    ),
+                    "recovery_command": status.next_resume_command,
+                }
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+                return 2
+        try:
+            result = build_autopilot(repo).run(args.job)
+        except Exception as error:
             result = {
-                "status": PipelineStage.FAILED_NEEDS_ATTENTION.value,
-                "reason": (
-                    "该 Job 需要人工确认后才能重开；"
-                    "resume 不会执行不可恢复阶段"
-                ),
-                "recovery_command": status.next_resume_command,
+                "status": "FAILED_NEEDS_ATTENTION",
+                "reason": sanitize_error(error),
+                "recovery_command": f"python -m aicf resume --job {args.job}",
             }
-            print(json.dumps(result, ensure_ascii=False, indent=2))
-            return 2
-        result = build_autopilot(repo).run(args.job)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0 if result.get("status") == "READY_TO_PUBLISH" else 1
     if args.command == "reopen":

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import subprocess
 import wave
 from dataclasses import dataclass
@@ -187,57 +188,64 @@ class NarrationPipeline:
         for stale in segments_dir.glob("*.wav"):
             stale.unlink()
 
-        work: list[dict[str, Any]] = []
+        sentence_units: list[dict[str, Any]] = []
         for source in _script_segments(script):
             script_segment_id = str(source.get("segment_id", "")).strip()
             narration = str(source.get("narration", "")).strip()
             if not script_segment_id or not narration:
                 raise ValueError("每个脚本段必须包含 segment_id 与 narration")
-            for text, pause_seconds in split_chinese_sentences(narration):
-                index = len(work) + 1
-                audio_id = f"AUD{index:03}"
-                target = segments_dir / f"{audio_id}_{script_segment_id}.wav"
-                result = self.service.synthesize(text, target)
-                duration = _wav_duration(target)
-                work.append(
+            for text, _pause_seconds in split_chinese_sentences(narration):
+                sentence_units.append(
                     {
-                        "audio_segment_id": audio_id,
                         "script_segment_id": script_segment_id,
                         "text": text,
-                        "path": str(target),
-                        "duration_seconds": duration,
-                        "pause_after_seconds": pause_seconds,
-                        "provider": result.provider,
-                        "degraded": result.degraded,
                     }
                 )
-        if not work:
+        if not sentence_units:
             raise ValueError("脚本没有可合成的中文句子")
+
+        target = segments_dir / "AUD001_full_narration.wav"
+        full_text = "".join(str(item["text"]) for item in sentence_units)
+        result = self.service.synthesize(full_text, target)
+        source_duration = _wav_duration(target)
+        total_weight = sum(max(1, len(str(item["text"]))) for item in sentence_units)
+
+        work: list[dict[str, Any]] = []
+        allocated = 0.0
+        for index, item in enumerate(sentence_units):
+            duration = (
+                source_duration - allocated
+                if index == len(sentence_units) - 1
+                else source_duration
+                * max(1, len(str(item["text"])))
+                / total_weight
+            )
+            allocated += duration
+            work.append(
+                {
+                    **item,
+                    "audio_segment_id": f"AUD{index + 1:03}",
+                    "path": str(target),
+                    "duration_seconds": duration,
+                    "pause_after_seconds": 0.0,
+                    "provider": result.provider,
+                    "degraded": result.degraded,
+                }
+            )
 
         timeline: list[dict[str, Any]] = []
         current = 0.0
-        for index, item in enumerate(work):
+        for item in work:
             duration = float(item["duration_seconds"])
             entry = dict(item)
             entry["start_seconds"] = current
             entry["end_seconds"] = current + duration
             timeline.append(entry)
             current += duration
-            if index < len(work) - 1:
-                current += float(item["pause_after_seconds"])
 
         root.mkdir(parents=True, exist_ok=True)
         pre_normalized = root / ".voiceover.pre.wav"
-        with wave.open(str(pre_normalized), "wb") as output:
-            output.setnchannels(2)
-            output.setsampwidth(2)
-            output.setframerate(48_000)
-            for index, item in enumerate(work):
-                _, _, _, frames = _wav_details(Path(item["path"]))
-                output.writeframes(frames)
-                if index < len(work) - 1:
-                    silent_frames = round(float(item["pause_after_seconds"]) * 48_000)
-                    output.writeframes(b"\0\0\0\0" * silent_frames)
+        shutil.copy2(target, pre_normalized)
 
         voiceover = root / "voiceover.wav"
         measurement_output = root / ".voiceover.measure.wav"
@@ -301,7 +309,7 @@ class NarrationPipeline:
             voiceover,
             self._command_runner,
         )
-        timeline_scale = 1.0
+        timeline_scale = probed_duration / current
         if probed_duration < min_duration_seconds:
             raise NeedsScriptDurationRevision(
                 actual_duration_seconds=probed_duration,
@@ -374,7 +382,7 @@ class NarrationPipeline:
                         f"{max_duration_seconds:.3f}s"
                     ),
                 )
-            timeline_scale = final_duration / probed_duration
+            timeline_scale *= final_duration / probed_duration
             if abs(final_duration - desired_duration) > 0.15:
                 raise NeedsScriptDurationRevision(
                     actual_duration_seconds=final_duration,
@@ -419,5 +427,5 @@ class NarrationPipeline:
             timeline_path=timeline_path,
             srt_path=srt_path,
             ass_path=ass_path,
-            segment_paths=tuple(Path(item["path"]) for item in work),
+            segment_paths=(target,),
         )

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any, Callable
+from urllib.error import URLError
 
 from pydantic import ValidationError
 
@@ -27,6 +28,7 @@ from aicf.models.contracts import (
     ReviewResult,
     ScriptResult,
 )
+from aicf.providers.openrouter import OpenRouterHTTPError, UpstreamRateLimitError
 from aicf.source_verifier import SourceVerificationError, SourceVerifier
 from aicf.state_machine import PipelineStage
 
@@ -306,7 +308,15 @@ class M2ContentRunner:
                     output_dir / "research_sources.json",
                     error.evidence,
                 )
-            retryable = isinstance(error, (ValueError, ValidationError))
+            # 只有确定性的数据错误才标记为不可重试；网络/上游服务/来源验证错误都可重试
+            # （重跑阶段时 LLM 会重新生成内容/URL）
+            retryable = (
+                isinstance(error, (URLError, TimeoutError, OSError, UpstreamRateLimitError, SourceVerificationError))
+                or (
+                    isinstance(error, OpenRouterHTTPError)
+                    and (error.status_code == 429 or error.status_code >= 500)
+                )
+            )
             self.repository.fail_stage(
                 job_id,
                 stage,

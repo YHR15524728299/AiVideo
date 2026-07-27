@@ -5,11 +5,30 @@ import hashlib
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from aicf.autopilot import Autopilot, NeedsAttention
 from aicf.database import JobRepository
 from aicf.engines.m6_engine import M6Pipeline, RepairEngine, TechnicalQA
 from aicf.providers.tts import FfmpegToolchain, discover_ffmpeg_toolchain
 from aicf.state_machine import ORDERED_STAGES, PipelineStage
+
+
+def test_m6_rejects_explicit_empty_platform_selection(tmp_path: Path) -> None:
+    pipeline = M6Pipeline(FfmpegToolchain("ffmpeg", "ffprobe"))
+
+    with pytest.raises(ValueError, match="至少选择一个"):
+        pipeline.run(
+            master_video=tmp_path / "missing-master.mp4",
+            clean_video=tmp_path / "missing-clean.mp4",
+            subtitle_path=tmp_path / "missing.ass",
+            timeline_path=tmp_path / "missing.json",
+            script={},
+            package={},
+            output_dir=tmp_path / "delivery",
+            expected_duration_seconds=1.0,
+            selected_platforms=(),
+        )
 
 
 def _advance_to_rendered(repository: JobRepository, job_id: str) -> None:
@@ -120,6 +139,39 @@ def test_technical_qa_runs_all_checks_and_accepts_valid_delivery(tmp_path: Path)
     assert report["checks"]["subtitles"]["safe_zone_passed"] is True
 
 
+def test_technical_qa_uses_long_silence_threshold_above_natural_pause(
+    tmp_path: Path,
+) -> None:
+    master, clean, subtitle, timeline = _media_files(tmp_path)
+    commands: list[list[str]] = []
+
+    def runner(
+        command: list[str],
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        return _qa_runner(command, **kwargs)
+
+    TechnicalQA(
+        FfmpegToolchain("ffmpeg-real", "ffprobe-real"),
+        command_runner=runner,
+    ).run(
+        master,
+        clean,
+        subtitle,
+        timeline,
+        expected_duration_seconds=3.0,
+    )
+
+    silence_command = next(
+        command
+        for command in commands
+        if "-af" in command
+        and "silencedetect" in command[command.index("-af") + 1]
+    )
+    assert "d=1.1" in silence_command[silence_command.index("-af") + 1]
+
+
 def test_technical_qa_rejects_timeline_overlap_and_incomplete_unsafe_ass(
     tmp_path: Path,
 ) -> None:
@@ -203,6 +255,25 @@ def test_m6_pipeline_repairs_at_most_twice_and_writes_complete_delivery(
     def artifact_runner(
         command: list[str], **_: object
     ) -> subprocess.CompletedProcess[str]:
+        if command[0] == "ffprobe-real":
+            bitrate = (
+                10_000_000
+                if "youtube_shorts" in str(command[-1])
+                else 8_000_000
+            )
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                json.dumps(
+                    {
+                        "width": 1080,
+                        "height": 1920,
+                        "fps": 30.0,
+                        "bit_rate": bitrate,
+                    }
+                ),
+                "",
+            )
         filter_value = command[command.index("-vf") + 1] if "-vf" in command else ""
         if "blackframe" in filter_value:
             assert "amount=0" in filter_value

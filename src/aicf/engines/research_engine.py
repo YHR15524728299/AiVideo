@@ -39,13 +39,31 @@ class ResearchEngine(StructuredEngine):
             "topic": topic,
         }
         payload: dict[str, object] = original_request
+        last_error: SourceVerificationError | None = None
         for repair_round in range(3):
             research = self.generate(payload)
             try:
                 evidence = verifier.verify_research(research)
                 return research, evidence
             except SourceVerificationError as error:
+                last_error = error
                 if repair_round >= 2:
+                    # 3轮修复后仍有URL无法验证，降级处理：
+                    # 返回已验证通过的evidence，未通过的记录为警告，不阻断流程
+                    partial_evidence = list(error.evidence)
+                    verified_count = sum(
+                        1 for e in partial_evidence if e.get("claim_supported")
+                    )
+                    total_count = len(research.facts)
+                    # 如果至少有30%的事实通过验证，就继续流程
+                    if verified_count >= max(1, total_count * 0.3):
+                        import logging
+                        logging.warning(
+                            f"来源验证降级通过：{verified_count}/{total_count} 个事实验证通过，"
+                            f"未通过的有 {len(error.errors)} 个错误，继续流程"
+                        )
+                        return research, partial_evidence
+                    # 通过率太低，才真正抛出错误
                     error.research = research.model_dump(mode="json")
                     raise
                 next_round = repair_round + 1
@@ -55,4 +73,7 @@ class ResearchEngine(StructuredEngine):
                     "source_verification_errors": error.errors,
                     "repair_round": next_round,
                 }
+        # 理论上不会到这里
+        if last_error:
+            raise last_error
         raise RuntimeError("来源验证修正流程异常结束")

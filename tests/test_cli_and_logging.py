@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import json
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,6 +13,27 @@ from aicf.cli import main
 from aicf.database import JobRepository
 from aicf.logging_utils import configure_logging, sanitize_error
 from aicf.state_machine import PipelineStage
+
+
+def test_importing_cli_does_not_replace_process_streams() -> None:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; "
+                "stdout, stderr = sys.stdout, sys.stderr; "
+                "import aicf.cli; "
+                "assert sys.stdout is stdout; "
+                "assert sys.stderr is stderr"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_cli_doctor_runs_and_never_prints_secret(

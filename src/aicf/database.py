@@ -120,9 +120,12 @@ class JobRepository:
             self._sync_snapshot(status)
 
     def create_job(self, job_id: str, output_dir: str | Path) -> JobStatus:
+        from aicf.production_settings import ProductionSettings
+
         self._validate_job_id(job_id)
         destination = Path(output_dir)
         destination.mkdir(parents=True, exist_ok=True)
+        ProductionSettings().freeze_for_job(destination)
         now = utc_now()
         status = JobStatus(
             job_id=job_id,

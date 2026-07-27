@@ -76,6 +76,8 @@ def test_detects_dreamina_1411_async_protocol_and_4_to_15_second_video() -> None
         "{ratio}",
         "--model_version",
         "{model}",
+        "--resolution_type",
+        "{resolution}",
         "--poll",
         "0",
     ]
@@ -142,10 +144,26 @@ def test_image_submission_parses_submit_id_polls_and_downloads_to_chinese_path(
         "9:16",
         "--model_version",
         "4.1",
+        "--resolution_type",
+        "2k",
         "--poll",
         "0",
     ]
     assert calls[-1][-2] == "--download_dir"
+
+
+def test_video_command_carries_selected_resolution() -> None:
+    adapter = JimengCliAdapter("dreamina", capabilities())
+
+    command = adapter.build_video_command(
+        "动态画面",
+        5,
+        model="seedance2.0",
+        ratio="9:16",
+        resolution="1080p",
+    )
+
+    assert command[command.index("--video_resolution") + 1] == "1080p"
 
 
 def test_failure_state_stops_polling_with_server_reason(tmp_path: Path) -> None:
@@ -232,14 +250,37 @@ def test_only_idempotent_timeout_is_retried_once(tmp_path: Path) -> None:
 
 
 def test_cache_key_changes_with_prompt_model_ratio_and_duration() -> None:
-    base = JimengCliAdapter._cache_key("提示词", "4.1", "9:16", None)
+    base = JimengCliAdapter._cache_key(
+        "提示词",
+        "4.1",
+        "9:16",
+        None,
+        kind="image",
+        resolution="2k",
+    )
 
-    assert base != JimengCliAdapter._cache_key("另一提示词", "4.1", "9:16", None)
-    assert base != JimengCliAdapter._cache_key("提示词", "4.0", "9:16", None)
-    assert base != JimengCliAdapter._cache_key("提示词", "4.1", "16:9", None)
+    assert base != JimengCliAdapter._cache_key(
+        "另一提示词", "4.1", "9:16", None, kind="image", resolution="2k"
+    )
+    assert base != JimengCliAdapter._cache_key(
+        "提示词", "4.0", "9:16", None, kind="image", resolution="2k"
+    )
+    assert base != JimengCliAdapter._cache_key(
+        "提示词", "4.1", "16:9", None, kind="image", resolution="2k"
+    )
     assert (
-        JimengCliAdapter._cache_key("视频", "seedance2.0fast", "9:16", 4)
-        != JimengCliAdapter._cache_key("视频", "seedance2.0fast", "9:16", 5)
+        JimengCliAdapter._cache_key(
+            "视频", "seedance2.0fast", "9:16", 4, kind="video", resolution="720p"
+        )
+        != JimengCliAdapter._cache_key(
+            "视频", "seedance2.0fast", "9:16", 5, kind="video", resolution="720p"
+        )
+    )
+    assert base != JimengCliAdapter._cache_key(
+        "提示词", "4.1", "9:16", None, kind="video", resolution="2k"
+    )
+    assert base != JimengCliAdapter._cache_key(
+        "提示词", "4.1", "9:16", None, kind="image", resolution="4k"
     )
 
 

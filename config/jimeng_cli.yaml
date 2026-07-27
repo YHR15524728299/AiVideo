@@ -9,6 +9,8 @@ image_command:
 - '{ratio}'
 - --model_version
 - '{model}'
+- --resolution_type
+- 2k
 - --poll
 - '0'
 video_command:
@@ -21,6 +23,8 @@ video_command:
 - '{ratio}'
 - --model_version
 - '{model}'
+- --video_resolution
+- 720p
 - --poll
 - '0'
 status_command:
@@ -64,6 +68,6 @@ execution:
   cache_enabled: true
 detection:
   status: detected
-  checked_at: '2026-07-21'
+  checked_at: '2026-07-27'
   source: dreamina --help; text2image --help; text2video --help; query_result --help
   note: Dreamina 1.4.11 异步协议：提交、query_result 轮询、download_dir 下载。

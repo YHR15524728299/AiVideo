@@ -10,6 +10,7 @@ from typing import Callable, cast
 
 from aicf.atomic_io import atomic_replace
 from aicf.models import VisualPlan
+from aicf.production_settings import ProductionSettings
 
 
 _PENDING_STATES = {
@@ -47,6 +48,7 @@ class M4AssetRunner:
         )
         self.clock = clock
         self.sleep = sleep
+        self.production_settings = ProductionSettings()
 
     def run(
         self,
@@ -62,6 +64,8 @@ class M4AssetRunner:
             plan_path.read_text(encoding="utf-8-sig")
         )
         root = plan_path.parent
+        self.production_settings = ProductionSettings.load_for_job(root)
+        self._apply_motion_mode(plan)
         tasks_path = root / "assets" / "tasks.json"
         manifest_path = root / "asset_manifest.json"
         tasks_document = self._load_or_create_tasks(tasks_path, plan)
@@ -76,10 +80,16 @@ class M4AssetRunner:
                 else original_target
             )
             if task["status"] == "completed" and target.is_file():
-                if task.get("degraded_from") == "video":
-                    shot.asset_type = "image"
-                    shot.expected_path = self._relative_path(root, target)
-                continue
+                try:
+                    self._validate_media(target, active_kind)
+                except (OSError, ValueError, TypeError):
+                    task["status"] = "submitted" if task.get("submit_id") else "new"
+                    self._write_json(tasks_path, tasks_document)
+                else:
+                    if task.get("degraded_from") == "video":
+                        shot.asset_type = "image"
+                        shot.expected_path = self._relative_path(root, target)
+                    continue
             if (
                 task.get("status")
                 in {"submission_intent", "UNKNOWN_REMOTE_SUBMISSION"}
@@ -126,10 +136,10 @@ class M4AssetRunner:
                 payload = self.provider.query(str(task["submit_id"]))
                 state = self._state(payload)
                 if state in _SUCCESS_STATES:
-                    self.provider.download(
+                    self._download_validated(
                         str(task["submit_id"]),
                         target,
-                        kind=active_kind,
+                        active_kind,
                     )
                     task["status"] = "completed"
                     task["downloaded_path"] = self._relative_path(root, target)
@@ -162,24 +172,6 @@ class M4AssetRunner:
                         active_kind == shot.asset_type
                         and int(task["attempts"]) < 2
                     ):
-                        task["submit_id"] = None
-                        self._submit_with_intent(
-                            tasks_path,
-                            tasks_document,
-                            task,
-                            active_kind,
-                            shot.prompt,
-                            shot.duration_seconds,
-                            usage_recorder,
-                            budget_guard,
-                        )
-                        continue
-                    if shot.asset_type == "video" and active_kind == "video":
-                        active_kind = "image"
-                        target = original_target.with_suffix(".keyframe.png")
-                        task["active_kind"] = active_kind
-                        task["degraded_from"] = "video"
-                        task["degradation_reason"] = str(reason)
                         task["submit_id"] = None
                         self._submit_with_intent(
                             tasks_path,
@@ -226,6 +218,7 @@ class M4AssetRunner:
                     prompt,
                     model=str(parameters["model"]),
                     ratio=str(parameters["ratio"]),
+                    resolution=str(parameters["resolution"]),
                 )
             )
         return str(
@@ -234,6 +227,7 @@ class M4AssetRunner:
                 duration_seconds,
                 model=str(parameters["model"]),
                 ratio=str(parameters["ratio"]),
+                resolution=str(parameters["resolution"]),
             )
         )
 
@@ -272,17 +266,47 @@ class M4AssetRunner:
         self._record_usage_if_needed(task, usage_recorder)
         self._write_json(tasks_path, tasks_document)
 
-    @staticmethod
     def _submission_parameters(
+        self,
         kind: str,
         duration_seconds: float,
     ) -> dict[str, object]:
+        ratio = "16:9" if self.production_settings.orientation == "landscape" else "9:16"
         return {
             "kind": kind,
-            "model": "4.1" if kind == "image" else "seedance2.0fast",
-            "ratio": "9:16",
+            "model": (
+                "4.1"
+                if kind == "image"
+                else self.production_settings.jimeng_model
+            ),
+            "ratio": ratio,
+            "resolution": (
+                "2k"
+                if kind == "image"
+                else self.production_settings.video_resolution
+            ),
             "duration_seconds": duration_seconds,
         }
+
+    def _apply_motion_mode(self, plan: VisualPlan) -> None:
+        """根据 motion_mode 将所有镜头设置为纯图片或纯视频。
+
+        视频模式下，即梦视频要求时长 4-15 秒，短于 4 秒的镜头会被调整为 4 秒。
+        """
+        desired = self.production_settings.motion_mode  # "image" 或 "video"
+        for shot in plan.shots:
+            if shot.asset_type == desired:
+                if desired == "video" and shot.duration_seconds < 4:
+                    shot.duration_seconds = 4.0
+                continue
+            shot.asset_type = desired
+            suffix = ".mp4" if desired == "video" else ".png"
+            shot.expected_path = str(
+                Path(shot.expected_path).with_suffix(suffix)
+            ).replace("\\", "/")
+            if desired == "video" and shot.duration_seconds < 4:
+                shot.duration_seconds = 4.0
+        plan.total_duration_seconds = sum(s.duration_seconds for s in plan.shots)
 
     @staticmethod
     def _usage_delta(kind: str, duration_seconds: float) -> dict[str, int]:
@@ -354,18 +378,21 @@ class M4AssetRunner:
         try:
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
             expected_hash = str(metadata["sha256"])
-            if hashlib.sha256(source.read_bytes()).hexdigest() != expected_hash:
+            if self._sha256(source) != expected_hash:
                 return False
             target.parent.mkdir(parents=True, exist_ok=True)
-            temporary = target.with_suffix(target.suffix + ".cache.tmp")
+            temporary = target.with_name(
+                f".{target.stem}.cache-{uuid.uuid4().hex}{target.suffix}"
+            )
             shutil.copy2(source, temporary)
-            if hashlib.sha256(temporary.read_bytes()).hexdigest() != expected_hash:
+            if self._sha256(temporary) != expected_hash:
                 temporary.unlink(missing_ok=True)
                 return False
+            self._validate_media(temporary, kind)
             atomic_replace(temporary, target)
-            self.media_probe(target, kind)
         except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
-            target.unlink(missing_ok=True)
+            if "temporary" in locals():
+                temporary.unlink(missing_ok=True)
             return False
         task["cache_key"] = metadata_path.stem
         return True
@@ -388,10 +415,54 @@ class M4AssetRunner:
         self._write_json(
             metadata_path,
             {
-                "sha256": hashlib.sha256(cache_path.read_bytes()).hexdigest(),
-                "media_probe": self.media_probe(cache_path, kind),
+                "sha256": self._sha256(cache_path),
+                "media_probe": self._validate_media(cache_path, kind),
             },
         )
+
+    def _download_validated(
+        self,
+        submit_id: str,
+        target: Path,
+        kind: str,
+    ) -> None:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(
+            f".{target.stem}.download-{uuid.uuid4().hex}{target.suffix}"
+        )
+        try:
+            self.provider.download(submit_id, temporary, kind=kind)
+            self._validate_media(temporary, kind)
+            atomic_replace(temporary, target)
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+
+    def _validate_media(self, path: Path, kind: str) -> dict[str, object]:
+        if not path.is_file() or path.stat().st_size <= 0:
+            raise ValueError(f"{kind} 素材为空或不存在: {path.name}")
+        probe = self.media_probe(path, kind)
+        reported_kind = probe.get("kind")
+        if reported_kind is not None and str(reported_kind) != kind:
+            raise ValueError(
+                f"素材类型不匹配: 期望 {kind}，实际 {reported_kind}"
+            )
+        for dimension in ("width", "height"):
+            if int(probe.get(dimension, 0)) <= 0:
+                raise ValueError(f"{kind} 素材缺少有效 {dimension}")
+        if kind == "image" and not str(probe.get("format", "")).strip():
+            raise ValueError("图片素材格式无效")
+        if kind == "video" and float(probe.get("duration_seconds", 0)) <= 0:
+            raise ValueError("视频素材时长无效")
+        return probe
+
+    @staticmethod
+    def _sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
 
     @staticmethod
     def _state(payload: dict[str, object]) -> str:
@@ -454,6 +525,36 @@ class M4AssetRunner:
                         "usage_recorded": False,
                     }
                 )
+            else:
+                expected_parameters = self._submission_parameters(
+                    shot.asset_type,
+                    shot.duration_seconds,
+                )
+                type_conflict = (
+                    not task.get("degraded_from")
+                    and (
+                        task.get("asset_type") != shot.asset_type
+                        or task.get("active_kind") != shot.asset_type
+                    )
+                )
+                saved_parameters = task.get("submission_parameters")
+                settings_conflict = (
+                    isinstance(saved_parameters, dict)
+                    and not task.get("degraded_from")
+                    and saved_parameters != expected_parameters
+                )
+                if type_conflict or settings_conflict:
+                    if task.get("submit_id") or task.get("status") != "new":
+                        raise ValueError(
+                            f"{shot.shot_id} 恢复冲突：素材类型或生产设置已变化"
+                        )
+                    task.update(
+                        {
+                            "asset_type": shot.asset_type,
+                            "active_kind": shot.asset_type,
+                            "submission_parameters": None,
+                        }
+                    )
             tasks.append(task)
         document: dict[str, object] = {"version": 1, "tasks": tasks}
         self._write_json(tasks_path, document)
@@ -479,8 +580,8 @@ class M4AssetRunner:
                     "prompt": shot.prompt,
                     "expected_path": shot.expected_path,
                     "authoritative_duration_seconds": shot.duration_seconds,
-                    "sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
-                    "media_probe": self.media_probe(target, shot.asset_type),
+                    "sha256": self._sha256(target),
+                    "media_probe": self._validate_media(target, shot.asset_type),
                 }
             )
         self._write_json(plan_path, plan.model_dump(mode="json"))

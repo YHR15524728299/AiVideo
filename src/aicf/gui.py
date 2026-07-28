@@ -394,7 +394,9 @@ class AicfGUI:
         self.ui_queue: queue.Queue[tuple[str, object, object | None]] = queue.Queue()
         self.running = False
         self.current_process: subprocess.Popen[str] | None = None
-        self._polling_job_id: str = ""  # 当前轮询进度的任务 ID
+        self._polling_job_id: str = ""  # 正在运行、需要实时跟踪日志的任务
+        self._display_job_id: str = ""  # 进度条当前显示的任务（跟随用户选中项）
+        self._user_selected_job: bool = False  # 用户是否手动选中了某个任务（用于判断是否自动切换显示）
         self._logged_stages: set[str] = set()  # 已记录到日志的阶段，避免重复
         self._log_file_offsets: dict[str, int] = {}  # 已读取的日志文件字节位置，用于增量读取
         self._last_refresh_ts: float = 0.0  # 上次刷新任务列表的时间戳
@@ -951,11 +953,10 @@ class AicfGUI:
         self._log(f"执行命令: {' '.join(args)}", "info")
         self._log_file_offsets.clear()  # 清空日志文件偏移，重新读取
 
-        # 提取 job_id 用于轮询进度（全局轮询器已在运行，会自动检测新任务）
+        # 提取 job_id，全局轮询器会自动检测并开始跟踪
         try:
             idx = args.index("--job")
             self._polling_job_id = args[idx + 1]
-            self._logged_stages.clear()
         except (ValueError, IndexError):
             self._polling_job_id = ""
 
@@ -1009,17 +1010,16 @@ class AicfGUI:
         """命令执行完毕（进程退出），刷新状态让轮询器读取最终结果。"""
         self.current_process = None
         self._set_buttons_running(False)
-        # 不立即清除 _polling_job_id，让全局轮询器读取 status.json 的最终状态（完成/失败）
+        # 不立即清除 _polling_job_id/_display_job_id，让全局轮询器读取 status.json 的最终状态
         self._refresh_job_list()
-        self._refresh_status()
+        self._refresh_status_for_job(self._display_job_id)
 
     def _auto_detect_and_poll(self) -> None:
-        """启动时自动检测 outputs 目录中是否有正在运行的任务，自动开始轮询。"""
+        """启动时自动检测 outputs 目录中是否有正在运行的任务，自动开始跟踪。"""
         outputs = project_root() / "outputs"
         if not outputs.is_dir():
             return
         terminal_states = {"COMPLETED", "INIT", "FAILED_RETRYABLE", "FAILED_NEEDS_ATTENTION"}
-        # 找最近修改的、正在运行的任务
         running_jobs: list[tuple[float, Path]] = []
         for job_dir in outputs.iterdir():
             if not job_dir.is_dir():
@@ -1045,42 +1045,59 @@ class AicfGUI:
             running_jobs.sort(reverse=True)
             job_id = running_jobs[0][1].name
             self._polling_job_id = job_id
+            self._display_job_id = job_id
+            self._user_selected_job = False
             self._logged_stages.clear()
             self._set_buttons_running(True)
             self._log(f"自动检测到运行中的任务 [{job_id}]，已连接进度跟踪", "info")
-            # 自动选中该任务
             self.job_id_var.set(job_id)
             self.job_tree.selection_set(job_id)
             self.job_tree.focus(job_id)
             self._highlight_selected_job()
+        else:
+            # 无运行任务，默认显示最新任务的状态
+            all_jobs = sorted(
+                [p for p in outputs.iterdir() if p.is_dir()],
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            if all_jobs:
+                self._display_job_id = all_jobs[0].name
+                self.job_tree.selection_set(self._display_job_id)
+                self.job_tree.focus(self._display_job_id)
+                self._highlight_selected_job()
+                self._refresh_status_for_job(self._display_job_id)
 
     def _poll_progress(self) -> None:
         """全局实时状态轮询（每1.5秒），自动检测运行任务、刷新进度和任务列表。"""
         import time
         now = time.time()
 
-        # 1. 如果没有正在跟踪的任务，自动检测
-        if not self._polling_job_id:
-            self._auto_detect_running_job()
+        # 1. 自动检测/更新正在运行的任务（用于日志跟踪和按钮状态）
+        self._detect_running_job()
 
-        # 2. 更新当前跟踪任务的进度
+        # 2. 更新进度条显示（显示 _display_job_id 的阶段状态）
+        if self._display_job_id:
+            self._update_display_job_stages()
+
+        # 3. 实时读取运行任务的日志
         if self._polling_job_id:
-            self._update_current_job_progress()
+            self._tail_running_job_logs()
 
-        # 3. 每2秒刷新一次任务列表（比之前9秒快很多）
+        # 4. 每2秒刷新任务列表
         if now - self._last_refresh_ts >= 2.0:
             self._refresh_job_list()
-            # 刷新任务列表后检查选中任务的状态变化
-            self._check_tracked_job_status()
+            self._sync_display_after_refresh()
             self._last_refresh_ts = now
 
-        # 4. 始终安排下一次轮询（1.5秒间隔，比之前3秒更实时）
         self.root.after(1500, self._poll_progress)
 
-    def _auto_detect_running_job(self) -> None:
-        """自动检测是否有新启动的任务，无需手动选中即可跟踪。"""
+    def _detect_running_job(self) -> None:
+        """检测当前是否有正在运行的任务，更新 _polling_job_id 和按钮状态。"""
         outputs = project_root() / "outputs"
         if not outputs.is_dir():
+            self._polling_job_id = ""
+            self._set_buttons_running(False)
             return
         terminal_states = {"COMPLETED", "INIT", "FAILED_RETRYABLE", "FAILED_NEEDS_ATTENTION"}
         newest_running: tuple[float, str] | None = None
@@ -1106,18 +1123,36 @@ class AicfGUI:
                         newest_running = (mtime, job_dir.name)
             except Exception:
                 pass
+
         if newest_running:
             job_id = newest_running[1]
             if self._polling_job_id != job_id:
+                # 新的运行任务开始了
                 self._polling_job_id = job_id
                 self._logged_stages.clear()
                 self._log_file_offsets.clear()
                 self._set_buttons_running(True)
-                self._log(f"检测到新任务 [{job_id}]，开始跟踪进度", "info")
+                self._log(f"检测到任务 [{job_id}] 开始运行，正在跟踪进度", "info")
+                # 如果用户没有手动选中其他任务，自动切换显示到运行中的任务
+                if not self._user_selected_job:
+                    self._display_job_id = job_id
+                    self.job_id_var.set(job_id)
+                    self.job_tree.selection_set(job_id)
+                    self.job_tree.focus(job_id)
+                    self._highlight_selected_job()
+        else:
+            # 没有运行中的任务了
+            if self._polling_job_id:
+                finished_id = self._polling_job_id
+                self._polling_job_id = ""
+                self._set_buttons_running(False)
+                # 如果显示的就是刚结束的任务，更新最终状态文字
+                if self._display_job_id == finished_id:
+                    self._update_display_job_stages()
 
-    def _update_current_job_progress(self) -> None:
-        """更新当前跟踪任务的阶段进度、状态文字和增量日志。"""
-        sp = self._get_status_path(self._polling_job_id)
+    def _update_display_job_stages(self) -> None:
+        """根据 _display_job_id 更新进度条阶段颜色、状态文字。"""
+        sp = self._get_status_path(self._display_job_id)
         if not sp.is_file():
             return
         try:
@@ -1127,7 +1162,22 @@ class AicfGUI:
             failed = data.get("failed_stage", "")
             completed = data.get("completed_stages", [])
             stage_name = self._translate_stage(cur) if cur else ""
-            if cur == "FAILED_NEEDS_ATTENTION":
+            is_running = self._is_job_display_running(self._display_job_id, data)
+
+            # 状态栏文字
+            if self._polling_job_id and self._polling_job_id != self._display_job_id:
+                # 用户在看历史任务，但有其他任务在后台运行
+                run_stage = ""
+                rsp = self._get_status_path(self._polling_job_id)
+                if rsp.is_file():
+                    try:
+                        rdata = json.loads(rsp.read_text(encoding="utf-8"))
+                        rc = rdata.get("current_stage", "")
+                        run_stage = self._translate_stage(rc) if rc else ""
+                    except Exception:
+                        pass
+                self._set_status(f"后台运行: {run_stage} | 查看: {self._display_job_id}")
+            elif cur == "FAILED_NEEDS_ATTENTION":
                 self._set_status("失败，需人工处理")
             elif cur == "FAILED_RETRYABLE":
                 failed_name = self._translate_stage(failed) if failed else stage_name
@@ -1137,28 +1187,30 @@ class AicfGUI:
                 self._set_status(f"运行中: {stage_name}（{failed_name} 失败，等待恢复）")
             elif cur == "COMPLETED" or data.get("status") == "ready_to_publish":
                 self._set_status("完成 ✓")
-            else:
+            elif is_running:
                 self._set_status(f"运行中: {stage_name}")
+            else:
+                self._set_status(f"任务 [{self._display_job_id}] {stage_name}")
 
-            for s in completed:
-                if s not in self._logged_stages:
-                    s_name = self._translate_stage(s)
-                    self._log(f"✓ {s_name} 完成", "success")
-                    self._logged_stages.add(s)
-            if (
-                cur
-                and cur not in self._logged_stages
-                and cur not in ("COMPLETED", "FAILED_RETRYABLE", "FAILED_NEEDS_ATTENTION")
-            ):
-                self._log(f"→ 进入阶段: {stage_name}", "info")
-                self._logged_stages.add(cur)
-
-            self._tail_log_files(data)
+            # 运行中任务的阶段完成日志
+            if self._polling_job_id == self._display_job_id:
+                for s in completed:
+                    if s not in self._logged_stages:
+                        s_name = self._translate_stage(s)
+                        self._log(f"✓ {s_name} 完成", "success")
+                        self._logged_stages.add(s)
+                if (
+                    cur
+                    and cur not in self._logged_stages
+                    and cur not in ("COMPLETED", "FAILED_RETRYABLE", "FAILED_NEEDS_ATTENTION")
+                ):
+                    self._log(f"→ 进入阶段: {stage_name}", "info")
+                    self._logged_stages.add(cur)
         except Exception:
             pass
 
-    def _check_tracked_job_status(self) -> None:
-        """检查跟踪的任务是否已结束（完成/失败），如果是则清理跟踪状态。"""
+    def _tail_running_job_logs(self) -> None:
+        """增量读取运行中任务的日志文件并输出到日志区。"""
         if not self._polling_job_id:
             return
         sp = self._get_status_path(self._polling_job_id)
@@ -1166,34 +1218,51 @@ class AicfGUI:
             return
         try:
             data = json.loads(sp.read_text(encoding="utf-8"))
-            cur = data.get("current_stage", "")
-            failed = data.get("failed_stage", "")
-            job_dir = self._get_job_dir(self._polling_job_id)
-            is_running = bool(
-                cur
-                and cur not in {"COMPLETED", "INIT", "FAILED_RETRYABLE", "FAILED_NEEDS_ATTENTION"}
-                and not failed
-                and self._is_job_really_running(job_dir, data)
-            )
-            if not is_running:
-                # 任务结束了
-                if cur == "COMPLETED" or data.get("status") == "ready_to_publish":
-                    self._set_status("完成 ✓")
-                    self._log(f"任务 [{self._polling_job_id}] 已完成", "success")
-                elif cur == "FAILED_NEEDS_ATTENTION":
-                    self._set_status("失败，需人工处理")
-                elif failed or cur == "FAILED_RETRYABLE":
-                    failed_name = self._translate_stage(failed) if failed else ""
-                    self._set_status(f"失败: {failed_name}，可点击继续/恢复")
-                self._polling_job_id = ""
-                self._set_buttons_running(False)
+            self._tail_log_files(data)
+        except Exception:
+            pass
+
+    def _is_job_display_running(self, job_id: str, data: dict) -> bool:
+        """判断一个任务是否真正在运行（用于显示状态）。"""
+        cur = data.get("current_stage", "")
+        failed = data.get("failed_stage", "")
+        terminal = {"COMPLETED", "INIT", "FAILED_RETRYABLE", "FAILED_NEEDS_ATTENTION"}
+        if not cur or cur in terminal or failed:
+            return False
+        job_dir = self._get_job_dir(job_id)
+        return self._is_job_really_running(job_dir, data)
+
+    def _sync_display_after_refresh(self) -> None:
+        """刷新任务列表后，确保选中项和显示状态同步。"""
+        sel = self.job_tree.selection()
+        if sel:
+            job_id = str(sel[0])
+            if self._display_job_id != job_id:
+                self._display_job_id = job_id
+        elif self._display_job_id and self.job_tree.exists(self._display_job_id):
+            self.job_tree.selection_set(self._display_job_id)
+            self.job_tree.focus(self._display_job_id)
+            self._highlight_selected_job()
+
+    def _refresh_status_for_job(self, job_id: str) -> None:
+        """刷新指定任务的阶段进度显示。"""
+        sp = self._get_status_path(job_id)
+        if not sp.is_file():
+            return
+        try:
+            data = json.loads(sp.read_text(encoding="utf-8"))
+            self._update_stages_from_status(data)
         except Exception:
             pass
 
     def _start_job(self) -> None:
         self._logged_stages.clear()
+        self._log_file_offsets.clear()
         job_id = self.job_id_var.get().strip() or self._auto_job_id()
         self.job_id_var.set(job_id)
+        # 新任务启动，显示切到新任务
+        self._display_job_id = job_id
+        self._user_selected_job = False
         self._ensure_direction_file()
         try:
             self._collect_production_settings().freeze_for_job(
@@ -1210,10 +1279,13 @@ class AicfGUI:
 
     def _resume_job(self) -> None:
         self._logged_stages.clear()
+        self._log_file_offsets.clear()
         job_id = self._current_job_id()
         if not job_id:
             messagebox.showwarning("提示", "请先在历史任务中选择一个任务，或在任务ID框中输入")
             return
+        self._display_job_id = job_id
+        self._user_selected_job = False
         self._load_job_production_settings(job_id)
         self._log(f"任务 [{job_id}] 继续/恢复", "info")
         self._run_command_async(
@@ -1250,7 +1322,10 @@ class AicfGUI:
     # ------------------------------------------------------------------
     def _refresh_all(self) -> None:
         self._refresh_job_list()
-        self._refresh_status()
+        job_id = self._current_job_id() or self._display_job_id
+        if job_id:
+            self._display_job_id = job_id
+            self._refresh_status_for_job(job_id)
 
     def _refresh_status(self) -> None:
         job_id = self._current_job_id()
@@ -1395,38 +1470,21 @@ class AicfGUI:
             self._highlight_selected_job()
             job_id = str(sel[0])
             self.job_id_var.set(job_id)
+            # 用户手动选中任务，进度条显示该任务的状态
+            self._display_job_id = job_id
+            self._user_selected_job = True
             self._load_job_production_settings(job_id)
-            self._refresh_status()
-            # 如果选中的任务正在运行中，自动启动进度轮询
+            self._refresh_status_for_job(job_id)
             sp = self._get_status_path(job_id)
             if sp.is_file():
                 try:
                     data = json.loads(sp.read_text(encoding="utf-8"))
-                    cur = data.get("current_stage", "")
-                    failed = data.get("failed_stage", "")
                     job_dir = self._get_job_dir(job_id)
-                    # 判断是否正在运行：不是终态、不是失败态、且进程真的在运行
-                    terminal_states = {
-                        "COMPLETED", "INIT",
-                        "FAILED_RETRYABLE", "FAILED_NEEDS_ATTENTION",
-                    }
-                    is_running = bool(
-                        cur
-                        and cur not in terminal_states
-                        and not failed
-                        and self._is_job_really_running(job_dir, data)
-                    )
-                    if is_running and self._polling_job_id != job_id:
-                        self._logged_stages.clear()
-                        self._log_file_offsets.clear()
-                        self._polling_job_id = job_id
+                    is_running = self._is_job_display_running(job_id, data)
+                    if is_running:
                         self._set_buttons_running(True)
-                        self._log(f"已切换跟踪到任务 [{job_id}]", "info")
-                    elif not is_running:
-                        # 选中的任务未运行，确保按钮可用
-                        # 注意：不清除 _polling_job_id，因为可能有其他任务在后台运行
-                        # 全局轮询器会自动检测真正在运行的任务
-                        self._set_buttons_running(False)
+                    else:
+                        self._set_buttons_running(self._polling_job_id != "")
                 except Exception:
                     pass
 

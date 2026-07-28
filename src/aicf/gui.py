@@ -27,6 +27,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from .config import load_config
+from .database import JobRepository
 from .file_lock import lock_is_active
 from .production_settings import (
     ProductionSettings,
@@ -657,6 +658,7 @@ class AicfGUI:
         self.log_text.tag_configure("error", foreground="#ff6b6b")
         self.log_text.tag_configure("success", foreground="#51cf66")
         self.log_text.tag_configure("info", foreground="#74c0fc")
+        self.log_text.tag_configure("warning", foreground="#ffa94d")
 
         # 右键菜单
         self._log_menu = Menu(self.log_text, tearoff=0)
@@ -700,7 +702,7 @@ class AicfGUI:
                 else:
                     text, tag = item, ""
                 self.log_text.configure(state="normal")
-                if tag and tag in ("error", "success", "info"):
+                if tag and tag in ("error", "success", "info", "warning"):
                     self.log_text.insert("end", text, tag)
                 else:
                     self.log_text.insert("end", text)
@@ -742,6 +744,51 @@ class AicfGUI:
 
     def _get_status_path(self, job_id: str) -> Path:
         return self._get_job_dir(job_id) / "status.json"
+
+    def _get_repo(self) -> JobRepository:
+        return JobRepository(project_root() / "data" / "content.db")
+
+    def _recover_zombie_job(self, job_id: str, data: dict) -> bool:
+        """检测并自动恢复僵尸任务（进程已死但状态显示运行中）。
+        返回 True 表示成功恢复为可重试状态。"""
+        cur = data.get("current_stage", "")
+        failed = data.get("failed_stage", "")
+        terminal = {"COMPLETED", "INIT", "FAILED_RETRYABLE", "FAILED_NEEDS_ATTENTION"}
+        if not cur or cur in terminal or failed:
+            return False
+        # 检查是否真的是僵尸（锁文件失效=进程已死）
+        job_dir = self._get_job_dir(job_id)
+        lock_path = job_dir / ".autopilot.lock"
+        if lock_is_active(lock_path, stale_after=120.0):
+            return False  # 进程还在运行，不是僵尸
+        # 确认是僵尸：尝试标记为可重试失败
+        try:
+            stage = PipelineStage(cur)
+            repo = self._get_repo()
+            # 读取当前状态确认
+            status = repo.get_job(job_id)
+            if status.current_stage == stage and status.failed_stage is None:
+                repo.fail_stage(
+                    job_id,
+                    stage,
+                    reason="进程异常退出（可能是程序被关闭、网络中断或电脑休眠），点击「继续/恢复」即可从当前阶段重新开始",
+                    retryable=True,
+                )
+                self._log(
+                    f"检测到异常中断的任务 [{job_id}]（阶段：{self._translate_stage(cur)}），"
+                    f"已自动标记为可恢复，点击「继续/恢复」即可继续",
+                    "warning",
+                )
+                # 清理过期锁文件
+                try:
+                    if lock_path.exists():
+                        lock_path.unlink()
+                except Exception:
+                    pass
+                return True
+        except Exception:
+            pass
+        return False
 
     def _collect_production_settings(self) -> ProductionSettings:
         # 将中文显示名转换回内部值
@@ -1031,6 +1078,13 @@ class AicfGUI:
                 data = json.loads(sp.read_text(encoding="utf-8"))
                 cur = data.get("current_stage", "")
                 failed = data.get("failed_stage", "")
+                # 自动检测并恢复僵尸任务（进程已死但状态显示运行中）
+                if cur and cur not in terminal_states and not failed:
+                    self._recover_zombie_job(job_dir.name, data)
+                    # 恢复后重新读取状态
+                    data = json.loads(sp.read_text(encoding="utf-8"))
+                    cur = data.get("current_stage", "")
+                    failed = data.get("failed_stage", "")
                 is_running = bool(
                     cur
                     and cur not in terminal_states
@@ -1111,6 +1165,12 @@ class AicfGUI:
                 data = json.loads(sp.read_text(encoding="utf-8"))
                 cur = data.get("current_stage", "")
                 failed = data.get("failed_stage", "")
+                # 自动检测并恢复僵尸任务
+                if cur and cur not in terminal_states and not failed:
+                    if self._recover_zombie_job(job_dir.name, data):
+                        data = json.loads(sp.read_text(encoding="utf-8"))
+                        cur = data.get("current_stage", "")
+                        failed = data.get("failed_stage", "")
                 is_running = bool(
                     cur
                     and cur not in terminal_states
@@ -1609,6 +1669,24 @@ class AicfGUI:
     # ------------------------------------------------------------------
     def _on_close(self) -> None:
         self._stop_preview()
+        # 如果有任务正在运行，提示用户
+        if self.current_process and self.current_process.poll() is None:
+            confirm = messagebox.askyesno(
+                "确认退出",
+                "当前有任务正在生成中，关闭窗口将中断任务。\n\n下次打开时可以点击「继续/恢复」从断点继续。\n\n确定要退出吗？",
+                icon="warning",
+            )
+            if not confirm:
+                return
+            # 终止正在运行的子进程
+            try:
+                self.current_process.terminate()
+                self.current_process.wait(timeout=5)
+            except Exception:
+                try:
+                    self.current_process.kill()
+                except Exception:
+                    pass
         self.root.destroy()
 
     def run(self) -> None:

@@ -150,6 +150,11 @@ def _responses() -> dict[str, dict[str, object]]:
                 "description": "Your workflow may be the real problem.",
                 "hashtags": ["AITools", "CreatorTips"],
             },
+            "youtube": {
+                "title": "Why AI Video Workflows Fail (And How to Fix Them)",
+                "description": "A deep dive into the real reason AI-generated videos fail and the workflow that fixes it.",
+                "hashtags": ["AIVideo", "Workflow", "CreatorEconomy"],
+            },
         },
     }
 
@@ -214,7 +219,7 @@ def test_content_orchestrator_runs_direction_to_publish_and_writes_contract_file
             "content_goal": "给出可执行判断",
             "content_pillars": ["AI视频质量"],
             "tone": ["清晰", "直接"],
-            "platforms": ["douyin", "xiaohongshu", "youtube_shorts", "tiktok"],
+            "platforms": ["douyin", "xiaohongshu", "youtube_shorts", "tiktok", "youtube"],
             "visual_style": "电影化知识短片",
             "avoid": ["虚假数据"],
         },
@@ -257,6 +262,7 @@ def test_content_orchestrator_runs_direction_to_publish_and_writes_contract_file
         "xiaohongshu",
         "youtube_shorts",
         "tiktok",
+        "youtube",
     }
     script_md = (output_dir / "script.md").read_text(encoding="utf-8")
     assert "# AI视频不稳定，先别怪模型" in script_md
@@ -283,7 +289,7 @@ def test_review_failure_stops_before_package(tmp_path: Path) -> None:
     manifest = ContentOrchestrator(client, output_dir).run(
         direction={
             "direction": "AI 内容",
-            "platforms": ["douyin", "xiaohongshu", "youtube_shorts", "tiktok"],
+            "platforms": ["douyin", "xiaohongshu", "youtube_shorts", "tiktok", "youtube"],
         },
         selected_topic={
             "topic_id": "T001",
@@ -329,7 +335,7 @@ def test_failed_rerun_keeps_previous_publish_and_isolates_review_artifacts(
     manifest = ContentOrchestrator(FakeStructuredClient(responses), output_dir).run(
         direction={
             "direction": "AI 内容",
-            "platforms": ["douyin", "xiaohongshu", "youtube_shorts", "tiktok"],
+            "platforms": ["douyin", "xiaohongshu", "youtube_shorts", "tiktok", "youtube"],
         },
         selected_topic={
             "topic_id": "T001",
@@ -372,7 +378,7 @@ def test_successful_rerun_replaces_only_m2_managed_files(tmp_path: Path) -> None
     ContentOrchestrator(FakeStructuredClient(_responses()), output_dir).run(
         direction={
             "direction": "AI 内容",
-            "platforms": ["douyin", "xiaohongshu", "youtube_shorts", "tiktok"],
+            "platforms": ["douyin", "xiaohongshu", "youtube_shorts", "tiktok", "youtube"],
         },
         selected_topic={
             "topic_id": "T001",
@@ -384,7 +390,7 @@ def test_successful_rerun_replaces_only_m2_managed_files(tmp_path: Path) -> None
     )
 
     package = json.loads((output_dir / "package.json").read_text(encoding="utf-8"))
-    assert set(package) == {"douyin", "xiaohongshu", "youtube_shorts", "tiktok"}
+    assert set(package) == {"douyin", "xiaohongshu", "youtube_shorts", "tiktok", "youtube"}
     assert (output_dir / "status.json").read_text(encoding="utf-8") == (
         '{"stage":"RENDERED"}'
     )
@@ -418,6 +424,7 @@ def test_exceptional_rerun_keeps_old_publish_and_records_failed_run(
                     "xiaohongshu",
                     "youtube_shorts",
                     "tiktok",
+                    "youtube",
                 ],
             },
             selected_topic={
@@ -520,6 +527,7 @@ def test_content_orchestrator_accepts_supported_platforms_in_any_order(
                 "douyin",
                 "youtube_shorts",
                 "xiaohongshu",
+                "youtube",
             ],
         },
         selected_topic={
@@ -604,6 +612,7 @@ def test_startup_recovers_interrupted_promotion_from_journal(tmp_path: Path) -> 
                     "xiaohongshu",
                     "youtube_shorts",
                     "tiktok",
+                    "youtube",
                 ],
             },
             selected_topic={
@@ -655,6 +664,7 @@ def test_startup_recovers_crash_between_target_replace_and_journal_update(
                     "xiaohongshu",
                     "youtube_shorts",
                     "tiktok",
+                    "youtube",
                 ],
             },
             selected_topic={

@@ -14,6 +14,7 @@ from pathlib import Path
 from tkinter import (
     BooleanVar,
     Menu,
+    PhotoImage,
     StringVar,
     Tk,
     Toplevel,
@@ -383,6 +384,8 @@ class AicfGUI:
     def __init__(self) -> None:
         self.root = Tk()
         self.root.title("AI Content Factory - 自动成片工具")
+        self._app_icon = PhotoImage(file=str(project_root() / "assets" / "app-icon.png"))
+        self.root.iconphoto(True, self._app_icon)
         self.root.geometry("1280x900")
         self.root.minsize(1100, 760)
 

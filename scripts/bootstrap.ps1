@@ -1,17 +1,37 @@
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
-$Python = Get-Command python -ErrorAction Stop
+$VenvDir = Join-Path $Root ".venv"
+$VenvPython = Join-Path $VenvDir "Scripts\python.exe"
 
-if (-not (Test-Path (Join-Path $Root ".venv\Scripts\python.exe"))) {
-    try {
-        & $Python.Source -m venv (Join-Path $Root ".venv")
+function Test-SupportedPython([string]$Executable) {
+    if (-not (Test-Path $Executable)) {
+        return $false
     }
-    catch {
-        & $Python.Source -m pip install virtualenv
-        & $Python.Source -m virtualenv (Join-Path $Root ".venv")
+    & $Executable -c "import pip, sys; raise SystemExit(0 if (sys.version_info >= (3, 11) and sys.version_info < (3, 14)) else 1)"
+    return $LASTEXITCODE -eq 0
+}
+
+if (-not (Test-SupportedPython $VenvPython)) {
+    $Uv = Get-Command uv -ErrorAction SilentlyContinue
+    if ($null -eq $Uv) {
+        throw "Python 3.11-3.13 is required. Install uv from https://docs.astral.sh/uv/ or install a compatible Python, then rerun this script."
+    }
+
+    # This only recreates this project's .venv. It does not alter the system Python.
+    & $Uv.Source venv --clear --seed --python 3.11 $VenvDir
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to create the project virtual environment with Python 3.11."
     }
 }
 
-$VenvPython = Join-Path $Root ".venv\Scripts\python.exe"
 & $VenvPython -m pip install -e "$Root[dev]"
-Write-Host "环境已就绪: $VenvPython"
+if ($LASTEXITCODE -ne 0) {
+    throw "Dependency installation failed. The project virtual environment is not ready."
+}
+
+& $VenvPython -c "import aicf"
+if ($LASTEXITCODE -ne 0) {
+    throw "Dependency installation finished but the application cannot be imported."
+}
+
+Write-Host "Environment ready: $VenvPython"

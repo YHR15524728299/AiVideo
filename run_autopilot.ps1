@@ -6,8 +6,15 @@ $ErrorActionPreference = "Stop"
 $Root = $PSScriptRoot
 $Python = Join-Path $Root ".venv\Scripts\python.exe"
 
-if (-not (Test-Path $Python)) {
+if (Test-Path $Python) {
+    & $Python -c "import aicf"
+}
+
+if ((-not (Test-Path $Python)) -or $LASTEXITCODE -ne 0) {
     & (Join-Path $Root "scripts\bootstrap.ps1")
+    if ($LASTEXITCODE -ne 0) {
+        throw "Project environment setup failed."
+    }
 }
 
 Push-Location $Root

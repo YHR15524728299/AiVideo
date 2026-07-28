@@ -2,7 +2,7 @@ Metadata-Version: 2.4
 Name: ai-content-factory
 Version: 0.1.0
 Summary: 方向驱动 AI 自动成片系统（M0-M2）
-Requires-Python: >=3.11
+Requires-Python: <3.14,>=3.11
 Requires-Dist: edge-tts<8,>=7.0
 Requires-Dist: Pillow<12,>=10.4
 Requires-Dist: pydantic<3,>=2.7

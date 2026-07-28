@@ -416,15 +416,13 @@ def build_default_tts_service() -> "TtsService":
     except FileNotFoundError:
         ffmpeg = find_audio_ffmpeg()
 
-    providers: list[TtsProvider] = []
-
-    # Kokoro 优先（本地神经网络，音质最好）
+    # Kokoro 始终优先；模型或依赖缺失时，TtsService 会自动降级。
     kokoro = KokoroTtsProvider(ffmpeg_executable=ffmpeg)
-    if kokoro.available():
-        providers.append(kokoro)
-
-    providers.append(EdgeTtsProvider(ffmpeg_executable=ffmpeg))
-    providers.append(SapiTtsProvider(ffmpeg_executable=ffmpeg))
+    providers: list[TtsProvider] = [
+        kokoro,
+        EdgeTtsProvider(ffmpeg_executable=ffmpeg),
+        SapiTtsProvider(ffmpeg_executable=ffmpeg),
+    ]
 
     return TtsService(providers)
 

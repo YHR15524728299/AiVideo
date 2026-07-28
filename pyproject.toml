@@ -6,7 +6,8 @@ build-backend = "setuptools.build_meta"
 name = "ai-content-factory"
 version = "0.1.0"
 description = "方向驱动 AI 自动成片系统（M0-M2）"
-requires-python = ">=3.11"
+# kokoro-onnx does not currently publish builds for Python 3.14.
+requires-python = ">=3.11,<3.14"
 dependencies = [
   "edge-tts>=7.0,<8",
   "Pillow>=10.4,<12",

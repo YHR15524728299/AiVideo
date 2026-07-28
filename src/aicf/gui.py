@@ -803,6 +803,11 @@ class AicfGUI:
 
     def _stop_preview(self) -> None:
         """停止正在播放的试听音频。"""
+        try:
+            import winsound
+            winsound.PlaySound(None, 0)
+        except Exception:
+            pass
         if self._preview_process is not None:
             try:
                 self._preview_process.terminate()
@@ -815,17 +820,19 @@ class AicfGUI:
             self._preview_process = None
 
     def _preview_voice(self) -> None:
-        """生成并播放当前选中音色的试听音频（试听词：然哥哥早上好）。"""
+        """生成并播放当前选中音色的试听音频。试听词覆盖多种语调，便于区分音色。"""
         self._stop_preview()
         self.btn_preview_voice.configure(state="disabled", text="生成中...")
 
         voice_id = self._voice_id_from_display(self.narration_voice_display_var.get())
-        preview_text = "然哥哥早上好"
+        # 较长的试听文本，覆盖不同声调/语速/情绪，便于区分音色差异
+        preview_text = "然哥哥早上好呀！今天天气真不错，你吃早饭了吗？我们一起出门走走吧。"
 
         def worker() -> None:
             try:
                 from .providers.tts import build_default_tts_service
                 import tempfile
+                import winsound
 
                 self.ui_queue.put(("set_status", "正在生成试听音频...", None))
                 tts = build_default_tts_service()
@@ -841,10 +848,10 @@ class AicfGUI:
                 result = tts.preview(preview_text, out_path, voice_id)
                 self.log_queue.put(f"[试听] 使用 {result.provider} 生成音色 {voice_id}\n")
 
-                # 用系统默认播放器播放
-                os.startfile(str(out_path))  # type: ignore[attr-defined]
-                self.log_queue.put(f"[试听] 正在播放: {out_path}\n")
-                self.ui_queue.put(("set_status", "试听播放中", None))
+                # 用 winsound 直接异步播放（可被停止，切换音色时自动中断上一个）
+                winsound.PlaySound(str(out_path), winsound.SND_FILENAME | winsound.SND_ASYNC)
+                self.log_queue.put(f"[试听] 正在播放，切换音色后点试听可直接对比\n")
+                self.ui_queue.put(("set_status", "试听播放中（切换音色可对比）", None))
             except Exception as error:
                 self.log_queue.put(f"[试听] 生成失败: {type(error).__name__}: {error}\n")
                 self.ui_queue.put(("set_status", "试听失败", None))

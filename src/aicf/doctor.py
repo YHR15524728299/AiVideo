@@ -13,14 +13,69 @@ from .logging_utils import sanitize_error
 from .providers.tts import find_audio_ffmpeg
 from .providers.openrouter import DEFAULT_FREE_MODEL
 
-
-def _safe_path(path: str | Path) -> str:
-    """对路径进行脱敏处理，替换用户主目录。"""
-    return sanitize_error(str(path))
-
 # 自动加载项目根目录 .env 文件
 _PROJECT_ROOT = Path(__file__).parent.parent.parent
 load_dotenv(_PROJECT_ROOT / ".env", override=False)
+
+
+def _describe_path(path: str | Path) -> str:
+    """将绝对路径转换为友好的位置描述，不暴露个人信息。"""
+    p = Path(str(path))
+    path_str = str(p)
+    name = p.name
+
+    # 项目内文件 → 相对路径
+    try:
+        rel = p.resolve().relative_to(_PROJECT_ROOT.resolve())
+        return str(rel)
+    except ValueError:
+        pass
+
+    # Python解释器
+    if name.lower().startswith("python") and name.lower().endswith((".exe", "")):
+        # 检测是否是虚拟环境
+        if ".venv" in path_str or "venv" in path_str or "virtualenv" in path_str.lower():
+            return "项目虚拟环境"
+        # 检测是否是Trae/IDE内置Python
+        if "trae" in path_str.lower() or ".trae-cn" in path_str:
+            return "IDE内置环境"
+        return f"系统 Python ({name})"
+
+    # npm全局安装的CLI工具
+    if "npm" in path_str.lower() or "node_modules" in path_str.lower():
+        return f"npm全局 ({name})"
+
+    # Winget安装的工具
+    if "winget" in path_str.lower() or "WinGet" in path_str:
+        return f"系统安装 ({name})"
+
+    # PATH中找到的（shutil.which返回的）
+    path_dirs = os.environ.get("PATH", "").split(os.pathsep)
+    for pd in path_dirs:
+        try:
+            if pd and p.resolve().parent == Path(pd).resolve():
+                return f"PATH中 ({name})"
+        except Exception:
+            pass
+
+    # AppData下的工具
+    if "AppData" in path_str:
+        if "Roaming" in path_str:
+            return f"用户目录 ({name})"
+        if "Local" in path_str:
+            return f"本地安装 ({name})"
+
+    # Program Files
+    if "Program Files" in path_str:
+        return f"系统程序 ({name})"
+
+    # 用户手动指定的其他路径 → 只显示文件名
+    return f"已配置 ({name})"
+
+
+def _safe_path(path: str | Path) -> str:
+    """对路径进行脱敏处理（备用，保留原有调用）。"""
+    return _describe_path(path)
 
 
 @dataclass(frozen=True)

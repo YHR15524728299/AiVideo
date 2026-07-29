@@ -30,14 +30,14 @@ from .production_settings import (
 from .providers.jimeng import detect_jimeng_cli
 from .providers.kling import detect_kling_cli
 from .providers.tts import discover_ffmpeg_toolchain, KokoroTtsProvider
-from .logging_utils import sanitize_error
+from .doctor import _describe_path
 # 提前导入doctor，避免线程中首次导入
 from . import doctor as _doctor_mod
 
 
 def _safe_path(path: str | Path) -> str:
-    """对路径进行脱敏处理。"""
-    return sanitize_error(str(path))
+    """将绝对路径转换为友好的位置描述。"""
+    return _describe_path(path)
 
 
 def _load_env(path: Path) -> dict[str, str]:

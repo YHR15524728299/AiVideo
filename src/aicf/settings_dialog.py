@@ -30,8 +30,14 @@ from .production_settings import (
 from .providers.jimeng import detect_jimeng_cli
 from .providers.kling import detect_kling_cli
 from .providers.tts import discover_ffmpeg_toolchain, KokoroTtsProvider
+from .logging_utils import sanitize_error
 # 提前导入doctor，避免线程中首次导入
 from . import doctor as _doctor_mod
+
+
+def _safe_path(path: str | Path) -> str:
+    """对路径进行脱敏处理。"""
+    return sanitize_error(str(path))
 
 
 def _load_env(path: Path) -> dict[str, str]:
@@ -425,7 +431,7 @@ class _VideoPage(ttk.Frame):
                 # 匹配路径（不区分大小写，支持.exe/.cmd）
                 paths = re.findall(r'([A-Za-z]:\\[^\s:；]+?\.(?:exe|EXE|cmd|CMD))', msg)
                 if paths:
-                    p = paths[0]
+                    p = _safe_path(paths[0])
                     self.after(0, lambda: self.jm.warn(f"已找到 CLI，但可能需要登录。终端运行 dreamina login。路径：{p}"))
                 else:
                     self.after(0, lambda: self.jm.err("未检测到即梦 CLI。", show_manual=True))
@@ -433,10 +439,11 @@ class _VideoPage(ttk.Frame):
         threading.Thread(target=w, daemon=True).start()
 
     def _jm_ok(self, caps):
+        safe_path = _safe_path(caps.cli_path) if caps.cli_path else ""
         if caps.cli_path and caps.supports_async_task:
-            self.jm.ok(f"路径：{caps.cli_path}")
+            self.jm.ok(f"路径：{safe_path}")
         elif caps.cli_path:
-            self.jm.warn(f"已找到 CLI，但需要登录。终端运行 dreamina login。路径：{caps.cli_path}")
+            self.jm.warn(f"已找到 CLI，但需要登录。终端运行 dreamina login。路径：{safe_path}")
         else:
             self.jm.err("未检测到。请安装后点「重新检测」，或手动指定路径。", show_manual=True)
         self._notify()
@@ -458,8 +465,9 @@ class _VideoPage(ttk.Frame):
         threading.Thread(target=w, daemon=True).start()
 
     def _kl_ok(self, caps):
+        safe_path = _safe_path(caps.cli_path) if caps.cli_path else ""
         if caps.cli_path and caps.supports_async_task:
-            self.kl.ok(f"路径：{caps.cli_path}")
+            self.kl.ok(f"路径：{safe_path}")
         elif caps.cli_path:
             self.kl.warn("已安装但未登录。终端运行 kling login")
         else:
@@ -586,11 +594,11 @@ class _TtsPage(ttk.Frame):
             # FFmpeg检测
             try:
                 tc = discover_ffmpeg_toolchain()
-                self.after(0, lambda: self.ff.ok(f"已找到：{tc.ffmpeg}"))
+                self.after(0, lambda: self.ff.ok(f"已找到：{_safe_path(tc.ffmpeg)}"))
             except Exception as e:
                 c = self.ff.get_val()
                 if c:
-                    self.after(0, lambda: self.ff.err(f"指定目录未找到：{c}", show_manual=True))
+                    self.after(0, lambda: self.ff.err(f"指定目录未找到：{_safe_path(c)}", show_manual=True))
                 else:
                     self.after(0, lambda: self.ff.err("未找到。请安装 FFmpeg。", show_manual=True))
             self.after(0, self._notify)

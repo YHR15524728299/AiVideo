@@ -9,8 +9,14 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from .logging_utils import sanitize_error
 from .providers.tts import find_audio_ffmpeg
 from .providers.openrouter import DEFAULT_FREE_MODEL
+
+
+def _safe_path(path: str | Path) -> str:
+    """对路径进行脱敏处理，替换用户主目录。"""
+    return sanitize_error(str(path))
 
 # 自动加载项目根目录 .env 文件
 _PROJECT_ROOT = Path(__file__).parent.parent.parent
@@ -61,16 +67,16 @@ def _check_executable(path: str) -> Check:
     if p.is_absolute():
         # 完整路径：检查文件是否存在
         if p.is_file():
-            return Check(True, str(p))
+            return Check(True, _safe_path(p))
         # 尝试加扩展名
         for ext in (".exe", ".cmd", ".bat"):
             pe = Path(str(p) + ext)
             if pe.is_file():
-                return Check(True, str(pe))
-        return Check(False, f"文件不存在: {path}")
+                return Check(True, _safe_path(pe))
+        return Check(False, f"文件不存在: {_safe_path(path)}")
     # 非完整路径：用shutil.which搜索
     found = shutil.which(path)
-    return Check(bool(found), found or f"PATH 中未找到: {path}")
+    return Check(bool(found), _safe_path(found) if found else f"PATH 中未找到: {path}")
 
 
 class Doctor:
@@ -109,7 +115,7 @@ class Doctor:
     @staticmethod
     def _tool(name: str) -> Check:
         path = shutil.which(name)
-        return Check(bool(path), path or f"PATH 中未找到: {name}", required=False)
+        return Check(bool(path), _safe_path(path) if path else f"PATH 中未找到: {name}", required=False)
 
     def _detect_kling(self) -> Check:
         """轻量检测可灵CLI是否存在（不做网络who_am_i调用避免卡顿）。"""
@@ -125,7 +131,7 @@ class Doctor:
                     kling_exe = str(c)
                     break
         if kling_exe:
-            return Check(True, f"已安装（{kling_exe}），需登录后可用", required=False)
+            return Check(True, f"已安装（{_safe_path(kling_exe)}），需登录后可用", required=False)
         return Check(False, "未安装（npm i -g @klingai/cli-cn 后 kling login）", required=False)
 
     def _detect_jimeng(self) -> Check:
@@ -135,7 +141,7 @@ class Doctor:
         # 搜索PATH
         found = shutil.which("dreamina")
         if found:
-            return Check(True, f"已安装（{found}），需登录后可用", required=False)
+            return Check(True, f"已安装（{_safe_path(found)}），需登录后可用", required=False)
         return Check(False, "未安装或未在PATH中", required=False)
 
     def run(self) -> DoctorReport:
@@ -175,7 +181,7 @@ class Doctor:
         # FFmpeg检测
         ffmpeg_check = Check(
             bool(self.audio_ffmpeg),
-            self.audio_ffmpeg or "未找到FFmpeg（winget install Gyan.FFmpeg）",
+            _safe_path(self.audio_ffmpeg) if self.audio_ffmpeg else "未找到FFmpeg（winget install Gyan.FFmpeg）",
         )
 
         # ffprobe检测：在ffmpeg同目录查找
@@ -189,7 +195,7 @@ class Doctor:
                     break
         ffprobe_check = Check(
             bool(ffprobe_path),
-            ffprobe_path or "未找到ffprobe（应与ffmpeg同目录）",
+            _safe_path(ffprobe_path) if ffprobe_path else "未找到ffprobe（应与ffmpeg同目录）",
         )
 
         api_key = bool(os.getenv("OPENROUTER_API_KEY"))
@@ -198,7 +204,7 @@ class Doctor:
 
         return DoctorReport(
             {
-                "python": Check(py_ok, f"{sys.executable} (v{py_ver}){'，需 >= 3.10' if not py_ok else ''}"),
+                "python": Check(py_ok, f"{_safe_path(sys.executable)} (v{py_ver}){'，需 >= 3.10' if not py_ok else ''}"),
                 "ffmpeg": ffmpeg_check,
                 "ffprobe": ffprobe_check,
                 "openrouter": Check(

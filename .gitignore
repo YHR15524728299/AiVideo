@@ -1,13 +1,65 @@
+# Python
 .venv/
 __pycache__/
 *.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+eggs/
+.eggs/
+
+# Testing
 .pytest_cache/
 .coverage
 htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+
+# Environment & Secrets
 .env
+.env.local
+.env.*.local
+
+# User configs (personal settings, not for sharing)
 config/*.yaml
 !config/*.example.yaml
-data/
-outputs/
+
+# Runtime data & caches
+data/*
+!data/.gitkeep
+!data/dreamina_asset_cache/
+!data/dreamina_asset_cache/.gitkeep
+!data/dreamina_cache/
+!data/dreamina_cache/.gitkeep
+!data/kling_cache/
+!data/kling_cache/.gitkeep
+!data/openrouter_cache/
+!data/openrouter_cache/.gitkeep
+
+# Generated outputs
+outputs/*
+!outputs/.gitkeep
+
+# Workspaces
 workspaces/
+
+# Logs
+logs/
 *.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# OS
+Desktop.ini

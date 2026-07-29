@@ -293,18 +293,18 @@ class OpenRouterClient:
                 if cached is not None and cached[1]:
                     return
                 raise ModelCatalogVerificationError(
-                    "无法实时验证 OpenRouter 模型是否免费（网络请求失败），M2 已阻断"
+                    "无法验证OpenRouter模型（网络请求失败），请检查网络连接或稍后重试"
                 ) from error
         if payload is None:
             if last_error:
                 raise ModelCatalogVerificationError(
-                    "无法实时验证 OpenRouter 模型是否免费，M2 已阻断"
+                    "无法验证OpenRouter模型，请检查网络连接后重试"
                 ) from last_error
-            raise ModelCatalogVerificationError("获取模型目录返回空结果，M2 已阻断")
+            raise ModelCatalogVerificationError("获取模型目录返回空结果，请稍后重试")
         models = payload.get("data")
         if not isinstance(models, list):
             raise ModelCatalogVerificationError(
-                "OpenRouter 实时模型目录格式无效，M2 已阻断"
+                "OpenRouter模型目录格式无效，请稍后重试"
             )
         selected = next(
             (
@@ -318,31 +318,31 @@ class OpenRouterClient:
             # 模型不在目录中，清除缓存并报错
             _MODEL_VERIFY_CACHE.pop(cache_key, None)
             raise ModelCatalogVerificationError(
-                f"模型 {self.model} 不在实时模型目录中，M2 已阻断"
+                f"模型 {self.model} 不存在，请选择其他模型"
             )
         pricing = selected.get("pricing")
         if not isinstance(pricing, dict):
             _MODEL_VERIFY_CACHE.pop(cache_key, None)
             raise ModelCatalogVerificationError(
-                f"模型 {self.model} 缺少实时价格，无法证明免费，M2 已阻断"
+                f"模型 {self.model} 缺少价格信息，无法验证是否免费"
             )
         required_prices = ("prompt", "completion")
         if any(field not in pricing for field in required_prices):
             _MODEL_VERIFY_CACHE.pop(cache_key, None)
             raise ModelCatalogVerificationError(
-                f"模型 {self.model} 价格字段不完整，无法证明免费，M2 已阻断"
+                f"模型 {self.model} 价格信息不完整，无法验证是否免费"
             )
         try:
             prices = [Decimal(str(value)) for value in pricing.values()]
         except (InvalidOperation, ValueError):
             _MODEL_VERIFY_CACHE.pop(cache_key, None)
             raise ModelCatalogVerificationError(
-                f"模型 {self.model} 价格格式无效，无法证明免费，M2 已阻断"
+                f"模型 {self.model} 价格格式无效"
             ) from None
         if not prices or any(price != 0 for price in prices):
             _MODEL_VERIFY_CACHE.pop(cache_key, None)
             raise ModelCatalogVerificationError(
-                f"模型 {self.model} 不是免费模型，M2 已阻断"
+                f"模型 {self.model} 不是免费模型，请选择以 :free 结尾的模型"
             )
         # 验证通过，写入缓存
         _MODEL_VERIFY_CACHE[cache_key] = (now, True)

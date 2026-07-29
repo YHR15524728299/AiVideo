@@ -9,6 +9,7 @@ from typing import Callable
 
 from aicf.models.contracts import VisualPlan, VisualShot
 from aicf.artifact_commit import JournaledFileGroup
+from aicf.production_settings import get_resolution
 from aicf.providers.tts import FfmpegToolchain
 
 
@@ -35,10 +36,19 @@ class MediaProbe:
     sample_rate: int
     channels: int
 
-    def assert_vertical_delivery(self, expected_duration_seconds: float) -> None:
+    def assert_vertical_delivery(
+        self,
+        expected_duration_seconds: float,
+        *,
+        orientation: str = "portrait",
+    ) -> None:
         errors: list[str] = []
-        if (self.width, self.height) != (1080, 1920):
-            errors.append(f"分辨率应为 1080x1920，实际 {self.width}x{self.height}")
+        expected_width, expected_height = get_resolution(orientation)
+        if (self.width, self.height) != (expected_width, expected_height):
+            errors.append(
+                f"分辨率应为 {expected_width}x{expected_height}，"
+                f"实际 {self.width}x{self.height}"
+            )
         if self.video_codec != "h264":
             errors.append(f"视频编码应为 h264，实际 {self.video_codec}")
         if self.pixel_format != "yuv420p":
@@ -137,6 +147,7 @@ class FfmpegRenderer:
         subtitle_path: str | Path,
         output_path: str | Path,
         title: str,
+        orientation: str = "portrait",
     ) -> RenderResult:
         plan_path = Path(visual_plan_path).resolve()
         audio = Path(audio_path).resolve()
@@ -160,9 +171,12 @@ class FfmpegRenderer:
         transaction_dir.mkdir(parents=True)
         pending_master = transaction_dir / master_output.name
         pending_clean = transaction_dir / clean_output.name
+        out_width, out_height = get_resolution(orientation)
         filter_script = transaction_dir / "m5_filter_complex.txt"
         filter_script.write_text(
-            self._build_filter_script(plan, subtitles),
+            self._build_filter_script(
+                plan, subtitles, width=out_width, height=out_height
+            ),
             encoding="utf-8",
         )
 
@@ -232,8 +246,8 @@ class FfmpegRenderer:
                         "clean": str(clean_output),
                     },
                     "render": {
-                        "width": 1080,
-                        "height": 1920,
+                        "width": out_width,
+                        "height": out_height,
                         "fps": 30,
                         "video_codec": "h264",
                         "pixel_format": "yuv420p",
@@ -242,6 +256,7 @@ class FfmpegRenderer:
                         "channels": 2,
                         "duration_seconds": plan.total_duration_seconds,
                         "shot_count": len(plan.shots),
+                        "orientation": orientation,
                     },
                 },
                 ensure_ascii=False,
@@ -266,6 +281,7 @@ class FfmpegRenderer:
         output_path = Path(kwargs["output_path"])
         committer = JournaledFileGroup(output_path.parent)
         committer.recover()
+        orientation = str(kwargs.get("orientation", "portrait"))
         result = self.render(**kwargs)
         plan = VisualPlan.model_validate_json(
             Path(kwargs["visual_plan_path"]).read_text(encoding="utf-8-sig")
@@ -283,7 +299,9 @@ class FfmpegRenderer:
             ),
         }
         for probe in probes.values():
-            probe.assert_vertical_delivery(plan.total_duration_seconds)
+            probe.assert_vertical_delivery(
+                plan.total_duration_seconds, orientation=orientation
+            )
 
         pending_dir = result.pending_master_path.parent
         for name, probe in probes.items():
@@ -311,31 +329,34 @@ class FfmpegRenderer:
         return asset.resolve()
 
     @classmethod
-    def _build_filter_script(cls, plan: VisualPlan, subtitles: Path) -> str:
+    def _build_filter_script(
+        cls, plan: VisualPlan, subtitles: Path, *, width: int, height: int
+    ) -> str:
         chains: list[str] = []
         labels: list[str] = []
+        scale_crop = (
+            f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+            f"crop={width}:{height}"
+        )
+        zoompan_size = f"{width}x{height}"
         for index, shot in enumerate(plan.shots):
             label = f"shot{index}"
             labels.append(f"[{label}]")
-            common = (
-                "scale=1080:1920:force_original_aspect_ratio=increase,"
-                "crop=1080:1920"
-            )
             if shot.asset_type == "image":
                 chain = (
-                    f"[{index}:v]{common},"
+                    f"[{index}:v]{scale_crop},"
                     "zoompan="
                     "z='min(zoom+0.001,1.08)':"
                     "x='iw/2-(iw/zoom/2)':"
                     "y='ih/2-(ih/zoom/2)':"
-                    "d=1:s=1080x1920:fps=30,"
+                    f"d=1:s={zoompan_size}:fps=30,"
                     f"trim=duration={shot.duration_seconds:.6f},"
                     f"setpts=PTS-STARTPTS,setsar=1,format=yuv420p[{label}]"
                 )
             else:
                 chain = (
                     f"[{index}:v]trim=duration={shot.duration_seconds:.6f},"
-                    f"setpts=PTS-STARTPTS,{common},fps=30,"
+                    f"setpts=PTS-STARTPTS,{scale_crop},fps=30,"
                     f"setsar=1,format=yuv420p[{label}]"
                 )
             chains.append(chain)

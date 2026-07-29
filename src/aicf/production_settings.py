@@ -10,12 +10,20 @@ from aicf.atomic_io import atomic_replace
 
 
 Platform = Literal["douyin", "xiaohongshu", "tiktok", "youtube_shorts", "youtube"]
+VideoProvider = Literal["jimeng", "kling"]
 JimengModel = Literal[
     "seedance2.0",
     "seedance2.0fast",
     "seedance2.0_vip",
     "seedance2.0fast_vip",
     "seedance2.0mini",
+]
+KlingModel = Literal[
+    "kling-video-v2_6",
+    "kling-video-v2_5",
+    "kling-video-v2_0",
+    "kling-video-v1_6",
+    "kling-video-v1_5",
 ]
 VideoResolution = Literal["720p", "1080p"]
 MotionMode = Literal["image", "video"]
@@ -58,12 +66,47 @@ ORIENTATION_DISPLAY_NAMES: dict[str, str] = {
     "landscape": "横屏 (16:9)",
 }
 
+# 各方向对应的输出分辨率
+ORIENTATION_RESOLUTION: dict[str, tuple[int, int]] = {
+    "portrait": (1080, 1920),
+    "landscape": (1920, 1080),
+}
+
+
+def get_resolution(orientation: str) -> tuple[int, int]:
+    """根据方向返回 (width, height) 分辨率元组，默认竖屏。"""
+    return ORIENTATION_RESOLUTION.get(orientation, ORIENTATION_RESOLUTION["portrait"])
+
 PLATFORM_DISPLAY_NAMES: dict[str, str] = {
     "douyin": "抖音",
     "xiaohongshu": "小红书",
     "tiktok": "TikTok",
     "youtube_shorts": "YouTube Shorts",
     "youtube": "YouTube",
+}
+
+# 视频生成提供商中文显示名称
+VIDEO_PROVIDER_DISPLAY_NAMES: dict[str, str] = {
+    "jimeng": "即梦（Dreamina）",
+    "kling": "可灵（Kling）",
+}
+
+# 即梦模型中文显示名称
+JIMENG_MODEL_DISPLAY_NAMES: dict[str, str] = {
+    "seedance2.0fast": "Seedance 2.0 极速",
+    "seedance2.0": "Seedance 2.0 标准",
+    "seedance2.0_vip": "Seedance 2.0 高清VIP",
+    "seedance2.0fast_vip": "Seedance 2.0 极速VIP",
+    "seedance2.0mini": "Seedance 2.0 轻量",
+}
+
+# 可灵模型中文显示名称
+KLING_MODEL_DISPLAY_NAMES: dict[str, str] = {
+    "kling-video-v2_6": "可灵 2.6 高品质",
+    "kling-video-v2_5": "可灵 2.5 标准",
+    "kling-video-v2_0": "可灵 2.0",
+    "kling-video-v1_6": "可灵 1.6",
+    "kling-video-v1_5": "可灵 1.5",
 }
 
 # 旁白音色中文显示名称
@@ -102,7 +145,9 @@ class ProductionSettings(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     selected_platforms: tuple[Platform, ...] = Field(default=("douyin",))
+    video_provider: VideoProvider = "jimeng"
     jimeng_model: JimengModel = "seedance2.0fast"
+    kling_model: KlingModel = "kling-video-v2_6"
     video_resolution: VideoResolution = "720p"
     motion_mode: MotionMode = "video"
     narration_voice: NarrationVoice = "kokoro:zm_yunyang"

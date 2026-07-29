@@ -25,6 +25,7 @@ from .m5_runner import M5VisualPlanRunner
 from .gui import launch as launch_gui
 from .logging_utils import sanitize_error
 from .providers.jimeng import JimengCliAdapter, detect_jimeng_cli
+from .providers.kling import KlingCliAdapter, build_kling_adapter
 from .providers.openrouter import OpenRouterClient
 from .providers.tts import (
     EdgeTtsProvider,
@@ -57,12 +58,7 @@ def repository() -> JobRepository:
 
 def build_narration_pipeline() -> NarrationPipeline:
     toolchain = discover_ffmpeg_toolchain()
-    service = TtsService(
-        [
-            EdgeTtsProvider(ffmpeg_executable=toolchain.ffmpeg),
-            SapiTtsProvider(ffmpeg_executable=toolchain.ffmpeg),
-        ]
-    )
+    service = build_default_tts_service()
     return NarrationPipeline(service=service, toolchain=toolchain)
 
 
@@ -82,11 +78,12 @@ def build_m2_runner(
     )
 
 
-def build_dreamina_adapter() -> JimengCliAdapter:
+def build_dreamina_adapter() -> JimengCliAdapter | None:
     root = project_root()
     config_path = root / "config" / "jimeng_cli.yaml"
     candidates = None
     settings: dict[str, object] = {}
+    success_prefix: list[str] | None = None
     if config_path.is_file():
         loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
         if isinstance(loaded, dict):
@@ -94,12 +91,26 @@ def build_dreamina_adapter() -> JimengCliAdapter:
             configured_prefix = loaded.get("command_prefix")
             if isinstance(configured_prefix, list) and configured_prefix:
                 candidates = [[str(token) for token in configured_prefix]]
-    capabilities = detect_jimeng_cli(
-        candidates,
-        config_path=config_path,
-        timeout_seconds=30,
-    )
-    prefix = yaml.safe_load(config_path.read_text(encoding="utf-8"))["command_prefix"]
+    # 用detect来验证CLI可用，成功后从配置文件读取prefix
+    try:
+        capabilities = detect_jimeng_cli(
+            candidates,
+            config_path=config_path,
+            timeout_seconds=30,
+        )
+    except Exception:
+        return None
+    # 从写入的配置文件读取prefix（detect成功后会写入）
+    prefix: list[str] = ["dreamina"]
+    if config_path.is_file():
+        try:
+            loaded_cfg = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+            if isinstance(loaded_cfg, dict):
+                cp = loaded_cfg.get("command_prefix")
+                if isinstance(cp, list) and cp:
+                    prefix = [str(t) for t in cp]
+        except Exception:
+            pass
     execution = settings.get("execution", {})
     if not isinstance(execution, dict):
         execution = {}
@@ -115,7 +126,6 @@ def build_dreamina_adapter() -> JimengCliAdapter:
 
 def build_m4_asset_runner() -> M4AssetRunner:
     root = project_root()
-    adapter = build_dreamina_adapter()
     ffprobe = discover_ffmpeg_toolchain().ffprobe
     config = load_config(root / "config" / "content_direction.yaml")
 
@@ -131,8 +141,28 @@ def build_m4_asset_runner() -> M4AssetRunner:
                 }
         return {"kind": "video", **asdict(probe_media(ffprobe, path))}
 
+    # 构建所有可用的视频生成提供商适配器
+    providers: dict[str, object] = {}
+
+    # 即梦CLI
+    jimeng_adapter = build_dreamina_adapter()
+    if jimeng_adapter is not None:
+        providers["jimeng"] = jimeng_adapter
+
+    # 可灵CLI
+    kling_adapter = build_kling_adapter()
+    if kling_adapter is not None:
+        providers["kling"] = kling_adapter
+
+    if not providers:
+        raise RuntimeError(
+            "没有可用的视频生成适配器。请配置即梦CLI或可灵CLI。\n"
+            "即梦：运行 `python -m aicf jimeng-login`\n"
+            "可灵：运行 `npm i -g @klingai/cli-cn` 然后 `kling login`"
+        )
+
     return M4AssetRunner(
-        adapter,
+        providers,
         media_probe=media_probe,
         asset_cache_dir=(
             root / "data" / "dreamina_asset_cache"
@@ -188,6 +218,17 @@ def build_parser() -> argparse.ArgumentParser:
         default="电影感中国未来城市清晨，金色阳光穿过薄雾，竖屏构图，细节丰富，无文字",
     )
     dreamina_smoke.add_argument("--model", default="4.1")
+    kling_smoke = subparsers.add_parser("kling-smoke")
+    kling_smoke.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("outputs") / "KLING_SMOKE",
+    )
+    kling_smoke.add_argument(
+        "--prompt",
+        default="电影感中国未来城市清晨，金色阳光穿过薄雾，竖屏构图，细节丰富，无文字",
+    )
+    kling_smoke.add_argument("--type", choices=["image", "video"], default="image")
     asset_run = subparsers.add_parser("asset-run")
     asset_run.add_argument("--visual-plan", required=True, type=Path)
     asset_run.add_argument("--resume", action="store_true")
@@ -275,6 +316,55 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"submit_id: {result.submit_id}")
         print(f"比例: 9:16")
         print(f"缓存命中: {'是' if result.cached else '否'}")
+        return 0
+    if args.command == "kling-smoke":
+        adapter = build_kling_adapter()
+        if adapter is None:
+            print(
+                json.dumps(
+                    {
+                        "status": "not_installed",
+                        "message": "可灵 CLI 未安装或未登录，请先运行: npm i -g @klingai/cli-cn 然后 kling login",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 1
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            if args.type == "video":
+                target = args.output_dir / "kling_smoke.mp4"
+                result = adapter.generate_video(
+                    args.prompt,
+                    required_seconds=5,
+                    output_path=target,
+                    ratio="9:16",
+                )
+            else:
+                target = args.output_dir / "kling_smoke.png"
+                result = adapter.generate_image(
+                    args.prompt,
+                    target,
+                    ratio="9:16",
+                )
+        except Exception as error:
+            print(
+                json.dumps(
+                    {"status": "failed", "error": sanitize_error(error)},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 1
+        kind_label = "视频" if args.type == "video" else "图片"
+        print(f"可灵 {kind_label}: {result.output_path}")
+        if result.submit_id:
+            print(f"generationId: {result.submit_id}")
+        print(f"比例: 9:16")
+        print(f"缓存命中: {'是' if result.cached else '否'}")
+        if result.degraded:
+            print(f"降级原因: {result.degradation_reason}")
         return 0
     if args.command == "asset-run":
         try:

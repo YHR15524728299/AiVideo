@@ -30,7 +30,7 @@ _FAILURE_STATES = {"failure", "failed", "error", "cancelled", "canceled"}
 class M4AssetRunner:
     def __init__(
         self,
-        provider: object,
+        providers: dict[str, object] | object,
         *,
         media_probe: Callable[[Path, str], dict[str, object]],
         pending_timeout_seconds: float = 1800,
@@ -39,7 +39,11 @@ class M4AssetRunner:
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
-        self.provider = provider
+        # 兼容旧的单provider传参方式
+        if isinstance(providers, dict):
+            self.providers = dict(providers)
+        else:
+            self.providers = {"jimeng": providers}
         self.media_probe = media_probe
         self.pending_timeout_seconds = pending_timeout_seconds
         self.poll_interval_seconds = poll_interval_seconds
@@ -49,6 +53,25 @@ class M4AssetRunner:
         self.clock = clock
         self.sleep = sleep
         self.production_settings = ProductionSettings()
+        self._current_provider_key = next(iter(self.providers), "jimeng")
+
+    @property
+    def provider(self) -> object:
+        """获取当前选中的视频生成适配器。"""
+        return self.providers.get(
+            self._current_provider_key,
+            self.providers.get("jimeng"),
+        )
+
+    _PROVIDER_DISPLAY_NAMES = {
+        "jimeng": "即梦",
+        "kling": "可灵",
+    }
+
+    def _provider_display_name(self) -> str:
+        return self._PROVIDER_DISPLAY_NAMES.get(
+            self._current_provider_key, self._current_provider_key
+        )
 
     def run(
         self,
@@ -58,13 +81,18 @@ class M4AssetRunner:
         usage_recorder: Callable[..., object] | None = None,
         budget_guard: Callable[..., object] | None = None,
     ) -> dict[str, object]:
-        del resume
         plan_path = Path(visual_plan_path).resolve()
         plan = VisualPlan.model_validate_json(
             plan_path.read_text(encoding="utf-8-sig")
         )
         root = plan_path.parent
         self.production_settings = ProductionSettings.load_for_job(root)
+        # 根据settings选择当前provider
+        self._current_provider_key = getattr(
+            self.production_settings, "video_provider", "jimeng"
+        )
+        if self._current_provider_key not in self.providers:
+            self._current_provider_key = next(iter(self.providers), "jimeng")
         self._apply_motion_mode(plan)
         tasks_path = root / "assets" / "tasks.json"
         manifest_path = root / "asset_manifest.json"
@@ -186,8 +214,9 @@ class M4AssetRunner:
                         continue
                     raise RuntimeError(f"{shot.shot_id} 生成失败：{reason}")
                 if state not in _PENDING_STATES:
+                    provider_label = self._provider_display_name()
                     raise RuntimeError(
-                        f"{shot.shot_id} 返回未知 Dreamina 状态：{state or '<空>'}"
+                        f"{shot.shot_id} 返回未知 {provider_label} 状态：{state or '<空>'}"
                     )
                 task["status"] = "pending"
                 self._write_json(tasks_path, tasks_document)
@@ -272,12 +301,21 @@ class M4AssetRunner:
         duration_seconds: float,
     ) -> dict[str, object]:
         ratio = "16:9" if self.production_settings.orientation == "landscape" else "9:16"
+        # 根据当前provider选择模型
+        if self._current_provider_key == "kling":
+            video_model = getattr(
+                self.production_settings, "kling_model", "kling-video-v2_6"
+            )
+            image_model = "kling-v1"  # 可灵图生图默认模型
+        else:
+            video_model = self.production_settings.jimeng_model
+            image_model = "4.1"
         return {
             "kind": kind,
             "model": (
-                "4.1"
+                image_model
                 if kind == "image"
-                else self.production_settings.jimeng_model
+                else video_model
             ),
             "ratio": ratio,
             "resolution": (
@@ -308,15 +346,21 @@ class M4AssetRunner:
                 shot.duration_seconds = 4.0
         plan.total_duration_seconds = sum(s.duration_seconds for s in plan.shots)
 
-    @staticmethod
-    def _usage_delta(kind: str, duration_seconds: float) -> dict[str, int]:
-        return {
-            "jimeng_images": 1 if kind == "image" else 0,
-            "jimeng_video_clips": 1 if kind == "video" else 0,
-            "jimeng_video_seconds_requested": (
-                int(duration_seconds) if kind == "video" else 0
-            ),
+    def _usage_delta(self, kind: str, duration_seconds: float) -> dict[str, int]:
+        prefix = self._current_provider_key
+        is_image = kind == "image"
+        is_video = kind == "video"
+        seconds = int(duration_seconds) if is_video else 0
+        result: dict[str, int] = {
+            f"{prefix}_images": 1 if is_image else 0,
+            f"{prefix}_video_clips": 1 if is_video else 0,
+            f"{prefix}_video_seconds_requested": seconds,
         }
+        # 同时设置通用字段名，方便跨provider统一统计
+        result["images"] = 1 if is_image else 0
+        result["video_clips"] = 1 if is_video else 0
+        result["video_seconds_requested"] = seconds
+        return result
 
     def _record_usage_if_needed(
         self,

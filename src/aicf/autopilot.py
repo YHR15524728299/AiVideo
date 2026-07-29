@@ -498,10 +498,12 @@ class Autopilot:
         if stage == PipelineStage.STORYBOARD_GENERATED:
             if self.visual_plan_runner is None:
                 raise NeedsAttention("缺少 storyboard/visual plan 处理器", "")
+            production = ProductionSettings.load_for_job(job_dir)
             self.visual_plan_runner.run(
                 script_path=job_dir / "script.json",
                 timeline_path=job_dir / "audio" / "timeline.json",
                 output_dir=job_dir,
+                orientation=production.orientation,
             )
             return {"status": "COMPLETED"}
         if stage == PipelineStage.KEYFRAMES_GENERATED:
@@ -517,22 +519,24 @@ class Autopilot:
             if self.renderer is None:
                 raise NeedsAttention("缺少 M5 渲染处理器", "")
             script = self._read_json(job_dir / "script.json")
+            production = ProductionSettings.load_for_job(job_dir)
             self.renderer.render_and_validate(
                 visual_plan_path=job_dir / "visual_plan.json",
                 audio_path=job_dir / "audio" / "voiceover.wav",
                 subtitle_path=job_dir / "audio" / "subtitles.ass",
                 output_path=job_dir / "final" / "master.mp4",
                 title=str(script["title"]),
+                orientation=production.orientation,
             )
             return {"status": "COMPLETED"}
         if stage == PipelineStage.QA_CHECKED:
             if self.m6_pipeline is None:
                 raise NeedsAttention("缺少 M6 QA/package 处理器", "")
+            production = ProductionSettings.load_for_job(job_dir)
             return self.m6_pipeline.run(
                 **self._load_inputs("", job_dir),
-                selected_platforms=ProductionSettings.load_for_job(
-                    job_dir
-                ).selected_platforms,
+                selected_platforms=production.selected_platforms,
+                orientation=production.orientation,
             )
         return {"status": "COMPLETED"}
 
@@ -834,6 +838,7 @@ class Autopilot:
                 f"python -m aicf resume --job {job_id}",
             )
         duration = self._expected_duration(job_dir)
+        production = ProductionSettings.load_for_job(job_dir)
         return {
             "master_video": master,
             "clean_video": clean,
@@ -847,6 +852,7 @@ class Autopilot:
                 "visual_plan_path": job_dir / "visual_plan.json",
                 "audio_path": job_dir / "audio" / "voiceover.wav",
                 "title": str(self._read_json(job_dir / "script.json").get("title", "")),
+                "orientation": production.orientation,
             },
         }
 

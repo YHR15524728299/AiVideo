@@ -5,11 +5,9 @@ __pycache__/
 .coverage
 htmlcov/
 .env
-data/*.db
-data/cache/
-data/openrouter_cache/
-data/dreamina_cache/
-data/dreamina_asset_cache/
+config/*.yaml
+!config/*.example.yaml
+data/
 outputs/
 workspaces/
 *.log

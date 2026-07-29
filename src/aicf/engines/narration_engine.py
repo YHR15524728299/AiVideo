@@ -11,6 +11,7 @@ from typing import Any, Callable, Mapping
 
 from aicf.atomic_io import atomic_replace
 from aicf.engines.subtitle_engine import build_ass, build_srt
+from aicf.production_settings import ProductionSettings
 from aicf.providers.tts import FfmpegToolchain, TtsService
 
 
@@ -420,8 +421,17 @@ class NarrationPipeline:
         ]
         srt_path = root / "subtitles.srt"
         ass_path = root / "subtitles.ass"
+        # output_dir 通常为 job_dir/audio，其父目录为 job_dir，尝试加载 orientation
+        job_dir = root.parent
+        try:
+            orientation = ProductionSettings.load_for_job(job_dir).orientation
+        except Exception:
+            orientation = "portrait"
         srt_path.write_text(build_srt(subtitle_entries), encoding="utf-8-sig")
-        ass_path.write_text(build_ass(subtitle_entries), encoding="utf-8-sig")
+        ass_path.write_text(
+            build_ass(subtitle_entries, orientation=orientation),
+            encoding="utf-8-sig",
+        )
         return NarrationResult(
             voiceover_path=voiceover,
             timeline_path=timeline_path,

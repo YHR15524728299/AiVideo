@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 
+from aicf.production_settings import get_resolution
+
 
 def split_subtitle_text(text: str, max_chars: int = 18) -> list[str]:
     if max_chars < 1:
@@ -55,16 +57,33 @@ def _ass_timestamp(seconds: float) -> str:
     return f"{hours}:{minutes:02}:{whole_seconds:02}.{centiseconds:02}"
 
 
-def build_ass(entries: list[Mapping[str, object]]) -> str:
-    header = """[Script Info]
+def build_ass(
+    entries: list[Mapping[str, object]],
+    *,
+    orientation: str = "portrait",
+) -> str:
+    width, height = get_resolution(orientation)
+    if orientation == "landscape":
+        # 横屏 1920x1080：字体与边距按视觉比例调整
+        fontsize = 56
+        margin_l = 140
+        margin_r = 140
+        margin_v = 80
+    else:
+        # 竖屏 1080x1920（默认）
+        fontsize = 64
+        margin_l = 80
+        margin_r = 80
+        margin_v = 180
+    header = f"""[Script Info]
 ScriptType: v4.00+
-PlayResX: 1080
-PlayResY: 1920
+PlayResX: {width}
+PlayResY: {height}
 WrapStyle: 2
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, BackColour, Bold, Alignment, MarginL, MarginR, MarginV, Outline, Shadow
-Style: Default,Microsoft YaHei,64,&H00FFFFFF,&H00101010,&H80000000,-1,2,80,80,180,3,1
+Style: Default,Microsoft YaHei,{fontsize},&H00FFFFFF,&H00101010,&H80000000,-1,2,{margin_l},{margin_r},{margin_v},3,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text

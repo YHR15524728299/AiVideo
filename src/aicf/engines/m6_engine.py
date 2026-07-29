@@ -16,6 +16,7 @@ from aicf.engines.subtitle_engine import build_ass
 from aicf.artifact_commit import DirectoryPromoter
 from aicf.models.contracts import SUPPORTED_PLATFORMS
 from aicf.platform_export import PlatformExporter
+from aicf.production_settings import get_resolution
 from aicf.providers.tts import FfmpegToolchain
 
 
@@ -78,7 +79,7 @@ def _timeline_entries(path: Path) -> list[tuple[float, float, str]]:
     return entries
 
 
-def _ass_safety(path: Path) -> dict[str, object]:
+def _ass_safety(path: Path, *, orientation: str = "portrait") -> dict[str, object]:
     text = path.read_text(encoding="utf-8-sig")
     play_res_x = re.search(r"^PlayResX:\s*(\d+)", text, re.MULTILINE)
     play_res_y = re.search(r"^PlayResY:\s*(\d+)", text, re.MULTILINE)
@@ -104,19 +105,31 @@ def _ass_safety(path: Path) -> dict[str, object]:
         for fields in [line.split(",", 9)]
         if len(fields) == 10
     }
-    safe_styles = {
-        name
-        for name, style in styles.items()
-        if style["alignment"] == 2
-        and style["margin_l"] >= 60
-        and style["margin_r"] >= 60
-        and 120 <= style["margin_v"] <= 360
-    }
+    expected_width, expected_height = get_resolution(orientation)
+    if orientation == "landscape":
+        # 横屏安全区域：底部居中字幕
+        safe_styles = {
+            name
+            for name, style in styles.items()
+            if style["alignment"] == 2
+            and style["margin_l"] >= 100
+            and style["margin_r"] >= 100
+            and 60 <= style["margin_v"] <= 200
+        }
+    else:
+        safe_styles = {
+            name
+            for name, style in styles.items()
+            if style["alignment"] == 2
+            and style["margin_l"] >= 60
+            and style["margin_r"] >= 60
+            and 120 <= style["margin_v"] <= 360
+        }
     passed = (
         bool(play_res_x)
         and bool(play_res_y)
-        and int(play_res_x.group(1)) == 1080
-        and int(play_res_y.group(1)) == 1920
+        and int(play_res_x.group(1)) == expected_width
+        and int(play_res_y.group(1)) == expected_height
         and bool(used_styles)
         and used_styles <= safe_styles
     )
@@ -187,12 +200,14 @@ class RepairEngine:
             actions.append("remix_audio")
         if "subtitles" in issue_names:
             entries = _timeline_entries(timeline)
+            orientation = str(context.get("orientation", "portrait"))
             subtitles.write_text(
                 build_ass(
                     [
                         {"start_seconds": start, "end_seconds": end, "text": text}
                         for start, end, text in entries
-                    ]
+                    ],
+                    orientation=orientation,
                 ),
                 encoding="utf-8-sig",
             )
@@ -201,13 +216,16 @@ class RepairEngine:
         if "ffprobe" in issue_names:
             needs_rerender = True
         if needs_rerender:
-            self.renderer.render_and_validate(
+            render_kwargs = dict(
                 visual_plan_path=self._required_path(context, "visual_plan_path"),
                 audio_path=self._required_path(context, "audio_path"),
                 subtitle_path=subtitles,
                 output_path=master,
                 title=str(context.get("title", "")),
             )
+            orientation = str(context.get("orientation", "portrait"))
+            render_kwargs["orientation"] = orientation
+            self.renderer.render_and_validate(**render_kwargs)
             actions.append("rerender_m5")
         return actions
 
@@ -337,6 +355,7 @@ class TechnicalQA:
         timeline_path: str | Path,
         *,
         expected_duration_seconds: float,
+        orientation: str = "portrait",
     ) -> dict[str, object]:
         master = Path(master_path)
         clean = Path(clean_path)
@@ -350,7 +369,9 @@ class TechnicalQA:
         for name, probe in probes.items():
             errors: list[str] = []
             try:
-                probe.assert_vertical_delivery(expected_duration_seconds)
+                probe.assert_vertical_delivery(
+                    expected_duration_seconds, orientation=orientation
+                )
             except ValueError as error:
                 errors.append(str(error))
             probe_checks[name] = {
@@ -469,7 +490,7 @@ class TechnicalQA:
             and abs(cue[1] - entry[1]) <= 0.15
             for cue, entry in zip(cues, entries)
         )
-        safety = _ass_safety(subtitles)
+        safety = _ass_safety(subtitles, orientation=orientation)
         subtitle_ok = (
             bool(cues)
             and all(text for _, _, text in cues)
@@ -553,6 +574,7 @@ class M6Pipeline:
         expected_duration_seconds: float,
         repair_context: dict[str, object] | None = None,
         selected_platforms: tuple[str, ...] | None = None,
+        orientation: str = "portrait",
     ) -> dict[str, object]:
         if selected_platforms is not None and not selected_platforms:
             raise ValueError("至少选择一个导出平台")
@@ -573,12 +595,16 @@ class M6Pipeline:
         repair_rounds = 0
         repair_attempts: list[dict[str, object]] = []
         repair_verified = False
+        # 确保 repair_context 中包含 orientation，供修复引擎使用
+        effective_repair_context = dict(repair_context or {})
+        effective_repair_context.setdefault("orientation", orientation)
         technical = self.technical_qa.run(
             master,
             clean,
             subtitles,
             timeline,
             expected_duration_seconds=expected_duration_seconds,
+            orientation=orientation,
         )
         _write_json(qa_dir / "technical_round_0.json", technical)
         while not technical["passed"] and repair_rounds < self.max_repair_rounds:
@@ -593,7 +619,7 @@ class M6Pipeline:
                 clean=clean,
                 subtitles=subtitles,
                 timeline=timeline,
-                context=repair_context or {},
+                context=effective_repair_context,
             )
             if not actions:
                 break
@@ -606,6 +632,7 @@ class M6Pipeline:
                 subtitles,
                 timeline,
                 expected_duration_seconds=expected_duration_seconds,
+                orientation=orientation,
             )
             current_issues = list(technical.get("issues", []))
             issues_disappeared = not set(previous_issues).intersection(current_issues)
@@ -663,10 +690,16 @@ class M6Pipeline:
             clean,
             working,
             expected_duration_seconds,
+            orientation=orientation,
         )
         shutil.copy2(master, working / "master.mp4")
         shutil.copy2(clean, working / "clean.mp4")
-        self._create_preview(master, working / "preview_540x960.mp4")
+        preview_filename = (
+            "preview_960x540.mp4" if orientation == "landscape" else "preview_540x960.mp4"
+        )
+        self._create_preview(
+            master, working / preview_filename, orientation=orientation
+        )
         platform_entries = self.platform_exporter.export(
             master,
             working,
@@ -686,9 +719,10 @@ class M6Pipeline:
             "cover": "cover.jpg",
             "clean_cover": "clean_cover.jpg",
             "clean_video": "clean.mp4",
-            "preview": "preview_540x960.mp4",
+            "preview": preview_filename,
             "platforms": platform_entries,
             "expected_duration_seconds": expected_duration_seconds,
+            "orientation": orientation,
         }
         manifest["files"] = self._file_inventory(working)
         _write_json(working / "publish_manifest.json", manifest)
@@ -728,10 +762,14 @@ class M6Pipeline:
         except (TypeError, ValueError):
             repair_rounds = 0
             issues.append("publish_manifest.json repair_rounds 无效")
+        orientation = str(manifest.get("orientation", "portrait"))
+        preview_name = (
+            "preview_960x540.mp4" if orientation == "landscape" else "preview_540x960.mp4"
+        )
         required = {
             "master.mp4",
             "clean.mp4",
-            "preview_540x960.mp4",
+            preview_name,
             "cover.jpg",
             "clean_cover.jpg",
             "contact_sheet.jpg",
@@ -787,7 +825,9 @@ class M6Pipeline:
                         self.command_runner,
                     )
                     if expected_duration > 0:
-                        probe.assert_vertical_delivery(expected_duration)
+                        probe.assert_vertical_delivery(
+                            expected_duration, orientation=orientation
+                        )
                 except Exception as error:
                     issues.append(f"{relative} 媒体验证失败: {error}")
         return issues
@@ -821,6 +861,8 @@ class M6Pipeline:
         clean: Path,
         destination: Path,
         duration: float,
+        *,
+        orientation: str = "portrait",
     ) -> int:
         sample_rate = 9.0 / max(duration, 0.1)
         frame_analysis = _run(
@@ -848,6 +890,13 @@ class M6Pipeline:
             )
         if any(value >= 98.0 for value in black_percentages):
             raise ValueError("contact sheet 包含黑帧")
+        # contact sheet：竖屏每格 270x480、横屏每格 480x270，保持 3x3 网格
+        if orientation == "landscape":
+            sheet_filter = f"fps={sample_rate:.8f},scale=480:270,tile=3x3"
+            cover_scale = "scale=1920:1080"
+        else:
+            sheet_filter = f"fps={sample_rate:.8f},scale=270:480,tile=3x3"
+            cover_scale = "scale=1080:1920"
         _run(
             self.command_runner,
             [
@@ -856,7 +905,7 @@ class M6Pipeline:
                 "-i",
                 str(master),
                 "-vf",
-                f"fps={sample_rate:.8f},scale=270:480,tile=3x3",
+                sheet_filter,
                 "-frames:v",
                 "1",
                 str(destination / "contact_sheet.jpg"),
@@ -875,13 +924,16 @@ class M6Pipeline:
                     "-frames:v",
                     "1",
                     "-vf",
-                    "scale=1080:1920",
+                    cover_scale,
                     str(destination / name),
                 ],
             )
         return len(black_percentages)
 
-    def _create_preview(self, master: Path, output: Path) -> None:
+    def _create_preview(
+        self, master: Path, output: Path, *, orientation: str = "portrait"
+    ) -> None:
+        scale_filter = "scale=960:540" if orientation == "landscape" else "scale=540:960"
         _run(
             self.command_runner,
             [
@@ -890,7 +942,7 @@ class M6Pipeline:
                 "-i",
                 str(master),
                 "-vf",
-                "scale=540:960",
+                scale_filter,
                 "-c:v",
                 "libx264",
                 "-crf",

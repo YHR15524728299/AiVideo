@@ -36,6 +36,7 @@ class M5VisualPlanRunner:
         timeline_path: str | Path,
         output_dir: str | Path,
         mode: Literal["balanced"] = "balanced",
+        orientation: Literal["portrait", "landscape"] = "portrait",
     ) -> VisualPlanResult:
         script = ScriptResult.model_validate(self._read_json(Path(script_path)))
         timeline = self._read_json(Path(timeline_path))
@@ -109,6 +110,7 @@ class M5VisualPlanRunner:
                             if int(spec["part_count"]) > 1
                             else None
                         ),
+                        orientation=orientation,
                     ),
                     expected_path=f"assets/{shot_id}{suffix}",
                     start_seconds=float(spec["start"]),
@@ -198,6 +200,7 @@ class M5VisualPlanRunner:
         *,
         dynamic: bool,
         sequence: tuple[int, int] | None = None,
+        orientation: str = "portrait",
     ) -> str:
         motion = (
             "连续动态镜头，主体运动明确，镜头运动流畅"
@@ -210,9 +213,14 @@ class M5VisualPlanRunner:
             if sequence
             else ""
         )
+        orientation_text = (
+            "横屏16:9，主体位于安全区域，无文字，无水印，无标志。"
+            if orientation == "landscape"
+            else "竖屏9:16，主体位于安全区域，无文字，无水印，无标志。"
+        )
         return (
             f"{visual_brief}{sequence_note}；{motion}；电影级光影，真实材质，层次丰富，"
-            "竖屏9:16，主体位于安全区域，无文字，无水印，无标志。"
+            f"{orientation_text}"
         )
 
     @staticmethod

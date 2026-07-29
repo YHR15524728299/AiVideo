@@ -9,10 +9,12 @@ import shutil
 import subprocess
 import sys
 import threading
+import tkinter as tk
 from datetime import datetime
 from pathlib import Path
 from tkinter import (
     BooleanVar,
+    Label,
     Menu,
     PhotoImage,
     StringVar,
@@ -35,9 +37,15 @@ from .production_settings import (
     MOTION_MODE_VALUES,
     ORIENTATION_DISPLAY_NAMES,
     PLATFORM_DISPLAY_NAMES,
+    VIDEO_PROVIDER_DISPLAY_NAMES,
+    JIMENG_MODEL_DISPLAY_NAMES,
+    KLING_MODEL_DISPLAY_NAMES,
     VOICE_DISPLAY_NAMES,
     VOICE_GROUP_ORDER,
 )
+from .providers.jimeng import detect_jimeng_cli
+from .providers.kling import detect_kling_cli
+from .settings_dialog import open_settings, load_default_settings
 from .state_machine import PipelineStage
 
 # 阶段顺序与中文名称（完整流水线）
@@ -71,17 +79,21 @@ STAGE_INDEX = {stage: i for i, (stage, _) in enumerate(STAGES)}
 def build_production_settings(
     platforms: dict[str, bool],
     *,
-    jimeng_model: str,
-    video_resolution: str,
-    motion_mode: str,
-    narration_voice: str,
-    orientation: str,
+    video_provider: str = "jimeng",
+    jimeng_model: str = "seedance2.0fast",
+    kling_model: str = "kling-video-v2_6",
+    video_resolution: str = "720p",
+    motion_mode: str = "video",
+    narration_voice: str = "kokoro:zm_yunyang",
+    orientation: str = "portrait",
 ) -> ProductionSettings:
     return ProductionSettings(
         selected_platforms=tuple(
             platform for platform, selected in platforms.items() if selected
         ),
+        video_provider=video_provider,
         jimeng_model=jimeng_model,
+        kling_model=kling_model,
         video_resolution=video_resolution,
         motion_mode=motion_mode,
         narration_voice=narration_voice,
@@ -409,11 +421,18 @@ class AicfGUI:
 
         self._setup_styles()
         self._build_ui()
+        # 加载默认生产设置
+        try:
+            default_settings = load_default_settings()
+            self._apply_production_settings(default_settings)
+        except Exception:
+            pass
         self._refresh_job_list()
         self._poll_log_queue()
         self._poll_ui_queue()
         self._auto_detect_and_poll()  # 自动检测后台运行的任务并启动实时轮询
         self._poll_progress()  # 启动全局实时状态刷新
+        self._update_button_states()  # 初始化按钮状态
 
     # ------------------------------------------------------------------
     # UI 构建
@@ -440,18 +459,23 @@ class AicfGUI:
         self.env_labels: dict[str, ttk.Label] = {}
         env_items = [
             ("openrouter", "OpenRouter"),
-            ("dreamina", "Dreamina CLI"),
+            ("dreamina", "即梦 CLI"),
+            ("kling", "可灵 CLI"),
             ("ffmpeg", "FFmpeg"),
             ("tts", "TTS 语音"),
         ]
         for i, (key, text) in enumerate(env_items):
             ttk.Label(env_frame, text=text + ":").grid(row=0, column=i * 2, sticky="w", padx=(8, 4))
-            lbl = ttk.Label(env_frame, text="未检查", style="EnvIdle.TLabel")
+            lbl = ttk.Label(env_frame, text="未检查", style="EnvIdle.TLabel", cursor="hand2")
             lbl.grid(row=0, column=i * 2 + 1, sticky="w", padx=(0, 16))
+            lbl.bind("<Button-1>", lambda e, k=key: self._open_settings_for(k))
             self.env_labels[key] = lbl
 
         ttk.Button(env_frame, text="检查环境", command=self._run_doctor).grid(
             row=0, column=len(env_items) * 2, sticky="e", padx=8
+        )
+        ttk.Button(env_frame, text="⚙️ 设置", command=self._open_settings).grid(
+            row=0, column=len(env_items) * 2 + 1, sticky="e", padx=(0, 8)
         )
 
         # 当前模型显示 + 选择按钮
@@ -510,28 +534,49 @@ class AicfGUI:
 
         options = ttk.Frame(setup_frame)
         options.grid(row=2, column=0, columnspan=5, sticky="ew", pady=(6, 0))
+
+        # 检测可用的视频生成提供商
+        self._available_providers = self._detect_video_providers()
+        self.video_provider_var = StringVar(value=self._available_providers[0] if self._available_providers else "")
         self.jimeng_model_var = StringVar(value="seedance2.0fast")
+        self.kling_model_var = StringVar(value="kling-video-v2_6")
         self.video_resolution_var = StringVar(value="720p")
         self.motion_mode_display_var = StringVar(value=MOTION_MODE_DISPLAY_NAMES["video"])
         self.narration_voice_var = StringVar(value="kokoro:zm_yunyang")
         self.narration_voice_display_var = StringVar(value=VOICE_DISPLAY_NAMES["kokoro:zm_yunyang"])
-        
-        # 即梦模型
-        ttk.Label(options, text="即梦模型:").pack(side="left", padx=(0, 4))
-        ttk.Combobox(
+
+        # 视频生成提供商
+        ttk.Label(options, text="视频生成:").pack(side="left", padx=(0, 4))
+        provider_display_values = tuple(
+            VIDEO_PROVIDER_DISPLAY_NAMES.get(p, p) for p in self._available_providers
+        )
+        initial_provider_display = VIDEO_PROVIDER_DISPLAY_NAMES.get(
+            self.video_provider_var.get(), ""
+        )
+        self.provider_display_var = StringVar(value=initial_provider_display)
+        self.provider_combo = ttk.Combobox(
             options,
-            textvariable=self.jimeng_model_var,
-            values=(
-                "seedance2.0fast",
-                "seedance2.0",
-                "seedance2.0_vip",
-                "seedance2.0fast_vip",
-                "seedance2.0mini",
-            ),
+            textvariable=self.provider_display_var,
+            values=provider_display_values,
             state="readonly",
-            width=18,
-        ).pack(side="left", padx=(0, 12))
-        
+            width=16,
+        )
+        self.provider_combo.pack(side="left", padx=(0, 8))
+        self.provider_combo.bind("<<ComboboxSelected>>", self._on_provider_selected)
+        if not self._available_providers:
+            self.provider_combo.set("未配置")
+            self.provider_combo.configure(state="disabled")
+
+        # 模型（根据提供商动态变化）
+        ttk.Label(options, text="模型:").pack(side="left", padx=(0, 4))
+        self.model_combo = ttk.Combobox(
+            options,
+            state="readonly",
+            width=20,
+        )
+        self.model_combo.pack(side="left", padx=(0, 12))
+        self._update_model_combo()
+
         # 分辨率
         ttk.Label(options, text="分辨率:").pack(side="left", padx=(0, 4))
         ttk.Combobox(
@@ -541,7 +586,7 @@ class AicfGUI:
             state="readonly",
             width=10,
         ).pack(side="left", padx=(0, 12))
-        
+
         # 动态模式（中文显示）
         ttk.Label(options, text="动态模式:").pack(side="left", padx=(0, 4))
         motion_mode_combo = ttk.Combobox(
@@ -552,7 +597,7 @@ class AicfGUI:
             width=12,
         )
         motion_mode_combo.pack(side="left", padx=(0, 12))
-        
+
         # 旁白音色（中文显示）
         ttk.Label(options, text="旁白音色:").pack(side="left", padx=(0, 4))
         voice_display_values = tuple(VOICE_DISPLAY_NAMES[v] for v in VOICE_GROUP_ORDER)
@@ -576,9 +621,15 @@ class AicfGUI:
         ttk.Label(setup_frame, text="内容方向:").grid(row=3, column=0, sticky="nw", pady=(6, 0), padx=(0, 6))
         self.direction_text = scrolledtext.ScrolledText(setup_frame, height=4, wrap="word", font=("Consolas", 10))
         self.direction_text.grid(row=3, column=1, columnspan=4, sticky="nsew", pady=(6, 0))
+        self._direction_placeholder = "在此输入视频内容方向，例如：\n• 主题：xxx\n• 风格：轻松/科普/情感\n• 目标受众：xxx\n• 关键信息点：..."
+        self._direction_has_placeholder = False
         default_dir = self._load_default_direction()
         if default_dir:
             self.direction_text.insert("1.0", default_dir)
+        else:
+            self._show_direction_placeholder()
+        self.direction_text.bind("<FocusIn>", self._on_direction_focus_in)
+        self.direction_text.bind("<FocusOut>", self._on_direction_focus_out)
 
         setup_frame.columnconfigure(4, weight=1)
         setup_frame.rowconfigure(3, weight=1)
@@ -595,8 +646,10 @@ class AicfGUI:
 
         ttk.Button(btn_frame, text="🔄 立即刷新", command=self._refresh_all).pack(side="left", padx=6)
         ttk.Button(btn_frame, text="📂 打开输出目录", command=self._open_output).pack(side="left", padx=6)
-        ttk.Button(btn_frame, text="打开最终视频", command=self._open_final_video).pack(side="left", padx=6)
-        ttk.Button(btn_frame, text="⏹ 停止", command=self._stop_job).pack(side="left", padx=6)
+        self.btn_open_video = ttk.Button(btn_frame, text="▶ 打开最终视频", command=self._open_final_video)
+        self.btn_open_video.pack(side="left", padx=6)
+        self.btn_stop = ttk.Button(btn_frame, text="⏹ 停止", command=self._stop_job)
+        self.btn_stop.pack(side="left", padx=6)
 
         # ---- 阶段进度 ----
         stage_frame = ttk.LabelFrame(root, text="流水线进度", padding=8)
@@ -659,16 +712,27 @@ class AicfGUI:
         self.log_text.tag_configure("success", foreground="#51cf66")
         self.log_text.tag_configure("info", foreground="#74c0fc")
         self.log_text.tag_configure("warning", foreground="#ffa94d")
+        self._log_auto_scroll = True
+        self._auto_scroll_var = BooleanVar(value=True)
 
         # 右键菜单
         self._log_menu = Menu(self.log_text, tearoff=0)
+        self._log_menu.add_command(label="复制", command=self._copy_log_selection, accelerator="Ctrl+C")
+        self._log_menu.add_command(label="全选", command=self._select_all_log, accelerator="Ctrl+A")
+        self._log_menu.add_separator()
         self._log_menu.add_command(label="清屏", command=self._clear_log)
+        self._log_menu.add_separator()
+        self._log_menu.add_checkbutton(label="自动滚动", command=self._toggle_auto_scroll, variable=self._auto_scroll_var)
         self.log_text.bind("<Button-3>", self._show_log_menu)
 
         # ---- 底部状态栏 ----
         self.status_var = StringVar(value="就绪")
-        status_bar = ttk.Label(root, textvariable=self.status_var, relief="sunken", anchor="w", padding=(6, 3))
-        status_bar.pack(fill="x", padx=10, pady=(0, 8))
+        self.status_bar = tk.Label(
+            root, textvariable=self.status_var, relief="sunken", anchor="w",
+            padx=6, pady=3, bg="#f5f5f5", fg="#333333",
+            font=("TkDefaultFont", 9)
+        )
+        self.status_bar.pack(fill="x", padx=10, pady=(0, 8))
 
         # 窗口关闭时停止试听
         root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -679,6 +743,26 @@ class AicfGUI:
     def _auto_job_id(self) -> str:
         now = datetime.now()
         return f"VIDEO{now.strftime('%m%d%H%M')}"
+
+    def _show_direction_placeholder(self):
+        """显示内容方向的placeholder提示文字。"""
+        self.direction_text.delete("1.0", "end")
+        self.direction_text.insert("1.0", self._direction_placeholder)
+        self.direction_text.configure(foreground="#9ca3af")
+        self._direction_has_placeholder = True
+
+    def _on_direction_focus_in(self, _event=None):
+        """获得焦点时清除placeholder。"""
+        if self._direction_has_placeholder:
+            self.direction_text.delete("1.0", "end")
+            self.direction_text.configure(foreground="")
+            self._direction_has_placeholder = False
+
+    def _on_direction_focus_out(self, _event=None):
+        """失去焦点时如果为空则显示placeholder。"""
+        content = self.direction_text.get("1.0", "end").strip()
+        if not content:
+            self._show_direction_placeholder()
 
     def _load_default_direction(self) -> str:
         path = project_root() / "config" / "content_direction.yaml"
@@ -693,6 +777,14 @@ class AicfGUI:
         ts = datetime.now().strftime("%H:%M:%S")
         self.log_queue.put(f"[{ts}] {msg}\n{tag}")
 
+    def _toggle_auto_scroll(self) -> None:
+        """切换日志自动滚动开关。"""
+        self._log_auto_scroll = self._auto_scroll_var.get()
+
+    def _open_settings_for(self, key: str) -> None:
+        """点击环境灯时打开设置对话框。"""
+        self._open_settings()
+
     def _poll_log_queue(self) -> None:
         try:
             while True:
@@ -706,7 +798,8 @@ class AicfGUI:
                     self.log_text.insert("end", text, tag)
                 else:
                     self.log_text.insert("end", text)
-                self.log_text.see("end")
+                if self._log_auto_scroll:
+                    self.log_text.see("end")
                 self.log_text.configure(state="disabled")
         except queue.Empty:
             pass
@@ -722,15 +815,38 @@ class AicfGUI:
                     self._set_status(str(arg1))
                 elif action == "preview_done":
                     self._on_preview_done()
+                elif action == "show_error":
+                    messagebox.showerror(str(arg1), str(arg2))
         except queue.Empty:
             pass
         self.root.after(100, self._poll_ui_queue)
 
     def _clear_log(self) -> None:
-        """清空运行日志。"""
+        """清空运行日志（带确认）。"""
+        if not messagebox.askyesno("确认清屏", "确定要清空所有日志吗？此操作不可撤销。", parent=self.root):
+            return
         self.log_text.configure(state="normal")
         self.log_text.delete("1.0", "end")
         self.log_text.configure(state="disabled")
+        self._log("日志已清空", "info")
+
+    def _copy_log_selection(self) -> None:
+        """复制日志中选中的文本到剪贴板。"""
+        try:
+            selected = self.log_text.get("sel.first", "sel.last")
+            self.root.clipboard_clear()
+            self.root.clipboard_append(selected)
+        except tk.TclError:
+            # 没有选中文本时复制全部
+            content = self.log_text.get("1.0", "end-1c")
+            self.root.clipboard_clear()
+            self.root.clipboard_append(content)
+
+    def _select_all_log(self) -> None:
+        """全选日志内容。"""
+        self.log_text.tag_add("sel", "1.0", "end-1c")
+        self.log_text.mark_set("insert", "1.0")
+        self.log_text.see("insert")
 
     def _show_log_menu(self, event: object) -> None:
         """在鼠标位置弹出右键菜单。"""
@@ -793,14 +909,27 @@ class AicfGUI:
     def _collect_production_settings(self) -> ProductionSettings:
         # 将中文显示名转换回内部值
         motion_display = self.motion_mode_display_var.get()
-        motion_mode = MOTION_MODE_VALUES.get(motion_display, "balanced")
-        
+        motion_mode = MOTION_MODE_VALUES.get(motion_display, "video")
+
+        # 获取当前选中的模型
+        current_provider = self._get_selected_provider()
+        kling_model = self.kling_model_var.get()
+        jimeng_model = self.jimeng_model_var.get()
+
+        # 校验：至少选择一个平台
+        selected_platforms = {
+            platform: bool(variable.get())
+            for platform, variable in self.platform_vars.items()
+        }
+        if not any(selected_platforms.values()):
+            messagebox.showwarning("提示", "请至少选择一个发布平台")
+            return None  # type: ignore[return-value]
+
         return build_production_settings(
-            {
-                platform: bool(variable.get())
-                for platform, variable in self.platform_vars.items()
-            },
-            jimeng_model=self.jimeng_model_var.get(),
+            selected_platforms,
+            video_provider=current_provider or "jimeng",
+            jimeng_model=jimeng_model,
+            kling_model=kling_model,
             video_resolution=self.video_resolution_var.get(),
             motion_mode=motion_mode,
             narration_voice=self.narration_voice_var.get(),
@@ -811,7 +940,16 @@ class AicfGUI:
         selected = set(settings.selected_platforms)
         for platform, variable in self.platform_vars.items():
             variable.set(platform in selected)
+        provider_key = getattr(settings, "video_provider", "jimeng")
+        self.video_provider_var.set(provider_key)
+        if hasattr(self, "provider_display_var"):
+            self.provider_display_var.set(
+                VIDEO_PROVIDER_DISPLAY_NAMES.get(provider_key, provider_key)
+            )
         self.jimeng_model_var.set(settings.jimeng_model)
+        self.kling_model_var.set(getattr(settings, "kling_model", "kling-video-v2_6"))
+        if hasattr(self, "model_combo"):
+            self._update_model_combo_display()
         self.video_resolution_var.set(settings.video_resolution)
         # 内部值转中文显示
         self.motion_mode_display_var.set(
@@ -830,12 +968,101 @@ class AicfGUI:
 
     def _set_status(self, text: str) -> None:
         self.status_var.set(text)
+        # 根据状态文本自动设置颜色
+        text_lower = text.lower()
+        if any(kw in text for kw in ("失败", "错误", "异常", "✗")) or "fail" in text_lower or "error" in text_lower:
+            self.status_bar.configure(fg="#c62828")  # 红色
+        elif any(kw in text for kw in ("完成", "就绪", "✓", "成功")) or "success" in text_lower or "complete" in text_lower:
+            self.status_bar.configure(fg="#2e7d32")  # 绿色
+        elif any(kw in text for kw in ("警告", "需处理")) or "warn" in text_lower:
+            self.status_bar.configure(fg="#f57c00")  # 橙色
+        elif "运行中" in text or "running" in text_lower:
+            self.status_bar.configure(fg="#1565c0")  # 蓝色
+        else:
+            self.status_bar.configure(fg="#333333")  # 默认深灰
 
     def _set_buttons_running(self, running: bool) -> None:
-        state = "disabled" if running else "normal"
-        self.btn_start.configure(state=state)
-        self.btn_resume.configure(state=state)
         self.running = running
+        self._update_button_states()
+
+    def _friendly_error(self, error: Exception) -> str:
+        """将技术异常转换为用户友好的中文提示。"""
+        error_msg = str(error)
+        error_lower = error_msg.lower()
+
+        # FFmpeg 相关错误
+        if "ffmpeg" in error_lower or "ffprobe" in error_lower:
+            if "not found" in error_lower or "未找到" in error_msg:
+                return ("未找到FFmpeg。\n\n"
+                        "请安装完整版FFmpeg：\n"
+                        "  方法1：运行 winget install Gyan.FFmpeg\n"
+                        "  方法2：从 https://ffmpeg.org 下载后添加到PATH\n\n"
+                        "安装后请重启本工具。")
+            return f"音频/视频处理出错：{error_msg}\n\n请确认FFmpeg安装正确。"
+
+        # 网络相关错误
+        if any(kw in error_lower for kw in ("401", "unauthorized", "invalid api", "api key")):
+            return ("API Key无效或未配置。\n\n"
+                    "请点击「⚙️ 设置」按钮，在「AI大模型」页面检查您的OPENROUTER_API_KEY是否正确。")
+        if "429" in error_lower or "too many requests" in error_lower or "rate limit" in error_lower:
+            return "请求过于频繁，请稍后重试。"
+        if "403" in error_lower or "forbidden" in error_lower:
+            return "API访问被拒绝，请检查您的API Key权限和账户余额。"
+        if any(kw in error_lower for kw in ("timeout", "timed out", "连接超时", "网络")):
+            return "网络连接超时，请检查网络连接后重试。"
+        if any(kw in error_lower for kw in ("connection", "connect", "dns", "网络错误")):
+            return "网络连接失败，请检查网络连接后重试。"
+
+        # TTS 相关错误
+        if "kokoro" in error_lower or "tts" in error_lower:
+            if "model" in error_lower or "下载" in error_msg:
+                return ("语音模型下载失败或未就绪。\n\n"
+                        "首次使用Kokoro本地TTS需要下载约300MB的模型文件，\n"
+                        "请确保网络通畅后重试。")
+            return f"语音生成失败：{error_msg}"
+
+        # CLI 认证错误
+        if any(kw in error_lower for kw in ("login", "认证", "auth", "未登录")):
+            return ("视频生成工具未登录。\n\n"
+                    "请点击「⚙️ 设置」→「视频生成」，根据指引完成登录。")
+
+        # CLI 未找到
+        if any(kw in error_lower for kw in ("not found", "未找到", "no such file")):
+            if "dreamina" in error_lower or "jimeng" in error_lower or "即梦" in error_msg:
+                return ("未找到即梦视频生成工具。\n\n"
+                        "请在「⚙️ 设置」→「视频生成」中安装并配置即梦CLI。")
+            if "kling" in error_lower or "可灵" in error_msg:
+                return ("未找到可灵视频生成工具。\n\n"
+                        "请在「⚙️ 设置」→「视频生成」中安装并配置可灵CLI。")
+
+        # 默认：返回简化的错误信息，技术详情放日志
+        return f"操作失败：{error_msg}\n\n详细错误信息请查看日志。"
+
+    def _update_button_states(self) -> None:
+        """根据当前运行状态和环境配置更新按钮可用状态。"""
+        has_video = bool(self._available_providers)
+        has_api = bool(_get_env_value("OPENROUTER_API_KEY"))
+        can_start = (not self.running) and has_video and has_api
+
+        self.btn_start.configure(state="normal" if can_start else "disabled")
+        self.btn_resume.configure(state="disabled" if self.running else "normal")
+
+        # 停止按钮只在运行中可用
+        if hasattr(self, "btn_stop"):
+            self.btn_stop.configure(state="normal" if self.running else "disabled")
+
+        # 打开最终视频按钮只在有选中任务时可用
+        if hasattr(self, "btn_open_video") and hasattr(self, "job_tree"):
+            selected = self._current_job_id()
+            self.btn_open_video.configure(state="normal" if selected else "disabled")
+
+        # 更新开始按钮提示文字
+        if not has_api:
+            self.btn_start.configure(text="▶ 请先配置API Key")
+        elif not has_video:
+            self.btn_start.configure(text="▶ 请先配置视频服务")
+        else:
+            self.btn_start.configure(text="▶ 开始生成")
 
     # ------------------------------------------------------------------
     # 音色选择与试听
@@ -851,6 +1078,86 @@ class AicfGUI:
         """下拉框选择音色时同步内部 voice_id。"""
         display = self.narration_voice_display_var.get()
         self.narration_voice_var.set(self._voice_id_from_display(display))
+
+    def _detect_video_providers(self) -> list[str]:
+        """检测哪些视频生成提供商已配置可用。"""
+        providers: list[str] = []
+        # 检测即梦CLI
+        try:
+            root = project_root()
+            config_path = root / "config" / "jimeng_cli.yaml"
+            caps = detect_jimeng_cli(config_path=config_path, timeout_seconds=5)
+            if caps.supports_async_task:
+                providers.append("jimeng")
+        except Exception:
+            pass
+        # 检测可灵CLI
+        try:
+            caps = detect_kling_cli(timeout_seconds=5)
+            if caps.supports_async_task and caps.cli_path:
+                providers.append("kling")
+        except Exception:
+            pass
+        return providers
+
+    def _get_selected_provider(self) -> str:
+        """获取当前选中的视频提供商（内部key）。"""
+        display = self.provider_display_var.get()
+        for key, name in VIDEO_PROVIDER_DISPLAY_NAMES.items():
+            if name == display:
+                return key
+        # fallback: 检查var
+        pv = self.video_provider_var.get()
+        if pv in VIDEO_PROVIDER_DISPLAY_NAMES:
+            return pv
+        return self._available_providers[0] if self._available_providers else "jimeng"
+
+    def _on_provider_selected(self, _event: object = None) -> None:
+        """切换视频提供商时更新模型下拉框。"""
+        provider = self._get_selected_provider()
+        self.video_provider_var.set(provider)
+        self._refresh_model_combo_options()
+
+    def _refresh_model_combo_options(self) -> None:
+        """根据当前选中的提供商刷新模型下拉框的选项列表和事件绑定。"""
+        provider = self._get_selected_provider()
+        if provider == "kling":
+            model_map = KLING_MODEL_DISPLAY_NAMES
+            current_var = self.kling_model_var
+        else:
+            model_map = JIMENG_MODEL_DISPLAY_NAMES
+            current_var = self.jimeng_model_var
+
+        display_values = tuple(model_map.values())
+        self.model_combo.configure(values=display_values)
+        current_display = model_map.get(current_var.get(), current_var.get())
+        self.model_combo.set(current_display)
+
+        def on_model_selected(_event: object = None) -> None:
+            display = self.model_combo.get()
+            # 反查内部key
+            for key, name in model_map.items():
+                if name == display:
+                    current_var.set(key)
+                    break
+        self.model_combo.bind("<<ComboboxSelected>>", on_model_selected)
+
+    def _update_model_combo_display(self) -> None:
+        """根据当前选中的提供商更新模型下拉框显示值（不改变选项列表）。"""
+        provider = self._get_selected_provider()
+        if provider == "kling":
+            display_name = KLING_MODEL_DISPLAY_NAMES.get(
+                self.kling_model_var.get(), self.kling_model_var.get()
+            )
+        else:
+            display_name = JIMENG_MODEL_DISPLAY_NAMES.get(
+                self.jimeng_model_var.get(), self.jimeng_model_var.get()
+            )
+        self.model_combo.set(display_name)
+
+    def _update_model_combo(self) -> None:
+        """初始化模型下拉框的选项列表。"""
+        self._refresh_model_combo_options()
 
     def _stop_preview(self) -> None:
         """停止正在播放的试听音频。"""
@@ -904,9 +1211,13 @@ class AicfGUI:
                 self.log_queue.put(f"[试听] 正在播放，切换音色后点试听可直接对比\n")
                 self.ui_queue.put(("set_status", "试听播放中（切换音色可对比）", None))
             except Exception as error:
-                self.log_queue.put(f"[试听] 生成失败: {type(error).__name__}: {error}\n")
+                error_msg = str(error)
+                error_type = type(error).__name__
+                self.log_queue.put(f"[试听] 生成失败: {error_type}: {error_msg}\n")
                 self.ui_queue.put(("set_status", "试听失败", None))
-                messagebox.showerror("试听失败", f"生成试听音频失败：\n{error}")
+                # 转换为用户友好的错误提示
+                friendly_msg = self._friendly_error(error)
+                self.ui_queue.put(("show_error", "试听失败", friendly_msg))
             finally:
                 self.ui_queue.put(("preview_done", None, None))
 
@@ -959,6 +1270,7 @@ class AicfGUI:
             checks = {
                 "openrouter": "openrouter: OK" in output,
                 "dreamina": "jimeng: OK" in output,
+                "kling": "kling: OK" in output,
                 "ffmpeg": "ffmpeg: OK" in output,
                 "tts": "tts_strategy: OK" in output,
             }
@@ -976,10 +1288,14 @@ class AicfGUI:
     def _ensure_direction_file(self) -> Path:
         """将界面输入的方向写入全局 config/content_direction.yaml。"""
         direction = self.direction_text.get("1.0", "end").strip()
+        # 如果是placeholder文本，视为空
+        if self._direction_has_placeholder or direction == self._direction_placeholder.strip():
+            direction = ""
         cfg_path = project_root() / "config" / "content_direction.yaml"
         cfg_path.parent.mkdir(parents=True, exist_ok=True)
+        # 不再使用默认值，调用前应确保direction不为空
         if not direction:
-            direction = "AI短视频自动生成"
+            direction = "请根据用户需求生成AI短视频"
         content = f"direction: |\n"
         for line in direction.splitlines():
             content += f"  {line}\n"
@@ -992,10 +1308,7 @@ class AicfGUI:
             messagebox.showinfo("提示", "已有任务正在运行，请等待或先停止")
             return
         # 立即设置运行标志，防止快速双击导致重复启动
-        self.running = True
-
-        self.btn_start.configure(state="disabled")
-        self.btn_resume.configure(state="disabled")
+        self._set_buttons_running(True)
         self._set_status("运行中...")
         self._log(f"执行命令: {' '.join(args)}", "info")
         self._log_file_offsets.clear()  # 清空日志文件偏移，重新读取
@@ -1319,13 +1632,27 @@ class AicfGUI:
         self._logged_stages.clear()
         self._log_file_offsets.clear()
         job_id = self.job_id_var.get().strip() or self._auto_job_id()
+        # 校验任务ID：只允许字母、数字、下划线、短横线
+        import re
+        if not re.match(r'^[a-zA-Z0-9_-]+$', job_id):
+            messagebox.showwarning("任务ID无效", "任务ID只能包含字母、数字、下划线(_)和短横线(-)")
+            return
+        # 校验内容方向不为空
+        direction = self.direction_text.get("1.0", "end").strip()
+        if self._direction_has_placeholder or not direction or direction == self._direction_placeholder.strip():
+            messagebox.showwarning("请填写内容方向", "请在「内容方向」文本框中填写视频的主题、风格和关键信息，\n这将帮助AI生成更符合您预期的视频内容。")
+            self.direction_text.focus_set()
+            return
         self.job_id_var.set(job_id)
         # 新任务启动，显示切到新任务
         self._display_job_id = job_id
         self._user_selected_job = False
         self._ensure_direction_file()
         try:
-            self._collect_production_settings().freeze_for_job(
+            settings = self._collect_production_settings()
+            if settings is None:
+                return
+            settings.freeze_for_job(
                 self._get_job_dir(job_id)
             )
         except ValueError as error:
@@ -1355,6 +1682,11 @@ class AicfGUI:
 
     def _stop_job(self) -> None:
         if self.current_process and self.running:
+            if not messagebox.askyesno(
+                "确认停止",
+                "确定要停止当前正在运行的任务吗？\n已生成的部分资源会被保留。",
+            ):
+                return
             pid = self.current_process.pid
             self._log(f"正在停止任务 (PID={pid})...", "info")
             try:
@@ -1381,11 +1713,14 @@ class AicfGUI:
     # 状态刷新
     # ------------------------------------------------------------------
     def _refresh_all(self) -> None:
+        self._set_status("正在刷新...")
         self._refresh_job_list()
         job_id = self._current_job_id() or self._display_job_id
         if job_id:
             self._display_job_id = job_id
             self._refresh_status_for_job(job_id)
+        self._set_status("刷新完成")
+        self._update_button_states()
 
     def _refresh_status(self) -> None:
         job_id = self._current_job_id()
@@ -1656,6 +1991,70 @@ class AicfGUI:
         dialog = ModelSelectionDialog(self.root)
         self.root.after(500, lambda: self._sync_model_label(dialog))
 
+    def _open_settings(self, *, first_time: bool = False) -> None:
+        """打开集中设置对话框。
+        
+        Args:
+            first_time: 是否是首次启动引导模式
+        """
+        def on_saved() -> None:
+            # 设置保存后，刷新环境状态和模型标签
+            self._run_doctor()
+            current_model = _get_env_value("OPENROUTER_MODEL") or "未设置"
+            self.model_label.configure(text=current_model)
+            # 重新检测可用的视频提供商
+            self._available_providers = self._detect_video_providers()
+            if self._available_providers:
+                provider_display_values = tuple(
+                    VIDEO_PROVIDER_DISPLAY_NAMES.get(p, p) for p in self._available_providers
+                )
+                self.provider_combo.configure(values=provider_display_values, state="readonly")
+                # 如果当前选中的provider不再可用，切换到第一个可用的
+                current_provider = self._get_selected_provider()
+                if current_provider not in self._available_providers:
+                    new_provider = self._available_providers[0]
+                    self.video_provider_var.set(new_provider)
+                    self.provider_display_var.set(
+                        VIDEO_PROVIDER_DISPLAY_NAMES.get(new_provider, new_provider)
+                    )
+                    self._refresh_model_combo_options()
+            else:
+                self.provider_combo.configure(values=[], state="disabled")
+                self.provider_combo.set("未配置")
+            # 更新按钮状态
+            self._update_button_states()
+
+        open_settings(self.root, on_saved=on_saved, first_time=first_time)
+
+    def _needs_initial_setup(self) -> bool:
+        """检查是否需要初始配置（首次使用）。"""
+        # 检查 API Key
+        api_key = _get_env_value("OPENROUTER_API_KEY")
+        if not api_key:
+            return True
+        # 检查 FFmpeg
+        try:
+            from .providers.tts import discover_ffmpeg_toolchain
+            discover_ffmpeg_toolchain()
+        except Exception:
+            return True
+        # 检查视频服务（至少一个）
+        jm_ok = False
+        kl_ok = False
+        try:
+            jm_caps = detect_jimeng_cli(timeout_seconds=5)
+            jm_ok = bool(jm_caps.cli_path and jm_caps.supports_async_task)
+        except Exception:
+            pass
+        try:
+            kl_caps = detect_kling_cli(timeout_seconds=5)
+            kl_ok = bool(kl_caps.cli_path and kl_caps.supports_async_task)
+        except Exception:
+            pass
+        if not jm_ok and not kl_ok:
+            return True
+        return False
+
     def _sync_model_label(self, dialog: ModelSelectionDialog) -> None:
         """同步模型标签（模型选择窗口关闭后更新）。"""
         if dialog.win.winfo_exists():
@@ -1692,7 +2091,18 @@ class AicfGUI:
     def run(self) -> None:
         # 启动后自动做一次环境检查
         self.root.after(500, self._run_doctor)
+        # 延迟检查是否需要初始配置（等环境检测完成后）
+        self.root.after(2000, self._check_first_run)
         self.root.mainloop()
+
+    def _check_first_run(self) -> None:
+        """检查是否是首次启动，如果缺少关键配置则自动打开设置面板。"""
+        try:
+            if self._needs_initial_setup():
+                self._open_settings(first_time=True)
+        except Exception:
+            # 如果检测过程出错，不要阻断启动，让用户手动点击设置
+            pass
 
 
 def launch() -> None:

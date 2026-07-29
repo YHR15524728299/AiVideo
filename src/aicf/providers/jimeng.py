@@ -6,7 +6,7 @@ import os
 import shutil
 import subprocess
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
@@ -21,6 +21,7 @@ from aicf.logging_utils import sanitize_error
 
 @dataclass(frozen=True)
 class JimengCapabilities:
+    cli_path: str = ""
     image_command: list[str] = field(default_factory=list)
     video_command: list[str] = field(default_factory=list)
     status_command: list[str] = field(default_factory=list)
@@ -245,6 +246,20 @@ def detect_jimeng_cli(
         if not capabilities.supports_async_task:
             failures.append(f"{prefix[0]}: --help 缺少 Dreamina 1.4.11 必需能力")
             continue
+        # 设置CLI路径
+        cli_path = prefix[0]
+        # 尝试解析为完整路径
+        full = shutil.which(cli_path)
+        if full:
+            cli_path = full
+        elif not Path(cli_path).is_absolute():
+            # 尝试在常见位置查找
+            for ext in ("", ".exe", ".cmd", ".bat"):
+                p = Path(cli_path + ext)
+                if p.is_file():
+                    cli_path = str(p.resolve())
+                    break
+        capabilities = replace(capabilities, cli_path=cli_path)
         if config_path is not None:
             target = Path(config_path)
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -260,7 +275,12 @@ def detect_jimeng_cli(
             atomic_replace(temporary, target)
         return capabilities
     detail = "；".join(failures) if failures else "未配置命令且 PATH 中未发现 dreamina"
-    raise JimengCliNotFound(f"未定位到真实 Dreamina CLI，M4 已阻塞：{detail}")
+    raise JimengCliNotFound(
+        f"未找到即梦视频生成工具。请确认已安装并登录：\n"
+        f"  1. 运行 npm i -g @bytedance/dreamina-cli 安装\n"
+        f"  2. 运行 dreamina login 完成登录\n"
+        f"详情：{detail}"
+    )
 
 
 class JimengCliAdapter:

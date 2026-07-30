@@ -433,6 +433,11 @@ class AicfGUI:
         self._auto_detect_and_poll()  # 自动检测后台运行的任务并启动实时轮询
         self._poll_progress()  # 启动全局实时状态刷新
         self._update_button_states()  # 初始化按钮状态
+        # 后台异步检测视频提供商和环境状态（不阻塞UI启动）
+        for lbl in self.env_labels.values():
+            lbl.configure(text="检测中...", style="EnvIdle.TLabel")
+        self._set_status("启动中，正在后台检测环境...")
+        self._start_async_provider_detection()
 
     # ------------------------------------------------------------------
     # UI 构建
@@ -535,8 +540,8 @@ class AicfGUI:
         options = ttk.Frame(setup_frame)
         options.grid(row=2, column=0, columnspan=5, sticky="ew", pady=(6, 0))
 
-        # 检测可用的视频生成提供商
-        self._available_providers = self._detect_video_providers()
+        # 快速检测可用的视频生成提供商（仅检查文件存在，不做网络请求）
+        self._available_providers = self._quick_detect_providers()
         self.video_provider_var = StringVar(value=self._available_providers[0] if self._available_providers else "")
         self.jimeng_model_var = StringVar(value="seedance2.0fast")
         self.kling_model_var = StringVar(value="kling-video-v2_6")
@@ -829,9 +834,32 @@ class AicfGUI:
                     self._on_preview_done()
                 elif action == "show_error":
                     messagebox.showerror(str(arg1), str(arg2))
+                elif action == "providers_detected":
+                    self._on_providers_detected(list(arg1) if arg1 else [])
         except queue.Empty:
             pass
         self.root.after(100, self._poll_ui_queue)
+
+    def _on_providers_detected(self, providers: list[str]) -> None:
+        """后台检测完成后更新视频提供商下拉框。"""
+        self._available_providers = providers
+        if providers:
+            provider_display_values = tuple(
+                VIDEO_PROVIDER_DISPLAY_NAMES.get(p, p) for p in providers
+            )
+            self.provider_combo.configure(values=provider_display_values, state="readonly")
+            current_provider = self._get_selected_provider()
+            if current_provider not in providers:
+                new_provider = providers[0]
+                self.video_provider_var.set(new_provider)
+                self.provider_display_var.set(
+                    VIDEO_PROVIDER_DISPLAY_NAMES.get(new_provider, new_provider)
+                )
+                self._refresh_model_combo_options()
+        else:
+            self.provider_combo.configure(values=[], state="disabled")
+            self.provider_combo.set("未配置")
+        self._update_button_states()
 
     def _clear_log(self) -> None:
         """清空运行日志（带确认）。"""
@@ -1091,8 +1119,63 @@ class AicfGUI:
         display = self.narration_voice_display_var.get()
         self.narration_voice_var.set(self._voice_id_from_display(display))
 
+    @staticmethod
+    def _quick_find_cli(name: str, candidates: list[Path] | None = None) -> str | None:
+        """快速查找CLI可执行文件（仅文件系统检查，不做网络请求）。"""
+        found = shutil.which(name)
+        if found:
+            return found
+        if candidates:
+            for c in candidates:
+                if c.is_file():
+                    return str(c)
+        return None
+
+    def _quick_detect_providers(self) -> list[str]:
+        """快速检测哪些视频提供商的CLI文件存在（不做网络/登录验证，毫秒级返回）。"""
+        providers: list[str] = []
+        # 检测即梦CLI文件
+        try:
+            root = project_root()
+            config_path = root / "config" / "jimeng_cli.yaml"
+            exe = os.environ.get("JIMENG_CLI_EXECUTABLE", "").strip()
+            if exe and Path(exe).is_file():
+                providers.append("jimeng")
+            else:
+                jm_candidates = [
+                    Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "dreamina" / "dreamina.exe",
+                    Path(os.environ.get("USERPROFILE", "")) / "bin" / "dreamina.exe",
+                ]
+                if self._quick_find_cli("dreamina", jm_candidates) or self._quick_find_cli("jimeng"):
+                    providers.append("jimeng")
+                elif config_path.is_file():
+                    try:
+                        cfg = load_config(config_path)
+                        p = cfg.get("cli_path", "")
+                        if p and Path(p).is_file():
+                            providers.append("jimeng")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        # 检测可灵CLI文件
+        try:
+            exe = os.environ.get("KLING_CLI_EXECUTABLE", "").strip()
+            if exe and Path(exe).is_file():
+                providers.append("kling")
+            else:
+                kl_candidates = [
+                    Path(os.environ.get("APPDATA", "")) / "npm" / "kling.cmd",
+                    Path(os.environ.get("APPDATA", "")) / "TRAE SOLO CN" / "ModularData" / "ai-agent" / "vm" / "tools" / "node" / "kling.cmd",
+                ]
+                if self._quick_find_cli("kling", kl_candidates):
+                    providers.append("kling")
+        except Exception:
+            pass
+        return providers
+
     def _detect_video_providers(self) -> list[str]:
-        """检测哪些视频生成提供商已配置可用。"""
+        """完整检测哪些视频生成提供商已配置可用（含网络who_am_i验证登录状态）。"""
         providers: list[str] = []
         # 检测即梦CLI
         try:
@@ -1111,6 +1194,34 @@ class AicfGUI:
         except Exception as e:
             print(f"[WARN] 可灵检测失败: {e}", file=sys.stderr)
         return providers
+
+    def _start_async_provider_detection(self) -> None:
+        """后台线程异步执行完整的提供商检测和环境检查，不阻塞UI启动。"""
+        def worker() -> None:
+            # 1. 完整检测视频提供商
+            providers = self._detect_video_providers()
+            self.ui_queue.put(("providers_detected", providers, None))
+            # 2. 后台运行doctor检查环境
+            try:
+                env = os.environ.copy()
+                env["PYTHONIOENCODING"] = "utf-8"
+                env["PYTHONUTF8"] = "1"
+                result = subprocess.run(
+                    [python_executable(), "-m", "aicf", "doctor"],
+                    cwd=str(project_root()),
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=30,
+                    env=env,
+                )
+                output = (result.stdout or "") + (result.stderr or "")
+                ok = result.returncode == 0
+                self.ui_queue.put(("env_update", output, ok))
+            except Exception as e:
+                self.ui_queue.put(("env_update", f"环境检查异常: {e}", False))
+        threading.Thread(target=worker, daemon=True).start()
 
     def _get_selected_provider(self) -> str:
         """获取当前选中的视频提供商（内部key）。"""
@@ -2039,7 +2150,7 @@ class AicfGUI:
         open_settings(self.root, on_saved=on_saved, first_time=first_time)
 
     def _needs_initial_setup(self) -> bool:
-        """检查是否需要初始配置（首次使用）。"""
+        """检查是否需要初始配置（首次使用）。仅做快速本地检查，不做网络请求。"""
         # 检查 API Key
         api_key = _get_env_value("OPENROUTER_API_KEY")
         if not api_key:
@@ -2050,20 +2161,9 @@ class AicfGUI:
             discover_ffmpeg_toolchain()
         except Exception:
             return True
-        # 检查视频服务（至少一个）
-        jm_ok = False
-        kl_ok = False
-        try:
-            jm_caps = detect_jimeng_cli(timeout_seconds=10)
-            jm_ok = bool(jm_caps.cli_path and jm_caps.supports_async_task)
-        except Exception:
-            pass
-        try:
-            kl_caps = detect_kling_cli(timeout_seconds=10)
-            kl_ok = bool(kl_caps.cli_path and kl_caps.supports_async_task)
-        except Exception:
-            pass
-        if not jm_ok and not kl_ok:
+        # 检查视频服务CLI文件是否存在（至少一个）
+        quick_providers = self._quick_detect_providers()
+        if not quick_providers:
             return True
         return False
 
@@ -2101,10 +2201,8 @@ class AicfGUI:
         self.root.destroy()
 
     def run(self) -> None:
-        # 启动后自动做一次环境检查
-        self.root.after(500, self._run_doctor)
-        # 延迟检查是否需要初始配置（等环境检测完成后）
-        self.root.after(2000, self._check_first_run)
+        # 延迟检查是否需要初始配置（等后台环境检测完成后）
+        self.root.after(3000, self._check_first_run)
         self.root.mainloop()
 
     def _check_first_run(self) -> None:

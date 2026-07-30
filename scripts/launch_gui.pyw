@@ -6,7 +6,8 @@ from pathlib import Path
 
 
 def _setup() -> Path:
-    project_root = Path(__file__).resolve().parent.parent.parent
+    # scripts/launch_gui.pyw -> parent = scripts/, parent.parent = 项目根目录
+    project_root = Path(__file__).resolve().parent.parent
     os.chdir(str(project_root))
     src_path = str(project_root / "src")
     if src_path not in sys.path:

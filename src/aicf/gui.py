@@ -1098,18 +1098,18 @@ class AicfGUI:
         try:
             root = project_root()
             config_path = root / "config" / "jimeng_cli.yaml"
-            caps = detect_jimeng_cli(config_path=config_path, timeout_seconds=5)
+            caps = detect_jimeng_cli(config_path=config_path, timeout_seconds=10)
             if caps.supports_async_task:
                 providers.append("jimeng")
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[WARN] 即梦检测失败: {e}", file=sys.stderr)
         # 检测可灵CLI
         try:
-            caps = detect_kling_cli(timeout_seconds=5)
+            caps = detect_kling_cli(timeout_seconds=10)
             if caps.supports_async_task and caps.cli_path:
                 providers.append("kling")
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[WARN] 可灵检测失败: {e}", file=sys.stderr)
         return providers
 
     def _get_selected_provider(self) -> str:
@@ -2054,12 +2054,12 @@ class AicfGUI:
         jm_ok = False
         kl_ok = False
         try:
-            jm_caps = detect_jimeng_cli(timeout_seconds=5)
+            jm_caps = detect_jimeng_cli(timeout_seconds=10)
             jm_ok = bool(jm_caps.cli_path and jm_caps.supports_async_task)
         except Exception:
             pass
         try:
-            kl_caps = detect_kling_cli(timeout_seconds=5)
+            kl_caps = detect_kling_cli(timeout_seconds=10)
             kl_ok = bool(kl_caps.cli_path and kl_caps.supports_async_task)
         except Exception:
             pass

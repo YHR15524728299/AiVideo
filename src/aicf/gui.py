@@ -751,16 +751,28 @@ class AicfGUI:
         self.direction_text.configure(foreground="#9ca3af")
         self._direction_has_placeholder = True
 
+    def _get_direction_content(self) -> str:
+        """获取文本框内容，不包含末尾隐式换行，strip后返回。"""
+        # 使用 "end-1c" 避免Tkinter自动添加的末尾换行符
+        return self.direction_text.get("1.0", "end-1c").strip()
+
+    def _is_showing_placeholder(self) -> bool:
+        """判断当前是否正在显示placeholder。"""
+        if not self._direction_has_placeholder:
+            return False
+        current = self.direction_text.get("1.0", "end-1c")
+        return current == self._direction_placeholder
+
     def _on_direction_focus_in(self, _event=None):
         """获得焦点时清除placeholder。"""
-        if self._direction_has_placeholder:
+        if self._is_showing_placeholder():
             self.direction_text.delete("1.0", "end")
             self.direction_text.configure(foreground="")
             self._direction_has_placeholder = False
 
     def _on_direction_focus_out(self, _event=None):
         """失去焦点时如果为空则显示placeholder。"""
-        content = self.direction_text.get("1.0", "end").strip()
+        content = self._get_direction_content()
         if not content:
             self._show_direction_placeholder()
 
@@ -1287,10 +1299,11 @@ class AicfGUI:
     # ------------------------------------------------------------------
     def _ensure_direction_file(self) -> Path:
         """将界面输入的方向写入全局 config/content_direction.yaml。"""
-        direction = self.direction_text.get("1.0", "end").strip()
-        # 如果是placeholder文本，视为空
-        if self._direction_has_placeholder or direction == self._direction_placeholder.strip():
+        # 如果正在显示placeholder，视为空
+        if self._is_showing_placeholder():
             direction = ""
+        else:
+            direction = self._get_direction_content()
         cfg_path = project_root() / "config" / "content_direction.yaml"
         cfg_path.parent.mkdir(parents=True, exist_ok=True)
         # 不再使用默认值，调用前应确保direction不为空
@@ -1638,8 +1651,7 @@ class AicfGUI:
             messagebox.showwarning("任务ID无效", "任务ID只能包含字母、数字、下划线(_)和短横线(-)")
             return
         # 校验内容方向不为空
-        direction = self.direction_text.get("1.0", "end").strip()
-        if self._direction_has_placeholder or not direction or direction == self._direction_placeholder.strip():
+        if self._is_showing_placeholder() or not self._get_direction_content():
             messagebox.showwarning("请填写内容方向", "请在「内容方向」文本框中填写视频的主题、风格和关键信息，\n这将帮助AI生成更符合您预期的视频内容。")
             self.direction_text.focus_set()
             return

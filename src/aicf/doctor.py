@@ -173,7 +173,7 @@ class Doctor:
         return Check(bool(path), _safe_path(path) if path else f"PATH 中未找到: {name}", required=False)
 
     def _detect_kling(self) -> Check:
-        """轻量检测可灵CLI是否存在（不做网络who_am_i调用避免卡顿）。"""
+        """检测可灵CLI是否可用，包括登录状态验证。"""
         kling_exe = self.kling_executable or shutil.which("kling")
         if not kling_exe:
             # 检查常见路径
@@ -185,9 +185,20 @@ class Doctor:
                 if c.is_file():
                     kling_exe = str(c)
                     break
-        if kling_exe:
-            return Check(True, f"已安装（{_safe_path(kling_exe)}），需登录后可用", required=False)
-        return Check(False, "未安装（npm i -g @klingai/cli-cn 后 kling login）", required=False)
+        if not kling_exe:
+            return Check(False, "未安装（npm i -g @klingai/cli-cn 后 kling login）", required=False)
+
+        # 尝试调用 detect_kling_cli 验证登录状态（短超时）
+        try:
+            from .providers.kling import detect_kling_cli
+            caps = detect_kling_cli(timeout_seconds=8)
+            if caps.supports_async_task and not caps.detection_error:
+                return Check(True, f"已登录可用（{_safe_path(kling_exe)}）", required=False)
+            elif caps.detection_error:
+                return Check(True, f"已安装（{_safe_path(kling_exe)}），需登录后可用", required=False)
+        except Exception:
+            pass
+        return Check(True, f"已安装（{_safe_path(kling_exe)}），需登录后可用", required=False)
 
     def _detect_jimeng(self) -> Check:
         """轻量检测即梦CLI是否存在。"""

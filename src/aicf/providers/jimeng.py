@@ -158,7 +158,7 @@ def parse_jimeng_help(help_text: str) -> JimengCapabilities:
 
 
 def _default_candidates() -> list[list[str]]:
-    configured = os.getenv("JIMENG_CLI_EXECUTABLE", "").strip()
+    configured = (os.getenv("JIMENG_CLI_EXECUTABLE") or "").strip()
     candidates: list[list[str]] = [[configured]] if configured else []
     discovered = shutil.which("dreamina")
     if discovered:

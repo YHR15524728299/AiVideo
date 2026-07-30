@@ -102,7 +102,7 @@ def _default_config_path() -> Path:
 def _find_kling_cli() -> str | None:
     """查找可灵CLI可执行文件。"""
     # 1. 环境变量指定（用户手动配置）
-    env_path = os.environ.get("KLING_CLI_EXECUTABLE", "").strip()
+    env_path = (os.environ.get("KLING_CLI_EXECUTABLE") or "").strip()
     if env_path and Path(env_path).is_file():
         return env_path
     # 2. PATH 中查找
@@ -111,12 +111,15 @@ def _find_kling_cli() -> str | None:
         return path
     # 3. TRAE node 内置路径 / npm 全局路径
     candidates = [
-        Path(os.environ.get("APPDATA", "")) / "TRAE SOLO CN" / "ModularData" / "ai-agent" / "vm" / "tools" / "node" / "kling.cmd",
-        Path(os.environ.get("APPDATA", "")) / "npm" / "kling.cmd",
+        Path(os.environ.get("APPDATA", "") or "") / "TRAE SOLO CN" / "ModularData" / "ai-agent" / "vm" / "tools" / "node" / "kling.cmd",
+        Path(os.environ.get("APPDATA", "") or "") / "npm" / "kling.cmd",
     ]
     for c in candidates:
-        if c.is_file():
-            return str(c)
+        try:
+            if c.is_file():
+                return str(c)
+        except Exception:
+            pass
     return None
 
 

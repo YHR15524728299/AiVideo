@@ -1127,8 +1127,11 @@ class AicfGUI:
             return found
         if candidates:
             for c in candidates:
-                if c.is_file():
-                    return str(c)
+                try:
+                    if c.is_file():
+                        return str(c)
+                except Exception:
+                    pass
         return None
 
     def _quick_detect_providers(self) -> list[str]:
@@ -1138,20 +1141,23 @@ class AicfGUI:
         try:
             root = project_root()
             config_path = root / "config" / "jimeng_cli.yaml"
-            exe = os.environ.get("JIMENG_CLI_EXECUTABLE", "").strip()
+            exe = (os.environ.get("JIMENG_CLI_EXECUTABLE") or "").strip()
             if exe and Path(exe).is_file():
                 providers.append("jimeng")
             else:
-                jm_candidates = [
-                    Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "dreamina" / "dreamina.exe",
-                    Path(os.environ.get("USERPROFILE", "")) / "bin" / "dreamina.exe",
-                ]
+                local_appdata = os.environ.get("LOCALAPPDATA") or ""
+                userprofile = os.environ.get("USERPROFILE") or ""
+                jm_candidates = []
+                if local_appdata:
+                    jm_candidates.append(Path(local_appdata) / "Programs" / "dreamina" / "dreamina.exe")
+                if userprofile:
+                    jm_candidates.append(Path(userprofile) / "bin" / "dreamina.exe")
                 if self._quick_find_cli("dreamina", jm_candidates) or self._quick_find_cli("jimeng"):
                     providers.append("jimeng")
                 elif config_path.is_file():
                     try:
                         cfg = load_config(config_path)
-                        p = cfg.get("cli_path", "")
+                        p = cfg.get("cli_path", "") or ""
                         if p and Path(p).is_file():
                             providers.append("jimeng")
                     except Exception:
@@ -1160,14 +1166,15 @@ class AicfGUI:
             pass
         # 检测可灵CLI文件
         try:
-            exe = os.environ.get("KLING_CLI_EXECUTABLE", "").strip()
+            exe = (os.environ.get("KLING_CLI_EXECUTABLE") or "").strip()
             if exe and Path(exe).is_file():
                 providers.append("kling")
             else:
-                kl_candidates = [
-                    Path(os.environ.get("APPDATA", "")) / "npm" / "kling.cmd",
-                    Path(os.environ.get("APPDATA", "")) / "TRAE SOLO CN" / "ModularData" / "ai-agent" / "vm" / "tools" / "node" / "kling.cmd",
-                ]
+                appdata = os.environ.get("APPDATA") or ""
+                kl_candidates = []
+                if appdata:
+                    kl_candidates.append(Path(appdata) / "npm" / "kling.cmd")
+                    kl_candidates.append(Path(appdata) / "TRAE SOLO CN" / "ModularData" / "ai-agent" / "vm" / "tools" / "node" / "kling.cmd")
                 if self._quick_find_cli("kling", kl_candidates):
                     providers.append("kling")
         except Exception:

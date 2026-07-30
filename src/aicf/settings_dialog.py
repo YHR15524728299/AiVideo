@@ -414,7 +414,7 @@ class _VideoPage(ttk.Frame):
     def _detect_jm(self, manual=None):
         self.jm.testing()
         self._notify()
-        manual_path = manual if manual is not None else self._env.get("JIMENG_CLI_EXECUTABLE", "")
+        manual_path = manual if manual is not None else (self._env.get("JIMENG_CLI_EXECUTABLE") or "")
         def w():
             try:
                 if manual_path and manual_path.strip():
@@ -451,9 +451,11 @@ class _VideoPage(ttk.Frame):
     def _detect_kl(self, manual=None):
         self.kl.testing()
         self._notify()
-        manual_path = manual if manual is not None else self._env.get("KLING_CLI_EXECUTABLE", "")
+        manual_path = manual if manual is not None else (self._env.get("KLING_CLI_EXECUTABLE") or "")
         if manual_path and manual_path.strip():
             os.environ["KLING_CLI_EXECUTABLE"] = manual_path.strip()
+        elif "KLING_CLI_EXECUTABLE" in os.environ and not manual_path:
+            os.environ.pop("KLING_CLI_EXECUTABLE", None)
         def w():
             try:
                 caps = detect_kling_cli()

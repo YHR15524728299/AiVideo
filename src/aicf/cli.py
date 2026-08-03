@@ -241,6 +241,11 @@ def build_parser() -> argparse.ArgumentParser:
     render.add_argument("--subtitles", required=True, type=Path)
     render.add_argument("--output", required=True, type=Path)
     render.add_argument("--title", required=True)
+    render.add_argument(
+        "--orientation",
+        choices=["portrait", "landscape"],
+        default="portrait",
+    )
     init_job = subparsers.add_parser("init-job")
     init_job.add_argument("--job", required=True)
     status = subparsers.add_parser("status")
@@ -403,6 +408,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             subtitle_path=args.subtitles,
             output_path=args.output,
             title=args.title,
+            orientation=args.orientation,
         )
         probe = probes["master"]
         print(f"成片: {result.output_path}")

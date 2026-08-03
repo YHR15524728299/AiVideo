@@ -198,6 +198,8 @@ def test_render_cli_uses_real_inputs_and_reports_probe(
             str(output),
             "--title",
             "真实集成样片",
+            "--orientation",
+            "landscape",
         ]
     )
 
@@ -205,6 +207,7 @@ def test_render_cli_uses_real_inputs_and_reports_probe(
     assert calls[0]["audio_path"] == audio
     assert calls[0]["subtitle_path"] == subtitles
     assert calls[0]["visual_plan_path"] == plan
+    assert calls[0]["orientation"] == "landscape"
     rendered = capsys.readouterr().out
     assert "1080x1920" in rendered
     assert "h264/yuv420p" in rendered

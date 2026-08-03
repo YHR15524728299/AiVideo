@@ -1,6 +1,10 @@
 from pathlib import Path
 
-from aicf.gui import build_production_settings, final_video_for_job
+from aicf.gui import (
+    build_production_settings,
+    final_video_for_job,
+    update_direction_config,
+)
 from aicf.production_settings import ProductionSettings
 
 
@@ -57,3 +61,28 @@ def test_final_video_uses_frozen_platform_order(tmp_path: Path) -> None:
     douyin.write_bytes(b"video")
 
     assert final_video_for_job(job_dir) == douyin
+
+
+def test_update_direction_config_preserves_other_settings(tmp_path: Path) -> None:
+    config_path = tmp_path / "content_direction.yaml"
+    config_path.write_text(
+        "direction: 原方向\n"
+        "series_name: 系列名\n"
+        "video:\n"
+        "  target_duration_seconds: 30\n"
+        "  min_duration_seconds: 20\n"
+        "  max_duration_seconds: 40\n"
+        "generation_budget:\n"
+        "  max_jimeng_video_clips: 3\n",
+        encoding="utf-8",
+    )
+
+    update_direction_config(config_path, "新方向\n第二行")
+
+    text = config_path.read_text(encoding="utf-8")
+    assert "direction: |-" in text
+    assert "新方向" in text
+    assert "第二行" in text
+    assert "series_name: 系列名" in text
+    assert "target_duration_seconds: 30" in text
+    assert "max_jimeng_video_clips: 3" in text

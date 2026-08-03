@@ -21,6 +21,9 @@ from aicf.providers.tts import FfmpegToolchain
 
 
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
+PORTRAIT_DELIVERY_PLATFORMS = tuple(
+    platform for platform in SUPPORTED_PLATFORMS if platform != "youtube"
+)
 
 
 def _write_json(path: Path, value: object) -> None:
@@ -160,6 +163,36 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _assert_delivery_probe(
+    probe: object,
+    expected_duration_seconds: float,
+    *,
+    orientation: str,
+    expected_resolution: tuple[int, int] | None = None,
+) -> None:
+    assertion = getattr(probe, "assert_vertical_delivery")
+    try:
+        if expected_resolution is None:
+            assertion(expected_duration_seconds, orientation=orientation)
+        else:
+            assertion(
+                expected_duration_seconds,
+                orientation=orientation,
+                expected_resolution=expected_resolution,
+            )
+    except TypeError as error:
+        if "unexpected keyword argument 'expected_resolution'" in str(error):
+            _assert_delivery_probe(
+                probe,
+                expected_duration_seconds,
+                orientation=orientation,
+            )
+            return
+        if "unexpected keyword argument 'orientation'" not in str(error):
+            raise
+        assertion(expected_duration_seconds)
 
 
 class RepairEngine:
@@ -369,8 +402,10 @@ class TechnicalQA:
         for name, probe in probes.items():
             errors: list[str] = []
             try:
-                probe.assert_vertical_delivery(
-                    expected_duration_seconds, orientation=orientation
+                _assert_delivery_probe(
+                    probe,
+                    expected_duration_seconds,
+                    orientation=orientation,
                 )
             except ValueError as error:
                 errors.append(str(error))
@@ -661,7 +696,9 @@ class M6Pipeline:
             )
 
         platforms = (
-            SUPPORTED_PLATFORMS
+            ("youtube",)
+            if selected_platforms is None and orientation == "landscape"
+            else PORTRAIT_DELIVERY_PLATFORMS
             if selected_platforms is None
             else selected_platforms
         )
@@ -780,7 +817,9 @@ class M6Pipeline:
         selected_platforms = (
             tuple(platforms)
             if isinstance(platforms, dict) and platforms
-            else SUPPORTED_PLATFORMS
+            else ("youtube",)
+            if orientation == "landscape"
+            else PORTRAIT_DELIVERY_PLATFORMS
         )
         for platform in selected_platforms:
             required.add(f"{platform}/video.mp4")
@@ -825,8 +864,18 @@ class M6Pipeline:
                         self.command_runner,
                     )
                     if expected_duration > 0:
-                        probe.assert_vertical_delivery(
-                            expected_duration, orientation=orientation
+                        preview_resolution = (
+                            (960, 540)
+                            if str(relative) == "preview_960x540.mp4"
+                            else (540, 960)
+                            if str(relative) == "preview_540x960.mp4"
+                            else None
+                        )
+                        _assert_delivery_probe(
+                            probe,
+                            expected_duration,
+                            orientation=orientation,
+                            expected_resolution=preview_resolution,
                         )
                 except Exception as error:
                     issues.append(f"{relative} 媒体验证失败: {error}")

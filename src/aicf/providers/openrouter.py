@@ -19,8 +19,6 @@ load_dotenv(os.path.join(_PROJECT_ROOT, ".env"), override=False)
 
 # 默认使用 OpenRouter 免费模型（强制 :free 后缀，优先能力强的中文模型）
 DEFAULT_FREE_MODEL = "deepseek/deepseek-chat-v3-0324:free"
-_MODEL_VERIFY_CACHE: dict[str, tuple[float, bool]] = {}
-_MODEL_VERIFY_CACHE_TTL = 300.0  # 缓存 5 分钟
 
 
 class UpstreamRateLimitError(RuntimeError):
@@ -260,14 +258,6 @@ class OpenRouterClient:
         )
 
     def _verify_free_model_from_live_catalog(self) -> None:
-        # 先查缓存
-        cache_key = self.model
-        now = time.time()
-        cached = _MODEL_VERIFY_CACHE.get(cache_key)
-        if cached is not None:
-            ts, ok = cached
-            if ok and now - ts < _MODEL_VERIFY_CACHE_TTL:
-                return  # 缓存命中且未过期，直接放行
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Accept": "application/json",
@@ -289,11 +279,8 @@ class OpenRouterClient:
                 if attempt < max_catalog_attempts - 1:
                     self.sleep(2.0 * (attempt + 1))
                     continue
-                # 获取目录失败时，如果缓存中曾经验证通过（即使过期），则放行并警告
-                if cached is not None and cached[1]:
-                    return
                 raise ModelCatalogVerificationError(
-                    "无法验证OpenRouter模型（网络请求失败），请检查网络连接或稍后重试"
+                    "无法实时验证OpenRouter模型（网络请求失败），请检查网络连接或稍后重试"
                 ) from error
         if payload is None:
             if last_error:
@@ -315,37 +302,29 @@ class OpenRouterClient:
             None,
         )
         if selected is None:
-            # 模型不在目录中，清除缓存并报错
-            _MODEL_VERIFY_CACHE.pop(cache_key, None)
             raise ModelCatalogVerificationError(
-                f"模型 {self.model} 不存在，请选择其他模型"
+                f"模型 {self.model} 不在实时模型目录中，请选择其他模型"
             )
         pricing = selected.get("pricing")
         if not isinstance(pricing, dict):
-            _MODEL_VERIFY_CACHE.pop(cache_key, None)
             raise ModelCatalogVerificationError(
                 f"模型 {self.model} 缺少价格信息，无法验证是否免费"
             )
         required_prices = ("prompt", "completion")
         if any(field not in pricing for field in required_prices):
-            _MODEL_VERIFY_CACHE.pop(cache_key, None)
             raise ModelCatalogVerificationError(
-                f"模型 {self.model} 价格信息不完整，无法验证是否免费"
+                f"模型 {self.model} 价格信息不完整，无法证明是否免费"
             )
         try:
             prices = [Decimal(str(value)) for value in pricing.values()]
         except (InvalidOperation, ValueError):
-            _MODEL_VERIFY_CACHE.pop(cache_key, None)
             raise ModelCatalogVerificationError(
                 f"模型 {self.model} 价格格式无效"
             ) from None
         if not prices or any(price != 0 for price in prices):
-            _MODEL_VERIFY_CACHE.pop(cache_key, None)
             raise ModelCatalogVerificationError(
                 f"模型 {self.model} 不是免费模型，请选择以 :free 结尾的模型"
             )
-        # 验证通过，写入缓存
-        _MODEL_VERIFY_CACHE[cache_key] = (now, True)
 
     def _request_with_fallback(
         self,
@@ -438,8 +417,7 @@ class OpenRouterClient:
             except (URLError, TimeoutError, OSError):
                 if attempt >= self.max_retries:
                     raise
-            # 指数退避：HTTP 错误用更长等待（5s, 10s, 20s, 40s），网络错误用短等待（2s, 4s, 8s）
-            wait = float(min(60, 5 * (2**attempt)))
+            wait = float(min(60, 2**attempt))
             self.sleep(wait)
         raise RuntimeError("OpenRouter 重试流程异常结束")
 

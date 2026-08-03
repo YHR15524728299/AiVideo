@@ -7,11 +7,19 @@ import yaml
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, model_validator
 
-from aicf.models.contracts import SUPPORTED_PLATFORMS, SupportedPlatform
+from aicf.models.contracts import SupportedPlatform
+from aicf.secret_store import load_runtime_secrets
 
 # 自动加载项目根目录 .env 文件
 _PROJECT_ROOT = Path(__file__).parent.parent.parent
 load_dotenv(_PROJECT_ROOT / ".env", override=False)
+load_runtime_secrets()
+DEFAULT_CONTENT_PLATFORMS: tuple[SupportedPlatform, ...] = (
+    "douyin",
+    "xiaohongshu",
+    "youtube_shorts",
+    "tiktok",
+)
 
 
 class VideoConfig(BaseModel):
@@ -61,7 +69,9 @@ class AppConfig(BaseModel):
     content_goal: str = "输出有判断、有信息密度、有实际方法的短视频"
     content_pillars: list[str] = Field(default_factory=list)
     tone: list[str] = Field(default_factory=lambda: ["清晰", "直接", "有判断"])
-    platforms: list[SupportedPlatform] = Field(default_factory=lambda: list(SUPPORTED_PLATFORMS))
+    platforms: list[SupportedPlatform] = Field(
+        default_factory=lambda: list(DEFAULT_CONTENT_PLATFORMS)
+    )
     languages: list[str] = Field(default_factory=lambda: ["zh-CN"])
     batch_size: int = Field(default=1, ge=1)
     video: VideoConfig = Field(default_factory=VideoConfig)

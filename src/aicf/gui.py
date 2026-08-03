@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
+import yaml
 from datetime import datetime
 from pathlib import Path
 from tkinter import (
@@ -28,6 +29,7 @@ from tkinter import font as tkfont
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from .atomic_io import atomic_write_text
 from .config import load_config
 from .database import JobRepository
 from .file_lock import lock_is_active
@@ -45,8 +47,10 @@ from .production_settings import (
 )
 from .providers.jimeng import detect_jimeng_cli
 from .providers.kling import detect_kling_cli
+from .secret_store import load_secret, migrate_secret_from_env
 from .settings_dialog import open_settings, load_default_settings
 from .state_machine import PipelineStage
+from .logging_utils import sanitize_error
 
 # 阶段顺序与中文名称（完整流水线）
 STAGES = [
@@ -123,19 +127,62 @@ def _read_env_file() -> str:
 
 def _write_env_file(content: str) -> None:
     env_path = project_root() / ".env"
-    env_path.write_text(content, encoding="utf-8")
+    atomic_write_text(env_path, content)
 
 
 def _get_env_value(key: str) -> str:
-    """从 .env 或系统环境变量读取值。"""
+    """从进程环境、安全凭据存储或非敏感 .env 配置读取值。"""
     val = os.getenv(key, "")
     if val:
         return val
+    if key == "OPENROUTER_API_KEY":
+        migrate_secret_from_env(project_root() / ".env", key)
+        return load_secret(key)
     env_text = _read_env_file()
     m = re.search(rf"^{key}\s*=\s*(.+)$", env_text, re.MULTILINE)
     if m:
         return m.group(1).strip().strip("\"'")
     return ""
+
+
+class _LiteralString(str):
+    pass
+
+
+class _ConfigDumper(yaml.SafeDumper):
+    pass
+
+
+_ConfigDumper.add_representer(
+    _LiteralString,
+    lambda dumper, value: dumper.represent_scalar(
+        "tag:yaml.org,2002:str",
+        value,
+        style="|",
+    ),
+)
+
+
+def update_direction_config(config_path: str | Path, direction: str) -> Path:
+    path = Path(config_path)
+    data: dict[str, object] = {}
+    if path.is_file():
+        loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        if not isinstance(loaded, dict):
+            raise ValueError("内容方向配置格式无效")
+        data = loaded
+    data["direction"] = _LiteralString(direction)
+    atomic_write_text(
+        path,
+        yaml.dump(
+            data,
+            Dumper=_ConfigDumper,
+            allow_unicode=True,
+            sort_keys=False,
+            default_flow_style=False,
+        ),
+    )
+    return path
 
 
 def _set_env_value(key: str, value: str) -> None:
@@ -757,7 +804,9 @@ class AicfGUI:
         self._direction_has_placeholder = True
 
     def _get_direction_content(self) -> str:
-        """获取文本框内容，不包含末尾隐式换行，strip后返回。"""
+        """获取文本框内容，不包含末尾隐式换行，strip后返回。如果是placeholder则返回空。"""
+        if self._is_showing_placeholder():
+            return ""
         # 使用 "end-1c" 避免Tkinter自动添加的末尾换行符
         return self.direction_text.get("1.0", "end-1c").strip()
 
@@ -772,7 +821,7 @@ class AicfGUI:
         """获得焦点时清除placeholder。"""
         if self._is_showing_placeholder():
             self.direction_text.delete("1.0", "end")
-            self.direction_text.configure(foreground="")
+            self.direction_text.configure(foreground="#000000")
             self._direction_has_placeholder = False
 
     def _on_direction_focus_out(self, _event=None):
@@ -792,7 +841,7 @@ class AicfGUI:
 
     def _log(self, msg: str, tag: str = "") -> None:
         ts = datetime.now().strftime("%H:%M:%S")
-        self.log_queue.put(f"[{ts}] {msg}\n{tag}")
+        self.log_queue.put(f"[{ts}] {sanitize_error(msg)}\n{tag}")
 
     def _toggle_auto_scroll(self) -> None:
         """切换日志自动滚动开关。"""
@@ -1188,14 +1237,14 @@ class AicfGUI:
         try:
             root = project_root()
             config_path = root / "config" / "jimeng_cli.yaml"
-            caps = detect_jimeng_cli(config_path=config_path, timeout_seconds=10)
+            caps = detect_jimeng_cli(config_path=config_path, timeout_seconds=30)
             if caps.supports_async_task:
                 providers.append("jimeng")
         except Exception as e:
             print(f"[WARN] 即梦检测失败: {e}", file=sys.stderr)
         # 检测可灵CLI
         try:
-            caps = detect_kling_cli(timeout_seconds=10)
+            caps = detect_kling_cli(timeout_seconds=30)
             if caps.supports_async_task and caps.cli_path:
                 providers.append("kling")
         except Exception as e:
@@ -1423,15 +1472,10 @@ class AicfGUI:
         else:
             direction = self._get_direction_content()
         cfg_path = project_root() / "config" / "content_direction.yaml"
-        cfg_path.parent.mkdir(parents=True, exist_ok=True)
         # 不再使用默认值，调用前应确保direction不为空
         if not direction:
             direction = "请根据用户需求生成AI短视频"
-        content = f"direction: |\n"
-        for line in direction.splitlines():
-            content += f"  {line}\n"
-        cfg_path.write_text(content, encoding="utf-8")
-        return cfg_path
+        return update_direction_config(cfg_path, direction)
 
     def _run_command_async(self, args: list[str], cwd: Path | None = None, env_extra: dict[str, str] | None = None) -> None:
         """在后台线程运行命令，实时输出日志。"""

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -101,6 +102,14 @@ class PlatformExporter:
                         "yuv420p",
                         "-b:v",
                         template.video_bitrate,
+                        "-minrate",
+                        template.video_bitrate,
+                        "-maxrate",
+                        template.video_bitrate,
+                        "-bufsize",
+                        self._double_bitrate(template.video_bitrate),
+                        "-x264-params",
+                        "nal-hrd=cbr:force-cfr=1",
                         "-c:a",
                         "aac",
                         "-ar",
@@ -190,6 +199,13 @@ class PlatformExporter:
             <= int(probe["bit_rate"])
             <= template.max_video_bitrate
         )
+
+    @staticmethod
+    def _double_bitrate(value: str) -> str:
+        match = re.fullmatch(r"(\d+)([kKmM]?)", value.strip())
+        if match is None:
+            raise ValueError(f"无效视频码率: {value}")
+        return f"{int(match.group(1)) * 2}{match.group(2)}"
 
     @staticmethod
     def _spec_key(template: PlatformTemplate) -> tuple[object, ...]:

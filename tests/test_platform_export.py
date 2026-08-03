@@ -139,6 +139,10 @@ def test_youtube_landscape_transcoding(tmp_path: Path) -> None:
     ffmpeg = next(command for command in commands if command[0] == "ffmpeg")
     assert ffmpeg[ffmpeg.index("-s") + 1] == "1920x1080"
     assert ffmpeg[ffmpeg.index("-b:v") + 1] == "12M"
+    assert ffmpeg[ffmpeg.index("-minrate") + 1] == "12M"
+    assert ffmpeg[ffmpeg.index("-maxrate") + 1] == "12M"
+    assert ffmpeg[ffmpeg.index("-bufsize") + 1] == "24M"
+    assert "nal-hrd=cbr" in ffmpeg[ffmpeg.index("-x264-params") + 1]
 
 
 def test_probes_master_transcodes_mismatch_and_validates_export(

@@ -215,6 +215,51 @@ def test_openrouter_rechecks_live_catalog_even_before_serving_cached_result(
     assert len(chat_transport.requests) == 1
 
 
+def test_openrouter_clients_do_not_share_live_catalog_verification(
+    tmp_path: Path,
+) -> None:
+    model = "test/isolation:free"
+    first_catalog = StubCatalogTransport(_catalog(_free_model(model)))
+    second_catalog = StubCatalogTransport(_catalog({
+        "id": model,
+        "pricing": {"prompt": "0", "completion": "0.1"},
+    }))
+    first_chat = StubTransport([_response()])
+    second_chat = StubTransport([_response()])
+    arguments = {
+        "stage": "direction",
+        "system_prompt": "JSON",
+        "user_payload": {},
+        "json_schema": {"name": "direction", "schema": {"type": "object"}},
+    }
+
+    first_client = OpenRouterClient(
+        api_key="first-secret",
+        model=model,
+        cache=FileCache(tmp_path / "first-cache"),
+        transport=first_chat,
+        model_catalog_transport=first_catalog,
+        sleep=lambda _: None,
+    )
+    second_client = OpenRouterClient(
+        api_key="second-secret",
+        model=model,
+        cache=FileCache(tmp_path / "second-cache"),
+        transport=second_chat,
+        model_catalog_transport=second_catalog,
+        sleep=lambda _: None,
+    )
+
+    assert first_client.call_structured(**arguments).data == {"answer": "ok"}
+    with pytest.raises(ModelCatalogVerificationError, match="不是免费模型"):
+        second_client.call_structured(**arguments)
+
+    assert len(first_catalog.requests) == 1
+    assert len(second_catalog.requests) == 1
+    assert len(first_chat.requests) == 1
+    assert second_chat.requests == []
+
+
 def test_openrouter_structured_call_sends_json_schema_and_tracks_usage(tmp_path: Path) -> None:
     transport = StubTransport([_response()])
     client = OpenRouterClient(

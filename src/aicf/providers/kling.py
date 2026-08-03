@@ -6,12 +6,13 @@ import logging
 import os
 import shutil
 import subprocess
+import threading
 import time
 import urllib.request
 import urllib.error
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 from PIL import Image, UnidentifiedImageError
 
@@ -37,6 +38,9 @@ class KlingCliCapabilities:
     default_video_model: str = "kling-v1-6"
     default_video_duration: float = 5.0
     detection_error: str | None = None
+    authentication_state: Literal[
+        "authenticated", "not_authenticated", "unknown"
+    ] = "unknown"
 
 
 @dataclass(frozen=True)
@@ -68,6 +72,10 @@ class KlingCliError(RuntimeError):
     pass
 
 
+class KlingCreditsRequired(KlingCliError):
+    """可灵账号点数不足，需要用户充值后恢复。"""
+
+
 class KlingTaskFailed(RuntimeError):
     pass
 
@@ -92,6 +100,42 @@ _PENDING_STATES = {
 }
 _SUCCESS_STATES = {"succeed", "success", "succeeded", "completed", "done", "partial_completed"}
 _FAILURE_STATES = {"failed", "failure", "error", "cancelled", "canceled"}
+_DETECTION_LOCK = threading.Lock()
+_DETECTION_CACHE_TTL_SECONDS = 15.0
+_DETECTION_STALE_SUCCESS_TTL_SECONDS = 300.0
+_DETECTION_CACHE: dict[str, tuple[float, KlingCliCapabilities]] = {}
+
+
+def _clear_detection_cache() -> None:
+    with _DETECTION_LOCK:
+        _DETECTION_CACHE.clear()
+
+
+def _is_rate_limit_message(message: str) -> bool:
+    normalized = message.lower()
+    return any(
+        marker in normalized
+        for marker in (
+            "too many requests",
+            "slow down",
+            "rate limit",
+            '"status": 429',
+        )
+    )
+
+
+def _is_auth_failure_message(message: str) -> bool:
+    normalized = message.lower()
+    return any(
+        marker in normalized
+        for marker in (
+            "please login",
+            "not authenticated",
+            "unauthorized",
+            '"status": 401',
+            '"status": 403',
+        )
+    )
 
 
 def _default_config_path() -> Path:
@@ -134,64 +178,139 @@ def detect_kling_cli(
     config_path: str | Path | None = None,
     *,
     timeout_seconds: float = 15,
+    force_refresh: bool = False,
+    command_runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+    sleep: Sleep = time.sleep,
+    clock: Clock = time.monotonic,
 ) -> KlingCliCapabilities:
     """检测可灵CLI是否可用，返回能力描述。"""
     cli_path = _find_kling_cli()
     if not cli_path:
-        return KlingCliCapabilities(supports_async_task=False, detection_error="未找到可灵CLI可执行文件")
-
-    # 尝试获取模型列表
-    detection_error: str | None = None
-    try:
-        cmd = _build_cli_command(cli_path, ["who_am_i"])
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
+        return KlingCliCapabilities(
+            supports_async_task=False,
+            detection_error="未找到可灵CLI可执行文件",
+            authentication_state="unknown",
         )
-        if result.returncode != 0:
-            stderr = result.stderr.strip()
-            stdout = result.stdout.strip()
-            msg = stderr or stdout or f"exit code {result.returncode}"
-            detection_error = f"who_am_i 返回非零退出码: {sanitize_error(msg)[:300]}"
-            logger.warning("可灵CLI who_am_i 失败（cli_path=%s）: %s", cli_path, detection_error)
-        else:
-            data = json.loads(result.stdout)
-            body = data.get("body", data)
-            models_info = body.get("availableModels", {})
-            # 找默认视频模型
-            video_models = models_info.get("text_to_video", {}).get("models", [])
-            default_video = "kling-v1-6"
-            for m in video_models:
-                if "v1-6" in m.get("model", ""):
-                    default_video = m["model"]
-                    break
-                if not default_video or "v2" in m.get("model", ""):
-                    default_video = m["model"]
-            # 找默认图片模型
-            image_models = models_info.get("text_to_image", {}).get("models", [])
-            default_image = "kling-image-v2_1"
-            for m in image_models:
-                if "v2_1" in m.get("model", ""):
-                    default_image = m["model"]
-                    break
-            return KlingCliCapabilities(
-                cli_path=cli_path,
-                default_image_model=default_image,
-                default_video_model=default_video,
-                supports_async_task=True,
-            )
-    except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError) as error:
-        detection_error = f"who_am_i 执行异常: {type(error).__name__}: {sanitize_error(str(error))[:300]}"
-        logger.warning("可灵CLI who_am_i 异常（cli_path=%s）: %s", cli_path, detection_error)
 
-    # CLI存在但who_am_i失败（认证过期/网络问题等），返回cli_path但标记为不可用
-    return KlingCliCapabilities(
-        cli_path=cli_path,
-        supports_async_task=False,
-        detection_error=detection_error or "未知检测错误",
-    )
+    runner = command_runner or subprocess.run
+    with _DETECTION_LOCK:
+        now = clock()
+        cached = _DETECTION_CACHE.get(cli_path)
+        if (
+            not force_refresh
+            and cached is not None
+            and now - cached[0] <= _DETECTION_CACHE_TTL_SECONDS
+        ):
+            return cached[1]
+
+        cmd = _build_cli_command(cli_path, ["who_am_i"])
+        last_error = ""
+        for attempt in range(3):
+            try:
+                result = runner(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_seconds,
+                )
+                if result.returncode != 0:
+                    stderr = (result.stderr or "").strip()
+                    stdout = (result.stdout or "").strip()
+                    msg = stderr or stdout or f"exit code {result.returncode}"
+                    if _is_rate_limit_message(msg):
+                        last_error = "可灵服务繁忙，登录状态暂时无法确认"
+                        if attempt < 2:
+                            sleep(0.5 * (2**attempt))
+                            continue
+                        if (
+                            cached is not None
+                            and cached[1].authentication_state == "authenticated"
+                            and now - cached[0]
+                            <= _DETECTION_STALE_SUCCESS_TTL_SECONDS
+                        ):
+                            return cached[1]
+                        return KlingCliCapabilities(
+                            cli_path=cli_path,
+                            supports_async_task=False,
+                            detection_error=last_error,
+                            authentication_state="unknown",
+                        )
+                    auth_state: Literal[
+                        "authenticated", "not_authenticated", "unknown"
+                    ] = (
+                        "not_authenticated"
+                        if _is_auth_failure_message(msg)
+                        else "unknown"
+                    )
+                    detection_error = (
+                        f"who_am_i 返回非零退出码: {sanitize_error(msg)[:300]}"
+                    )
+                    logger.warning(
+                        "可灵CLI who_am_i 失败（cli_path=%s）: %s",
+                        cli_path,
+                        detection_error,
+                    )
+                    return KlingCliCapabilities(
+                        cli_path=cli_path,
+                        supports_async_task=False,
+                        detection_error=detection_error,
+                        authentication_state=auth_state,
+                    )
+
+                data = json.loads(result.stdout or "")
+                body = data.get("body", data)
+                models_info = body.get("availableModels", {})
+                video_models = models_info.get("text_to_video", {}).get(
+                    "models", []
+                )
+                default_video = "kling-v1-6"
+                for model_info in video_models:
+                    model = model_info.get("model", "")
+                    if "v1-6" in model:
+                        default_video = model
+                        break
+                    if "v2" in model:
+                        default_video = model
+                image_models = models_info.get("text_to_image", {}).get(
+                    "models", []
+                )
+                default_image = "kling-image-v2_1"
+                for model_info in image_models:
+                    model = model_info.get("model", "")
+                    if "v2_1" in model:
+                        default_image = model
+                        break
+                capabilities = KlingCliCapabilities(
+                    cli_path=cli_path,
+                    default_image_model=default_image,
+                    default_video_model=default_video,
+                    supports_async_task=True,
+                    authentication_state="authenticated",
+                )
+                _DETECTION_CACHE[cli_path] = (clock(), capabilities)
+                return capabilities
+            except (
+                subprocess.TimeoutExpired,
+                OSError,
+                json.JSONDecodeError,
+            ) as error:
+                last_error = (
+                    f"who_am_i 执行异常: {type(error).__name__}: "
+                    f"{sanitize_error(str(error))[:300]}"
+                )
+                logger.warning(
+                    "可灵CLI who_am_i 异常（cli_path=%s）: %s",
+                    cli_path,
+                    last_error,
+                )
+                break
+
+        return KlingCliCapabilities(
+            cli_path=cli_path,
+            supports_async_task=False,
+            detection_error=last_error or "未知检测错误",
+            authentication_state="unknown",
+        )
 
 
 class KlingCliAdapter:
@@ -224,6 +343,22 @@ class KlingCliAdapter:
 
     # ---------- CLI 执行基础方法 ----------
 
+    @staticmethod
+    def _extract_json_payload(output: str) -> dict[str, Any]:
+        text = output.strip()
+        if not text:
+            raise json.JSONDecodeError("empty output", text, 0)
+        for index in range(len(text) - 1, -1, -1):
+            if text[index] != "{":
+                continue
+            try:
+                payload = json.loads(text[index:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                return payload
+        raise json.JSONDecodeError("no JSON object found", text, 0)
+
     def _run_cli(self, args: list[str], *, timeout: float | None = None) -> dict[str, Any]:
         """执行kling命令并解析JSON响应。"""
         timeout = timeout if timeout is not None else self.timeout_seconds
@@ -239,29 +374,53 @@ class KlingCliAdapter:
                     timeout=timeout,
                 )
                 if result.returncode != 0:
-                    stderr = result.stderr.strip()
-                    stdout = result.stdout.strip()
+                    stderr = (result.stderr or "").strip()
+                    stdout = (result.stdout or "").strip()
                     msg = stderr or stdout or f"exit code {result.returncode}"
                     # 尝试解析错误JSON
                     try:
-                        err_data = json.loads(stdout) if stdout else {}
+                        err_data = self._extract_json_payload(stdout)
                         if isinstance(err_data, dict) and not err_data.get("ok", True):
-                            msg = err_data.get("error") or err_data.get("message") or msg
+                            msg = (
+                                err_data.get("error")
+                                or err_data.get("message")
+                                or err_data.get("body")
+                                or msg
+                            )
                     except Exception:
                         pass
-                    raise KlingCliError(f"可灵CLI错误: {sanitize_error(msg)[:300]}")
+                    cleaned = sanitize_error(str(msg))[:300]
+                    if "insufficient credits" in cleaned.lower():
+                        raise KlingCreditsRequired(f"可灵CLI错误: {cleaned}")
+                    raise KlingCliError(f"可灵CLI错误: {cleaned}")
 
-                stdout = result.stdout.strip()
+                stdout = (result.stdout or "").strip()
                 if not stdout:
                     raise KlingCliError("可灵CLI返回空响应")
-                data = json.loads(stdout)
+                data = self._extract_json_payload(stdout)
                 if isinstance(data, dict) and data.get("ok") is False:
-                    raise KlingCliError(f"可灵CLI错误: {data.get('error', data.get('message', '未知错误'))}")
+                    message = (
+                        data.get("error")
+                        or data.get("message")
+                        or data.get("body")
+                        or "未知错误"
+                    )
+                    cleaned = sanitize_error(str(message))[:300]
+                    if "insufficient credits" in cleaned.lower():
+                        raise KlingCreditsRequired(f"可灵CLI错误: {cleaned}")
+                    raise KlingCliError(f"可灵CLI错误: {cleaned}")
                 return data.get("body", data)
             except (subprocess.TimeoutExpired, json.JSONDecodeError, KlingCliError) as error:
                 last_error = error
-                if isinstance(error, KlingCliError) and ("认证" in str(error) or "login" in str(error).lower()):
-                    raise
+                if isinstance(error, KlingCliError):
+                    normalized = str(error).lower()
+                    if (
+                        "认证" in normalized
+                        or "login" in normalized
+                        or "insufficient credits" in normalized
+                        or "点数不足" in normalized
+                    ):
+                        raise
                 if attempt >= self.retry_count:
                     raise
             wait = float(min(30, 3 * (2 ** attempt)))
@@ -497,8 +656,7 @@ class KlingCliAdapter:
         resolution: str = "720p",
         **kwargs: Any,
     ) -> str:
-        """提交文生视频任务，返回 generationId。（resolution参数已忽略，可灵由模型决定画质）"""
-        del resolution
+        """提交文生视频任务，返回 generationId。"""
         resolved_model = model or self.capabilities.default_video_model
         duration = int(self._generation_duration(required_seconds))
         args = [
@@ -506,6 +664,8 @@ class KlingCliAdapter:
             "--model", resolved_model,
             "--aspectRatio", ratio,
             "--duration", str(duration),
+            "--resolution", resolution,
+            "--enableAudio", "false",
             prompt,
         ]
         payload = self._run_cli(args)

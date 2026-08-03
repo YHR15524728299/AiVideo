@@ -10,6 +10,7 @@ import pytest
 from aicf.autopilot import Autopilot, NeedsAttention
 from aicf.database import JobRepository
 from aicf.engines.m6_engine import M6Pipeline, RepairEngine, TechnicalQA
+from aicf.engines.render_engine import MediaProbe
 from aicf.providers.tts import FfmpegToolchain, discover_ffmpeg_toolchain
 from aicf.state_machine import ORDERED_STAGES, PipelineStage
 
@@ -475,6 +476,71 @@ def test_verify_delivery_enforces_required_and_exact_manifest_file_set(
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     issues = pipeline.verify_delivery(delivery)
     assert any("实际文件集合与 manifest 不一致" in issue for issue in issues)
+
+
+def test_verify_landscape_delivery_accepts_960x540_preview(
+    tmp_path: Path,
+) -> None:
+    delivery = tmp_path / "delivery"
+    required = {
+        "master.mp4",
+        "clean.mp4",
+        "preview_960x540.mp4",
+        "cover.jpg",
+        "clean_cover.jpg",
+        "contact_sheet.jpg",
+        "qa/content_qa.json",
+        "qa/technical_round_0.json",
+        "youtube/video.mp4",
+        "youtube/publish.md",
+    }
+    for relative in required:
+        path = delivery / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(f"payload:{relative}".encode())
+    files = {
+        relative: {
+            "sha256": hashlib.sha256((delivery / relative).read_bytes()).hexdigest(),
+            "size_bytes": (delivery / relative).stat().st_size,
+            "media": relative.endswith(".mp4"),
+        }
+        for relative in sorted(required)
+    }
+    (delivery / "publish_manifest.json").write_text(
+        json.dumps(
+            {
+                "status": "READY_TO_PUBLISH",
+                "expected_duration_seconds": 55.872,
+                "repair_rounds": 0,
+                "orientation": "landscape",
+                "platforms": {"youtube": {}},
+                "files": files,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def probe(_ffprobe: str, path: Path, _runner: object) -> MediaProbe:
+        width, height = (960, 540) if path.name.startswith("preview_") else (1920, 1080)
+        return MediaProbe(
+            duration_seconds=55.872,
+            size_bytes=path.stat().st_size,
+            video_codec="h264",
+            width=width,
+            height=height,
+            pixel_format="yuv420p",
+            fps=30.0,
+            audio_codec="aac",
+            sample_rate=48_000,
+            channels=2,
+        )
+
+    pipeline = M6Pipeline(
+        FfmpegToolchain("ffmpeg", "ffprobe"),
+        media_probe=probe,
+    )
+
+    assert pipeline.verify_delivery(delivery) == []
 
 
 def test_m6_pipeline_fails_after_two_noop_repairs_without_packaging(

@@ -218,7 +218,11 @@ def detect_jimeng_cli(
     failures: list[str] = []
     prefixes = candidates if candidates is not None else _default_candidates()
     for raw_prefix in prefixes:
-        prefix = [str(token) for token in raw_prefix if str(token)]
+        prefix = [
+            os.path.expandvars(os.path.expanduser(str(token)))
+            for token in raw_prefix
+            if str(token)
+        ]
         if not prefix:
             continue
         help_parts: list[str] = []
@@ -358,7 +362,7 @@ class JimengCliAdapter:
 
     @staticmethod
     def _parse_json_output(completed: subprocess.CompletedProcess[str], name: str) -> dict[str, object]:
-        text = completed.stdout.strip()
+        text = (completed.stdout or "").strip()
         try:
             value = json.loads(text)
         except json.JSONDecodeError:

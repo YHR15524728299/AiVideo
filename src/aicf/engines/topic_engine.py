@@ -67,3 +67,20 @@ def rank_topics(
         topic["overall_score"] = 0.0 if duplicate else round(max(0.0, min(100.0, score)), 2)
         ranked.append(topic)
     return sorted(ranked, key=lambda item: float(item["overall_score"]), reverse=True)
+
+
+def select_topic(
+    ranked: list[Mapping[str, object]],
+    raw_direction: str,
+) -> dict[str, object]:
+    if not ranked:
+        raise ValueError("候选选题不能为空")
+    title_match = re.search(r"标题必须为《([^》]+)》", raw_direction)
+    if title_match is None:
+        return dict(ranked[0])
+    eligible = [item for item in ranked if not bool(item.get("duplicate"))] or ranked
+    selected = max(
+        eligible,
+        key=lambda item: float(item.get("direction_relevance", 0)),
+    )
+    return {**dict(selected), "title": title_match.group(1).strip()}

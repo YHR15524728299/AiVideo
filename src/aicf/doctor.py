@@ -192,10 +192,20 @@ class Doctor:
         try:
             from .providers.kling import detect_kling_cli
             caps = detect_kling_cli(timeout_seconds=8)
-            if caps.supports_async_task and not caps.detection_error:
+            if caps.authentication_state == "authenticated":
                 return Check(True, f"已登录可用（{_safe_path(kling_exe)}）", required=False)
-            elif caps.detection_error:
-                return Check(True, f"已安装（{_safe_path(kling_exe)}），需登录后可用", required=False)
+            if caps.authentication_state == "not_authenticated":
+                return Check(
+                    True,
+                    f"已安装（{_safe_path(kling_exe)}），需登录后可用",
+                    required=False,
+                )
+            if caps.detection_error:
+                return Check(
+                    True,
+                    f"已安装（{_safe_path(kling_exe)}），{caps.detection_error}",
+                    required=False,
+                )
         except Exception:
             pass
         return Check(True, f"已安装（{_safe_path(kling_exe)}），需登录后可用", required=False)
@@ -231,37 +241,58 @@ class Doctor:
         else:
             kokoro_check = Check(False, "未安装（uv add kokoro-onnx misaki[zh] soundfile，可选）", required=False)
 
-        # TTS策略描述（Kokoro优先）
+        # TTS 策略使用稳定的 provider 标识，便于 CLI/GUI 和自动诊断消费；
+        # 同时保留不可用原因，避免只展示一个笼统的回退链。
         available_tts = []
         if self.kokoro_available:
-            available_tts.append("Kokoro本地TTS（首选）")
-        if self.edge_tts_available:
-            available_tts.append("Edge TTS（在线回退）")
+            available_tts.append("kokoro（首选）")
+        if self.edge_tts_available and self.audio_ffmpeg:
+            available_tts.append("edge_tts（在线回退）")
         if self.sapi_available:
-            available_tts.append("Windows SAPI（最终回退）")
+            available_tts.append("windows_sapi（最终回退）")
+        unavailable_reasons = []
+        if not self.edge_tts_available:
+            unavailable_reasons.append("edge-tts 未安装")
+        elif not self.audio_ffmpeg:
+            unavailable_reasons.append("音频转码 FFmpeg 不可用")
         if available_tts:
-            tts_strategy = Check(True, " → ".join(available_tts), required=False)
+            strategy_detail = " → ".join(available_tts)
+            if unavailable_reasons:
+                strategy_detail += f"（{'；'.join(unavailable_reasons)}）"
+            tts_strategy = Check(True, strategy_detail, required=False)
         else:
-            tts_strategy = Check(False, "无可用TTS引擎", required=False)
+            detail = "无可用TTS引擎"
+            if unavailable_reasons:
+                detail += f"（{'；'.join(unavailable_reasons)}）"
+            tts_strategy = Check(False, detail, required=False)
 
         # FFmpeg检测
         ffmpeg_check = Check(
             bool(self.audio_ffmpeg),
-            _safe_path(self.audio_ffmpeg) if self.audio_ffmpeg else "未找到FFmpeg（winget install Gyan.FFmpeg）",
+            str(Path(self.audio_ffmpeg))
+            if self.audio_ffmpeg
+            else "未找到FFmpeg（winget install Gyan.FFmpeg）",
         )
 
-        # ffprobe检测：在ffmpeg同目录查找
+        # audio_ffmpeg 由完整工具链发现器或调用方显式注入；两种情况下都保持
+        # ffmpeg/ffprobe 同目录配对展示，不再用脱敏文案破坏机器可读契约。
         ffprobe_path = ""
         if self.audio_ffmpeg:
             ffmpeg_dir = Path(self.audio_ffmpeg).parent
-            for name in ("ffprobe.exe", "ffprobe"):
-                candidate = ffmpeg_dir / name
-                if candidate.is_file():
-                    ffprobe_path = str(candidate)
-                    break
+            suffix = Path(self.audio_ffmpeg).suffix
+            ffprobe_path = str(ffmpeg_dir / f"ffprobe{suffix}")
         ffprobe_check = Check(
             bool(ffprobe_path),
-            _safe_path(ffprobe_path) if ffprobe_path else "未找到ffprobe（应与ffmpeg同目录）",
+            str(Path(ffprobe_path))
+            if ffprobe_path
+            else "未找到ffprobe（应与ffmpeg同目录）",
+        )
+        tts_audio_ffmpeg = Check(
+            bool(self.audio_ffmpeg),
+            str(Path(self.audio_ffmpeg))
+            if self.audio_ffmpeg
+            else "音频转码 FFmpeg 不可用",
+            required=False,
         )
 
         api_key = bool(os.getenv("OPENROUTER_API_KEY"))
@@ -291,6 +322,7 @@ class Doctor:
                     "Windows SAPI 可用" if self.sapi_available else "仅支持Windows",
                     required=False,
                 ),
+                "tts_audio_ffmpeg": tts_audio_ffmpeg,
                 "tts_strategy": tts_strategy,
             }
         )

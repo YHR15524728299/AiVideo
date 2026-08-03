@@ -236,6 +236,27 @@ def test_sanitize_error_redacts_credentials_signatures_and_user_paths(
     assert sanitized.count("***REDACTED***") >= 6
 
 
+def test_gui_log_sanitizes_secrets_before_queueing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from aicf.gui import AicfGUI
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "do-not-display")
+    queued: list[str] = []
+    gui = object.__new__(AicfGUI)
+    gui.log_queue = type(
+        "QueueStub",
+        (),
+        {"put": lambda _self, value: queued.append(value)},
+    )()
+
+    gui._log("请求失败：Bearer do-not-display")
+
+    assert len(queued) == 1
+    assert "do-not-display" not in queued[0]
+    assert "***REDACTED***" in queued[0]
+
+
 def test_cli_error_json_uses_shared_sanitizer(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

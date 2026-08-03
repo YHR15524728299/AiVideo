@@ -20,7 +20,7 @@ from aicf.engines.script_engine import (
     ScriptRevisionEngine,
     render_script_markdown,
 )
-from aicf.engines.topic_engine import TopicGenerationEngine, rank_topics
+from aicf.engines.topic_engine import TopicGenerationEngine, rank_topics, select_topic
 from aicf.models.contracts import (
     DirectionProfile,
     PackageResult,
@@ -108,7 +108,7 @@ class M2ContentRunner:
         if PipelineStage.TOPIC_SELECTED in reusable_stages:
             selected = self._read_json(output_dir / "topic.json")
         else:
-            selected = ranked[0]
+            selected = select_topic(ranked, config.direction)
             self._stage(
                 job_id,
                 PipelineStage.TOPIC_SELECTED,
@@ -199,7 +199,10 @@ class M2ContentRunner:
                     list(config.platforms),
                 ),
             )
-        package_data = package.model_dump(mode="json")
+        # youtube 是兼容长视频发布链路的可选扩展；旧版 M2 默认平台集合仍为四个平台。
+        # Pydantic 默认会把未提供的可选字段序列化为 null，必须排除它，避免悄悄
+        # 扩大 package.json / manifest 对外声明的平台集合。
+        package_data = package.model_dump(mode="json", exclude_none=True)
         self._write_json(output_dir / "package.json", package_data)
         manifest = {
             "status": "ready_to_publish",
@@ -308,10 +311,21 @@ class M2ContentRunner:
                     output_dir / "research_sources.json",
                     error.evidence,
                 )
-            # 只有确定性的数据错误才标记为不可重试；网络/上游服务/来源验证错误都可重试
-            # （重跑阶段时 LLM 会重新生成内容/URL）
+            # M2 阶段中的 ValueError / ValidationError 来自结构化生成结果，而非静态
+            # 用户配置；重跑该阶段会重新生成，因此属于可恢复失败。
             retryable = (
-                isinstance(error, (URLError, TimeoutError, OSError, UpstreamRateLimitError, SourceVerificationError))
+                isinstance(
+                    error,
+                    (
+                        ValueError,
+                        ValidationError,
+                        URLError,
+                        TimeoutError,
+                        OSError,
+                        UpstreamRateLimitError,
+                        SourceVerificationError,
+                    ),
+                )
                 or (
                     isinstance(error, OpenRouterHTTPError)
                     and (error.status_code == 429 or error.status_code >= 500)

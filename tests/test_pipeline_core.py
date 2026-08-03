@@ -17,7 +17,7 @@ from aicf.engines.timeline_engine import (
     build_narration_timeline,
     probe_wav_duration,
 )
-from aicf.engines.topic_engine import rank_topics
+from aicf.engines.topic_engine import rank_topics, select_topic
 from aicf.providers.jimeng import JimengCapabilities, JimengCliAdapter
 from aicf.providers.openrouter import extract_json_object
 
@@ -180,6 +180,42 @@ def test_topic_ranking_penalizes_risk_and_recent_duplicates() -> None:
     assert ranked[0]["topic_id"] == "T1"
     assert ranked[1]["duplicate"] is True
     assert ranked[1]["overall_score"] == 0
+
+
+def test_explicit_title_prioritizes_direction_fit_and_locks_title() -> None:
+    ranked = [
+        {
+            "topic_id": "T004",
+            "title": "美联储的观察清单",
+            "direction_relevance": 98,
+            "overall_score": 86.5,
+            "duplicate": False,
+        },
+        {
+            "topic_id": "T001",
+            "title": "美联储鹰鸽大战",
+            "direction_relevance": 100,
+            "overall_score": 84.6,
+            "duplicate": False,
+        },
+    ]
+
+    selected = select_topic(
+        ranked,
+        "视频标题必须为《美联储，为什么有人主张加息？2026.7.31》。",
+    )
+
+    assert selected["topic_id"] == "T001"
+    assert selected["title"] == "美联储，为什么有人主张加息？2026.7.31"
+
+
+def test_without_explicit_title_keeps_ranked_first_topic() -> None:
+    ranked = [
+        {"topic_id": "T004", "title": "观察清单", "overall_score": 90},
+        {"topic_id": "T001", "title": "政策分歧", "overall_score": 80},
+    ]
+
+    assert select_topic(ranked, "制作一条美联储视频")["topic_id"] == "T004"
 
 
 def test_jimeng_adapter_builds_argument_list_and_never_exceeds_fifteen_seconds(

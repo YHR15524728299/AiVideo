@@ -10,6 +10,7 @@ from PIL import Image
 
 from aicf.m4_asset_runner import M4AssetRunner
 from aicf.production_settings import ProductionSettings
+from aicf.providers.kling import KlingCreditsRequired
 
 
 def _write_plan(path: Path, kinds: list[str]) -> None:
@@ -90,7 +91,6 @@ class FakeDreamina:
             "gen_status": state,
             "fail_reason": "fake failed" if state == "failed" else None,
         }
-
     def download(
         self,
         submit_id: str,
@@ -118,6 +118,19 @@ class CrashAfterRemoteSubmit(FakeDreamina):
         raise SystemExit("simulated crash after remote submission")
 
 
+class NoKlingCredits(FakeDreamina):
+    def submit_video(
+        self,
+        prompt: str,
+        required_seconds: float,
+        *,
+        model: str,
+        ratio: str,
+        resolution: str = "720p",
+    ) -> str:
+        raise KlingCreditsRequired("可灵点数不足")
+
+
 def _probe(path: Path, kind: str) -> dict[str, object]:
     if kind == "image":
         with Image.open(path) as image:
@@ -136,6 +149,53 @@ def _probe(path: Path, kind: str) -> dict[str, object]:
         "duration_seconds": 5.0,
         "size_bytes": path.stat().st_size,
     }
+
+
+def test_kling_insufficient_credits_waits_without_unknown_submission(
+    tmp_path: Path,
+) -> None:
+    plan_path = tmp_path / "visual_plan.json"
+    _write_plan(plan_path, ["video"])
+    ProductionSettings(
+        selected_platforms=("youtube",),
+        video_provider="kling",
+        motion_mode="video",
+        orientation="landscape",
+    ).save_for_job(tmp_path)
+
+    result = M4AssetRunner(
+        {"kling": NoKlingCredits()},
+        media_probe=_probe,
+    ).run(plan_path)
+
+    task = json.loads(
+        (tmp_path / "assets" / "tasks.json").read_text(encoding="utf-8")
+    )["tasks"][0]
+    assert result["status"] == "WAITING_EXTERNAL"
+    assert result["reason"] == "KLING_CREDITS_REQUIRED"
+    assert task["status"] == "waiting_credits"
+    assert task["submit_id"] is None
+
+
+def test_selected_provider_unavailable_does_not_fallback(
+    tmp_path: Path,
+) -> None:
+    plan_path = tmp_path / "visual_plan.json"
+    _write_plan(plan_path, ["video"])
+    ProductionSettings(
+        selected_platforms=("youtube",),
+        video_provider="jimeng",
+        motion_mode="video",
+        orientation="landscape",
+    ).save_for_job(tmp_path)
+
+    runner = M4AssetRunner(
+        {"kling": NoKlingCredits()},
+        media_probe=_probe,
+    )
+
+    with pytest.raises(RuntimeError, match="指定的视频提供商不可用.*jimeng"):
+        runner.run(plan_path)
 
 
 def test_processes_all_videos_in_video_mode_and_updates_outputs(

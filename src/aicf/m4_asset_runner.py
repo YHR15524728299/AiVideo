@@ -11,6 +11,7 @@ from typing import Callable, cast
 from aicf.atomic_io import atomic_replace
 from aicf.models import VisualPlan
 from aicf.production_settings import ProductionSettings
+from aicf.providers.kling import KlingCreditsRequired
 
 
 _PENDING_STATES = {
@@ -92,7 +93,11 @@ class M4AssetRunner:
             self.production_settings, "video_provider", "jimeng"
         )
         if self._current_provider_key not in self.providers:
-            self._current_provider_key = next(iter(self.providers), "jimeng")
+            available = "、".join(self.providers) or "无"
+            raise RuntimeError(
+                f"指定的视频提供商不可用: {self._current_provider_key}；"
+                f"当前可用: {available}"
+            )
         self._apply_motion_mode(plan)
         tasks_path = root / "assets" / "tasks.json"
         manifest_path = root / "asset_manifest.json"
@@ -146,16 +151,34 @@ class M4AssetRunner:
                 self._write_json(tasks_path, tasks_document)
                 continue
             if not task.get("submit_id"):
-                self._submit_with_intent(
-                    tasks_path,
-                    tasks_document,
-                    task,
-                    active_kind,
-                    shot.prompt,
-                    shot.duration_seconds,
-                    usage_recorder,
-                    budget_guard,
-                )
+                try:
+                    self._submit_with_intent(
+                        tasks_path,
+                        tasks_document,
+                        task,
+                        active_kind,
+                        shot.prompt,
+                        shot.duration_seconds,
+                        usage_recorder,
+                        budget_guard,
+                    )
+                except KlingCreditsRequired:
+                    task.update(
+                        {
+                            "request_id": None,
+                            "submission_parameters": None,
+                            "submit_id": None,
+                            "status": "waiting_credits",
+                            "usage_recorded": False,
+                        }
+                    )
+                    self._write_json(tasks_path, tasks_document)
+                    return {
+                        "status": "WAITING_EXTERNAL",
+                        "shot_id": shot.shot_id,
+                        "reason": "KLING_CREDITS_REQUIRED",
+                        "message": "可灵账号点数不足，充值后可从当前镜头继续",
+                    }
             self._record_usage_if_needed(task, usage_recorder)
             self._write_json(tasks_path, tasks_document)
 

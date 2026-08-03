@@ -20,7 +20,7 @@
 在 PowerShell 中运行：
 
 ```powershell
-Set-Location "d:\Vibe Coding\aiVideo\ai_content_factory"
+Set-Location "<项目目录>\ai_content_factory"
 .\scripts\bootstrap.ps1
 ```
 
@@ -30,7 +30,9 @@ Set-Location "d:\Vibe Coding\aiVideo\ai_content_factory"
 
 主要输入是 `config\content_direction.yaml`，只有 `direction` 必填。其余字段缺失时使用代码默认值。
 
-复制 `.env.example` 为 `.env` 仅用于参考；敏感值应通过进程或用户环境变量提供：
+复制 `.env.example` 为 `.env` 仅用于非敏感配置参考。GUI 保存的 OpenRouter
+API Key 使用 Windows DPAPI 加密，并存放在当前 Windows 用户的应用数据目录，
+不会写入项目源码、`.env` 或 YAML 配置。也可以通过进程环境变量临时提供：
 
 ```powershell
 $env:OPENROUTER_API_KEY = "..."
@@ -98,7 +100,8 @@ Job 状态同时写入：
 
 ## 测试
 
-当前共有 234 项（227+）自动化测试。测试遵循测试先行的红-绿流程，覆盖：
+当前可收集 293 项自动化测试。最近一次全量执行结果为 292 passed、1 skipped。
+测试遵循测试先行的红-绿流程，覆盖：
 
 - 唯一必填方向与默认值
 - 时长边界校验
@@ -124,6 +127,10 @@ Job 状态同时写入：
 uv run --extra dev pytest
 uv run --extra dev pytest --cov=aicf --cov-report=term-missing
 ```
+
+当前整体覆盖率为 60.87%，尚未达到工程配置的 80% 质量门槛。主要缺口集中在
+Tkinter GUI 和设置窗口，发布前仍需补充窗口生命周期、异步检测、登录流程和
+配置保存的自动化测试。
 
 ## 已知环境结果
 

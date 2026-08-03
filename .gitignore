@@ -17,6 +17,9 @@ eggs/
 htmlcov/
 .tox/
 .nox/
+.mypy_cache/
+.ruff_cache/
+.cache/
 coverage.xml
 *.cover
 
@@ -40,6 +43,14 @@ data/*
 !data/kling_cache/.gitkeep
 !data/openrouter_cache/
 !data/openrouter_cache/.gitkeep
+data/dreamina_asset_cache/*
+!data/dreamina_asset_cache/.gitkeep
+data/dreamina_cache/*
+!data/dreamina_cache/.gitkeep
+data/kling_cache/*
+!data/kling_cache/.gitkeep
+data/openrouter_cache/*
+!data/openrouter_cache/.gitkeep
 
 # Generated outputs
 outputs/*
@@ -58,6 +69,12 @@ logs/
 *.swp
 *.swo
 *~
+*.tmp
+*.temp
+*.bak
+*.old
+*.orig
+*.rej
 .DS_Store
 Thumbs.db
 

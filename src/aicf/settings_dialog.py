@@ -21,6 +21,7 @@ from tkinter import (
 from tkinter import ttk
 import tkinter.scrolledtext as st
 
+from .atomic_io import atomic_write_text
 from .production_settings import (
     KLING_MODEL_DISPLAY_NAMES, JIMENG_MODEL_DISPLAY_NAMES,
     MOTION_MODE_DISPLAY_NAMES, VIDEO_PROVIDER_DISPLAY_NAMES,
@@ -30,6 +31,12 @@ from .production_settings import (
 from .providers.jimeng import detect_jimeng_cli
 from .providers.kling import detect_kling_cli
 from .providers.tts import discover_ffmpeg_toolchain, KokoroTtsProvider
+from .secret_store import (
+    load_secret,
+    migrate_secret_from_env,
+    remove_secret_from_env,
+    store_secret,
+)
 from .doctor import _describe_path
 # 提前导入doctor，避免线程中首次导入
 from . import doctor as _doctor_mod
@@ -90,7 +97,7 @@ def _save_env(path: Path, vals: dict[str, str]) -> None:
             if new_lines and new_lines[-1].strip() != "":
                 new_lines.append("")
             new_lines.append(f"{k}={_format_env_value(vals[k])}")
-    path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+    atomic_write_text(path, "\n".join(new_lines) + "\n")
 
 
 def _root() -> Path:
@@ -271,6 +278,7 @@ class _Overview(ttk.Frame):
 class _AIPage(ttk.Frame):
     def __init__(self, master, env_path):
         super().__init__(master, padding=16)
+        migrate_secret_from_env(env_path, "OPENROUTER_API_KEY")
         self._env = _load_env(env_path)
 
         ttk.Label(self, text="✏️  AI 大模型配置", font=("Segoe UI", 13, "bold")).pack(anchor="w", pady=(0, 4))
@@ -285,7 +293,10 @@ class _AIPage(ttk.Frame):
         ).pack(anchor="w", pady=(0, 8))
         row = ttk.Frame(key_box)
         row.pack(fill="x")
-        self.key_var = StringVar(value=self._env.get("OPENROUTER_API_KEY", ""))
+        key_value = os.environ.get("OPENROUTER_API_KEY") or load_secret(
+            "OPENROUTER_API_KEY"
+        )
+        self.key_var = StringVar(value=key_value)
         self._entry = ttk.Entry(row, textvariable=self.key_var, show="•", width=50)
         self._entry.pack(side=LEFT, fill="x", expand=True, padx=(0, 4))
         self._show_btn = ttk.Button(row, text="显示", width=6, command=self._toggle)
@@ -358,9 +369,11 @@ class _AIPage(ttk.Frame):
 
     def collect(self):
         return {
-            "OPENROUTER_API_KEY": self.key_var.get().strip(),
             "OPENROUTER_MODEL": self.model_var.get().strip(),
         }
+
+    def secret_value(self) -> str:
+        return self.key_var.get().strip()
 
     def key_status(self):
         return ("ok", "已配置") if self.key_var.get().strip() else ("error", "未配置")
@@ -378,27 +391,25 @@ class _VideoPage(ttk.Frame):
         ttk.Label(self, text="🔍  视频生成服务", font=("Segoe UI", 13, "bold")).pack(anchor="w", pady=(0, 4))
         ttk.Label(
             self,
-            text="系统自动检测 CLI。登录请在终端完成，GUI 不处理密码。即梦和可灵至少配一个。",
+            text="选择一个AI视频服务登录即可使用。点击「🔑 一键登录」会自动打开终端帮你登录，用手机扫码就行。",
             foreground="#6b7280", wraplength=600, justify="left",
         ).pack(anchor="w", pady=(0, 12))
 
         self.jm = _AutoCard(self, "即梦（Dreamina / 豆包·Seedance）",
-                            "字节跳动文生视频服务，安装并登录后自动检测。", icon="🎬")
+                            "字节跳动出品的AI视频生成工具，用抖音/豆包账号扫码即可使用。", icon="🎬")
         self.jm.pack(fill="x", pady=4)
         self.jm.add_btn("🔄 重新检测", self._detect_jm)
-        self.jm.add_btn("📋 登录步骤", self._jm_help)
-        self.jm.add_btn("💻 打开终端", self._terminal)
+        self.jm.add_btn("🔑 一键登录", self._jm_login)
         self.jm.on_apply(lambda p: self._detect_jm(p))
         sv = self._env.get("JIMENG_CLI_EXECUTABLE", "")
         if sv:
             self.jm.set_val(sv)
 
         self.kl = _AutoCard(self, "可灵（Kling AI）",
-                            "快手文生视频服务，npm 安装 CLI 并登录后自动检测。", icon="🎬")
+                            "快手出品的AI视频生成工具，用快手账号扫码即可使用。", icon="🎬")
         self.kl.pack(fill="x", pady=4)
         self.kl.add_btn("🔄 重新检测", self._detect_kl)
-        self.kl.add_btn("📋 安装/登录", self._kl_help)
-        self.kl.add_btn("💻 打开终端", self._terminal)
+        self.kl.add_btn("🔑 一键登录", self._kl_login)
         self.kl.on_apply(lambda p: self._detect_kl(p))
         skv = self._env.get("KLING_CLI_EXECUTABLE", "")
         if skv:
@@ -441,11 +452,14 @@ class _VideoPage(ttk.Frame):
     def _jm_ok(self, caps):
         safe_path = _safe_path(caps.cli_path) if caps.cli_path else ""
         if caps.cli_path and caps.supports_async_task:
-            self.jm.ok(f"路径：{safe_path}")
+            self.jm.ok(f"已登录就绪 ✓")
         elif caps.cli_path:
-            self.jm.warn(f"已找到 CLI，但需要登录。终端运行 dreamina login。路径：{safe_path}")
+            err_detail = ""
+            if caps.detection_error and "未登录" not in caps.detection_error and "login" not in caps.detection_error.lower():
+                err_detail = f"（{caps.detection_error}）"
+            self.jm.warn(f"已安装，但需要登录。点击「🔑 一键登录」扫码{err_detail}")
         else:
-            self.jm.err("未检测到。请安装后点「重新检测」，或手动指定路径。", show_manual=True)
+            self.jm.err("未检测到即梦工具。请先安装豆包/即梦客户端。", show_manual=True)
         self._notify()
 
     def _detect_kl(self, manual=None):
@@ -458,35 +472,110 @@ class _VideoPage(ttk.Frame):
             os.environ.pop("KLING_CLI_EXECUTABLE", None)
         def w():
             try:
-                caps = detect_kling_cli()
+                caps = detect_kling_cli(
+                    timeout_seconds=30,
+                    force_refresh=manual is not None,
+                )
                 self.after(0, lambda: self._kl_ok(caps))
             except Exception as e:
+                import traceback
+                traceback.print_exc()
                 msg = str(e)
-                self.after(0, lambda: self.kl.err(f"检测失败：{msg[:60]}", show_manual=True))
+                self.after(0, lambda: self.kl.err(f"检测失败：{msg[:200]}", show_manual=True))
                 self.after(0, self._notify)
         threading.Thread(target=w, daemon=True).start()
 
     def _kl_ok(self, caps):
         safe_path = _safe_path(caps.cli_path) if caps.cli_path else ""
-        if caps.cli_path and caps.supports_async_task:
-            self.kl.ok(f"路径：{safe_path}")
+        if caps.authentication_state == "authenticated":
+            self.kl.ok(f"已登录就绪 ✓")
+        elif caps.authentication_state == "not_authenticated":
+            self.kl.warn("已安装，但需要登录。点击「🔑 一键登录」扫码")
         elif caps.cli_path:
-            self.kl.warn("已安装但未登录。终端运行 kling login")
+            detail = caps.detection_error or "登录状态暂时无法确认"
+            self.kl.warn(f"{detail}，请稍后点「重新检测」")
         else:
-            self.kl.err("未检测到。运行 npm i -g @klingai/cli-cn 安装，然后 kling login。", show_manual=True)
+            self.kl.err("未检测到可灵工具。请先安装可灵CLI。", show_manual=True)
         self._notify()
 
-    def _jm_help(self):
-        messagebox.showinfo("即梦登录", "1. 安装即梦 CLI（dreamina.exe）\n2. 点「打开终端」\n3. 运行 dreamina login\n4. 扫码登录\n5. 点「重新检测」")
-
-    def _kl_help(self):
-        messagebox.showinfo("可灵安装", "1. 安装 Node.js\n2. 点「打开终端」\n3. npm i -g @klingai/cli-cn\n4. kling login\n5. 点「重新检测」")
-
-    def _terminal(self):
+    def _open_terminal_and_run(self, command: str, intro: str):
+        """打开一个终端窗口，显示提示信息并执行命令。"""
         try:
-            subprocess.Popen(["powershell.exe", "-NoExit"], cwd=str(_root()))
-        except:
-            os.startfile(str(_root()))
+            # 使用PowerShell打开新窗口，先显示提示再执行命令
+            ps_script = f'''
+Write-Host ""
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host "  {intro}" -ForegroundColor Yellow
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "正在执行登录命令，请稍候..." -ForegroundColor Green
+Write-Host ""
+{command}
+Write-Host ""
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host "  登录完成后，请回到设置窗口点击「重新检测」" -ForegroundColor Yellow
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host ""
+'''
+            # 写入临时脚本文件
+            import tempfile
+            tmp = Path(tempfile.gettempdir()) / "aicf_login.ps1"
+            tmp.write_text(ps_script, encoding="utf-8")
+            subprocess.Popen(
+                ["powershell.exe", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", str(tmp)],
+                cwd=str(_root()),
+                creationflags=subprocess.CREATE_NEW_CONSOLE if hasattr(subprocess, 'CREATE_NEW_CONSOLE') else 0,
+            )
+        except Exception as e:
+            # 备用方案：直接打开终端
+            try:
+                subprocess.Popen(["powershell.exe", "-NoExit", "-Command", command], cwd=str(_root()))
+            except:
+                os.startfile(str(_root()))
+                messagebox.showinfo("登录指引", f"请在打开的终端中输入以下命令并按回车：\n\n{command}")
+
+    def _jm_login(self):
+        """一键登录即梦：自动打开终端并执行登录命令。"""
+        messagebox.showinfo(
+            "即梦登录",
+            "点击「确定」后会自动打开一个黑色终端窗口。\n\n"
+            "请在终端中：\n"
+            "1. 等待命令执行完成\n"
+            "2. 如果出现二维码，用抖音APP扫码登录\n"
+            "3. 登录成功后，回到这里点击「重新检测」"
+        )
+        self._open_terminal_and_run("dreamina login", "即梦/豆包登录")
+
+    def _kl_login(self):
+        """一键登录可灵：自动打开终端并执行登录命令。"""
+        # 先检查kling CLI是否存在
+        from .providers.kling import _find_kling_cli
+        cli_path = _find_kling_cli()
+        if not cli_path:
+            messagebox.showwarning(
+                "可灵未安装",
+                "未检测到可灵CLI工具。\n\n"
+                "可灵需要先安装才能登录。请确保你已通过TRAE或npm安装了可灵CLI。\n\n"
+                "如果你已经安装但仍提示此消息，请点「浏览...」手动选择kling.cmd文件位置。"
+            )
+            self.kl.err("未检测到可灵CLI，请手动指定路径或安装", show_manual=True)
+            return
+
+        messagebox.showinfo(
+            "可灵登录",
+            "点击「确定」后会自动打开一个黑色终端窗口。\n\n"
+            "请在终端中：\n"
+            "1. 等待命令执行完成\n"
+            "2. 如果出现二维码或登录链接，按提示完成登录\n"
+            "3. 登录成功后，回到这里点击「重新检测」"
+        )
+        # 根据cli_path类型决定命令
+        if cli_path.lower().endswith(('.cmd', '.bat')):
+            # Windows下.cmd文件需要通过cmd /c调用
+            cmd = f'cmd /c ""{cli_path}" login"'
+        else:
+            cmd = f'"{cli_path}" login'
+        self._open_terminal_and_run(cmd, "可灵(Kling)登录")
 
     def collect(self):
         r = {}
@@ -875,12 +964,22 @@ class SettingsDialog(Toplevel):
         env.update(self.tp.collect())
         env = {k: v for k, v in env.items() if v}
         try:
+            api_key = self.ai.secret_value()
+            store_secret("OPENROUTER_API_KEY", api_key)
+            remove_secret_from_env(env_path, "OPENROUTER_API_KEY")
+            if api_key:
+                os.environ["OPENROUTER_API_KEY"] = api_key
+            else:
+                os.environ.pop("OPENROUTER_API_KEY", None)
             _save_env(env_path, env)
             for k, v in env.items():
                 os.environ[k] = v
             defaults = self.dp.collect()
             def_path.parent.mkdir(parents=True, exist_ok=True)
-            def_path.write_text(json.dumps(defaults, ensure_ascii=False, indent=2), encoding="utf-8")
+            atomic_write_text(
+                def_path,
+                json.dumps(defaults, ensure_ascii=False, indent=2) + "\n",
+            )
             self._dirty = False
             self._status.configure(text="✓ 配置已保存，部分设置需重启后生效", foreground="#22c55e")
             if self._on_saved:

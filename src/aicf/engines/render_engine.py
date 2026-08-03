@@ -41,9 +41,14 @@ class MediaProbe:
         expected_duration_seconds: float,
         *,
         orientation: str = "portrait",
+        expected_resolution: tuple[int, int] | None = None,
     ) -> None:
         errors: list[str] = []
-        expected_width, expected_height = get_resolution(orientation)
+        expected_width, expected_height = (
+            expected_resolution
+            if expected_resolution is not None
+            else get_resolution(orientation)
+        )
         if (self.width, self.height) != (expected_width, expected_height):
             errors.append(
                 f"分辨率应为 {expected_width}x{expected_height}，"

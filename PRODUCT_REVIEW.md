@@ -1,8 +1,8 @@
 # AI Content Factory 产品验收与代码健康报告
 
-**评审角色：** 产品经理 / 发布验收  
-**评审范围：** 全部源码、配置、测试、启动入口、环境诊断、GUI关键流程、敏感信息与工程清洁度  
-**评审日期：** 2026-07-30  
+**评审角色：** 产品经理 / 发布验收
+**评审范围：** 全部源码、配置、测试、启动入口、环境诊断、GUI关键流程、敏感信息与工程清洁度
+**评审日期：** 2026-07-30
 **发布结论：** 有条件不通过
 
 项目核心流水线、外部服务检测和自动化测试当前可正常运行，但 GUI 异步线程安全和
@@ -37,32 +37,32 @@
 
 ### 费用安全边界
 
-**Symptom：** OpenRouter 免费模型验证存在进程级缓存，目录验证失败时可能使用旧结果继续请求。  
-**Source：** Fail Closed / Single Source of Truth。  
-**Consequence：** 模型价格或账户状态变化后仍可能继续调用，破坏费用保护。  
+**Symptom：** OpenRouter 免费模型验证存在进程级缓存，目录验证失败时可能使用旧结果继续请求。
+**Source：** Fail Closed / Single Source of Truth。
+**Consequence：** 模型价格或账户状态变化后仍可能继续调用，破坏费用保护。
 **Remedy：** 已移除共享验证缓存，恢复每次调用实时验证；目录不可用、模型缺失或价格非零时立即阻断。相关测试 20 项通过。
 
 ### 内容配置保护
 
-**Symptom：** GUI 开始任务时会重写 `config/content_direction.yaml`，只保留方向字段。  
-**Source：** Shotgun Surgery / Data Ownership。  
-**Consequence：** 用户设置的视频时长、预算、风格和平台可能被静默删除。  
+**Symptom：** GUI 开始任务时会重写 `config/content_direction.yaml`，只保留方向字段。
+**Source：** Shotgun Surgery / Data Ownership。
+**Consequence：** 用户设置的视频时长、预算、风格和平台可能被静默删除。
 **Remedy：** 已改为仅更新 `direction`，保留所有其他 YAML 字段，并采用原子写入。
 
 ### 密钥移出工程
 
-**Symptom：** 项目 `.env` 中曾保存一枚真实 OpenRouter API Key。  
-**Source：** Secrets Management / Least Exposure。  
-**Consequence：** 项目被复制、压缩或同步时可能泄露账号资源。  
+**Symptom：** 项目 `.env` 中曾保存一枚真实 OpenRouter API Key。
+**Source：** Secrets Management / Least Exposure。
+**Consequence：** 项目被复制、压缩或同步时可能泄露账号资源。
 **Remedy：** 已将密钥迁移到当前 Windows 用户的 DPAPI 加密凭据文件，并从项目 `.env` 删除；GUI 保存密钥时不再写入工程文件。
 
 > 由于该密钥曾以明文落盘，仍建议在 OpenRouter 后台轮换一次密钥。
 
 ### 日志脱敏
 
-**Symptom：** GUI 内存日志未统一经过脱敏函数。  
-**Source：** Defense in Depth。  
-**Consequence：** 外部 CLI 异常可能把 Token、Cookie 或用户路径显示在界面并被复制。  
+**Symptom：** GUI 内存日志未统一经过脱敏函数。
+**Source：** Defense in Depth。
+**Consequence：** 外部 CLI 异常可能把 Token、Cookie 或用户路径显示在界面并被复制。
 **Remedy：** GUI `_log()` 已统一调用 `sanitize_error()`，并增加回归测试。
 
 ### M2与M6稳定性
@@ -74,22 +74,22 @@
 
 ### GUI后台线程直接访问Tkinter
 
-**级别：** 高  
+**级别：** 高
 **Symptom：** `src/aicf/settings_dialog.py` 中多个工作线程直接调用 `self.after()`，
-位置包括第 350–364、438–450、476–483、661–693、839–842 行。  
-**Source：** Dependency Disorder / Concurrency Boundary。  
+位置包括第 350–364、438–450、476–483、661–693、839–842 行。
+**Source：** Dependency Disorder / Concurrency Boundary。
 **Consequence：** 快速关闭窗口或重复检测时，可能出现 `main thread is not in main loop`、
-`invalid command name`、状态被旧结果覆盖或窗口无响应。  
+`invalid command name`、状态被旧结果覆盖或窗口无响应。
 **Remedy：** 工作线程只写入 `queue.Queue`，所有控件读取和更新统一由主线程轮询；
 每轮检测增加 generation ID，丢弃迟到结果。
 
 ### GUI自动化覆盖不足
 
-**级别：** 高  
+**级别：** 高
 **Symptom：** 总覆盖率 60.87%，`gui.py` 约 10%，`settings_dialog.py` 约 13%，
-低于 `pyproject.toml` 设置的 80% 门槛。  
-**Source：** Test Pyramid / Humble Object。  
-**Consequence：** 登录、窗口关闭、重复点击、配置保存和后台检测的回归无法被自动发现。  
+低于 `pyproject.toml` 设置的 80% 门槛。
+**Source：** Test Pyramid / Humble Object。
+**Consequence：** 登录、窗口关闭、重复点击、配置保存和后台检测的回归无法被自动发现。
 **Remedy：** 拆出可测试的纯逻辑层，并增加窗口生命周期、登录、配置迁移、任务冲突和
 异步检测测试；覆盖率达到 80% 后再发布稳定版。
 
@@ -126,8 +126,8 @@ GUI 模型选择器在 `src/aicf/gui.py` 第 325–330 行自行判断价格，�
 
 ## 健康评分
 
-**Mode：** Health Dashboard  
-**Scope：** 整个 `ai_content_factory` 工程  
+**Mode：** Health Dashboard
+**Scope：** 整个 `ai_content_factory` 工程
 **Composite Score：** 85/100
 
 | 维度 | 分数 | 主要问题 |

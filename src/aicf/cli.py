@@ -12,9 +12,11 @@ import yaml
 from PIL import Image
 
 from .autopilot import Autopilot
+from .background_worker import WorkerLauncher, run_worker, worker_status
 from .cache import FileCache
 from .config import load_config
 from .database import JobRepository
+from .delivery_view import finalize_user_delivery, migrate_legacy_job
 from .doctor import Doctor
 from .engines.m6_engine import M6Pipeline, RepairEngine
 from .engines.narration_engine import NarrationPipeline
@@ -190,6 +192,7 @@ def build_autopilot(job_repository: JobRepository) -> Autopilot:
         ),
         config=config,
         voice_validator=VoiceValidator(build_optional_asr()),
+        user_output_root=root / "outputs",
     )
 
 
@@ -270,6 +273,15 @@ def build_parser() -> argparse.ArgumentParser:
     retry.add_argument("--stage", required=True, choices=[s.value for s in PipelineStage])
     autopilot = subparsers.add_parser("autopilot")
     autopilot.add_argument("--job", required=True)
+    worker_start = subparsers.add_parser("worker-start")
+    worker_start.add_argument("--job", required=True)
+    worker_run = subparsers.add_parser("worker-run")
+    worker_run.add_argument("--job", required=True)
+    worker_status_parser = subparsers.add_parser("worker-status")
+    worker_status_parser.add_argument("--job", required=True)
+    finalize_delivery = subparsers.add_parser("finalize-delivery")
+    finalize_delivery.add_argument("--job", required=True)
+    finalize_delivery.add_argument("--migrate-legacy", action="store_true")
     content_run = subparsers.add_parser("content-run")
     content_run.add_argument("--job", required=True)
     subparsers.add_parser("ui")
@@ -437,11 +449,61 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0 if result.get("status") == "ready_to_publish" else 1
     repo = repository()
+    if args.command == "finalize-delivery":
+        status = repo.get_job(args.job)
+        job_dir = Path(status.output_dir)
+        user_dir = project_root() / "outputs" / args.job
+        if args.migrate_legacy and job_dir.resolve() == user_dir.resolve():
+            result = migrate_legacy_job(
+                repo,
+                args.job,
+                job_dir,
+                project_root() / "data" / "jobs" / args.job,
+                user_dir,
+            )
+        else:
+            result = finalize_user_delivery(job_dir, user_dir)
+        print(
+            json.dumps(
+                {"status": "READY", "output_dir": str(result.output_dir)},
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+    if args.command in {"worker-start", "worker-run", "worker-status"}:
+        try:
+            status = repo.get_job(args.job)
+        except KeyError:
+            status = repo.create_job(
+                args.job,
+                project_root() / "data" / "jobs" / args.job,
+            )
+        job_dir = Path(status.output_dir)
+        if args.command == "worker-start":
+            result = WorkerLauncher(python_executable=sys.executable).start(
+                args.job,
+                job_dir,
+                project_root=project_root(),
+            )
+            print(result.model_dump_json(indent=2))
+            return 0
+        if args.command == "worker-status":
+            print(json.dumps(worker_status(job_dir), ensure_ascii=False, indent=2))
+            return 0
+        return run_worker(
+            args.job,
+            job_dir,
+            run_autopilot=lambda job_id: build_autopilot(repo).run(job_id),
+        )
     if args.command == "autopilot":
         try:
             repo.get_job(args.job)
         except KeyError:
-            repo.create_job(args.job, project_root() / "outputs" / args.job)
+            repo.create_job(
+                args.job,
+                project_root() / "data" / "jobs" / args.job,
+            )
         try:
             result = build_autopilot(repo).run(args.job)
         except FileNotFoundError as error:
@@ -460,7 +522,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0 if result.get("status") == "READY_TO_PUBLISH" else 1
     if args.command == "init-job":
-        output_dir = project_root() / "outputs" / args.job
+        output_dir = project_root() / "data" / "jobs" / args.job
         _print_status(repo.create_job(args.job, output_dir))
         return 0
     if args.command == "status":

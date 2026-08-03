@@ -17,6 +17,7 @@ JimengModel = Literal[
     "seedance2.0_vip",
     "seedance2.0fast_vip",
     "seedance2.0mini",
+    "seedance2.5",
 ]
 KlingModel = Literal[
     "kling-video-v2_6",
@@ -93,6 +94,7 @@ VIDEO_PROVIDER_DISPLAY_NAMES: dict[str, str] = {
 
 # 即梦模型中文显示名称
 JIMENG_MODEL_DISPLAY_NAMES: dict[str, str] = {
+    "seedance2.5": "Seedance 2.5 高品质",
     "seedance2.0fast": "Seedance 2.0 极速",
     "seedance2.0": "Seedance 2.0 标准",
     "seedance2.0_vip": "Seedance 2.0 高清VIP",

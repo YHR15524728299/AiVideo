@@ -153,6 +153,20 @@ class JobRepository:
             ).fetchall()
         return [JobStatus.model_validate_json(row["status_json"]) for row in rows]
 
+    def relocate_output_dir(
+        self,
+        job_id: str,
+        output_dir: str | Path,
+    ) -> JobStatus:
+        destination = Path(output_dir).resolve()
+        if not destination.is_dir():
+            raise FileNotFoundError(f"新任务工作目录不存在: {destination}")
+
+        def mutate(status: JobStatus) -> None:
+            status.output_dir = str(destination)
+
+        return self._mutate(job_id, mutate)
+
     def start_stage(self, job_id: str, stage: PipelineStage) -> JobStatus:
         def mutate(status: JobStatus) -> None:
             self._assert_not_completed(status)
@@ -651,8 +665,8 @@ class JobRepository:
         status.updated_at = utc_now()
         payload = status.model_dump_json()
         connection.execute(
-            "UPDATE jobs SET status_json = ?, updated_at = ? WHERE job_id = ?",
-            (payload, status.updated_at, status.job_id),
+            "UPDATE jobs SET output_dir = ?, status_json = ?, updated_at = ? WHERE job_id = ?",
+            (status.output_dir, payload, status.updated_at, status.job_id),
         )
 
     @staticmethod

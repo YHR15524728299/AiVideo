@@ -4,6 +4,7 @@ from aicf.gui import (
     build_production_settings,
     final_video_for_job,
     update_direction_config,
+    worker_start_command,
 )
 from aicf.production_settings import ProductionSettings
 
@@ -61,6 +62,21 @@ def test_final_video_uses_frozen_platform_order(tmp_path: Path) -> None:
     douyin.write_bytes(b"video")
 
     assert final_video_for_job(job_dir) == douyin
+
+
+def test_final_video_prefers_flat_user_delivery(tmp_path: Path) -> None:
+    job_dir = tmp_path / "data" / "jobs" / "JOB001"
+    user_dir = tmp_path / "outputs" / "JOB001"
+    user_dir.mkdir(parents=True)
+    final = user_dir / "最终视频.mp4"
+    final.write_bytes(b"video")
+
+    assert final_video_for_job(job_dir, user_dir) == final
+
+
+def test_gui_starts_detached_worker_command() -> None:
+    command = worker_start_command("JOB001")
+    assert command[-4:] == ["aicf", "worker-start", "--job", "JOB001"]
 
 
 def test_update_direction_config_preserves_other_settings(tmp_path: Path) -> None:

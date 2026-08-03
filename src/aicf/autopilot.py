@@ -7,6 +7,8 @@ import time
 from pathlib import Path
 from typing import Any
 from urllib.error import URLError
+from .delivery_view import finalize_user_delivery
+from urllib.error import URLError
 
 from aicf.config import AppConfig
 from aicf.database import JobRepository
@@ -38,6 +40,7 @@ class Autopilot:
         renderer: object | None = None,
         config: AppConfig | None = None,
         voice_validator: VoiceValidator | None = None,
+        user_output_root: str | Path | None = None,
     ) -> None:
         self.repository = repository
         self.m6_pipeline = m6_pipeline
@@ -48,6 +51,9 @@ class Autopilot:
         self.renderer = renderer
         self.config = config
         self.voice_validator = voice_validator or VoiceValidator()
+        self.user_output_root = (
+            Path(user_output_root) if user_output_root is not None else None
+        )
         self.sleep = time.sleep
 
     def run(self, job_id: str) -> dict[str, Any]:
@@ -72,7 +78,9 @@ class Autopilot:
             status = self.repository.get_job(job_id)
             job_dir = Path(status.output_dir)
             if status.current_stage == PipelineStage.COMPLETED:
-                return self._completed_manifest(job_id, job_dir)
+                manifest = self._completed_manifest(job_id, job_dir)
+                self._finalize_user_delivery(job_id, job_dir, manifest)
+                return manifest
 
             content_result = self._ensure_content(job_id, job_dir)
             if content_result is not None:
@@ -173,7 +181,9 @@ class Autopilot:
                 PipelineStage.COMPLETED,
                 [job_dir / "delivery" / "publish_manifest.json"],
             )
-            return completed or manifest
+            result = completed or manifest
+            self._finalize_user_delivery(job_id, job_dir, result)
+            return result
         # 理论上不会到这里
         return {"status": "FAILED_RETRYABLE", "reason": "重试耗尽", "recovery_command": f"python -m aicf resume --job {job_id}"}
 
@@ -800,6 +810,19 @@ class Autopilot:
 
     def _load_delivery_manifest(self, job_dir: Path) -> dict[str, Any]:
         return self._read_json(job_dir / "delivery" / "publish_manifest.json")
+
+    def _finalize_user_delivery(
+        self,
+        job_id: str,
+        job_dir: Path,
+        manifest: dict[str, Any],
+    ) -> None:
+        if (
+            self.user_output_root is None
+            or manifest.get("status") != "READY_TO_PUBLISH"
+        ):
+            return
+        finalize_user_delivery(job_dir, self.user_output_root / job_id)
 
     def _load_inputs(self, job_id: str, job_dir: Path) -> dict[str, object]:
         final_dir = job_dir / "final"

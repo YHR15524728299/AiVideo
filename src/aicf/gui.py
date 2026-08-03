@@ -30,6 +30,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from .atomic_io import atomic_write_text
+from .background_worker import read_worker_record
 from .config import load_config
 from .database import JobRepository
 from .file_lock import lock_is_active
@@ -105,7 +106,14 @@ def build_production_settings(
     )
 
 
-def final_video_for_job(job_dir: str | Path) -> Path | None:
+def final_video_for_job(
+    job_dir: str | Path,
+    user_output_dir: str | Path | None = None,
+) -> Path | None:
+    if user_output_dir is not None:
+        user_video = Path(user_output_dir) / "最终视频.mp4"
+        if user_video.is_file():
+            return user_video
     root = Path(job_dir)
     settings = ProductionSettings.load_for_job(root)
     for platform in settings.selected_platforms:
@@ -113,6 +121,17 @@ def final_video_for_job(job_dir: str | Path) -> Path | None:
         if video.is_file():
             return video
     return None
+
+
+def worker_start_command(job_id: str) -> list[str]:
+    return [
+        python_executable(),
+        "-m",
+        "aicf",
+        "worker-start",
+        "--job",
+        job_id,
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -945,7 +964,10 @@ class AicfGUI:
             self._log_menu.grab_release()
 
     def _get_job_dir(self, job_id: str) -> Path:
-        return project_root() / "outputs" / job_id
+        try:
+            return Path(self._get_repo().get_job(job_id).output_dir)
+        except KeyError:
+            return project_root() / "data" / "jobs" / job_id
 
     def _get_status_path(self, job_id: str) -> Path:
         return self._get_job_dir(job_id) / "status.json"
@@ -1550,15 +1572,12 @@ class AicfGUI:
         self._refresh_status_for_job(self._display_job_id)
 
     def _auto_detect_and_poll(self) -> None:
-        """启动时自动检测 outputs 目录中是否有正在运行的任务，自动开始跟踪。"""
-        outputs = project_root() / "outputs"
-        if not outputs.is_dir():
-            return
+        """启动时从数据库检测正在运行的任务并自动跟踪。"""
         terminal_states = {"COMPLETED", "INIT", "FAILED_RETRYABLE", "FAILED_NEEDS_ATTENTION"}
         running_jobs: list[tuple[float, Path]] = []
-        for job_dir in outputs.iterdir():
-            if not job_dir.is_dir():
-                continue
+        statuses = self._get_repo().list_jobs()
+        for status in statuses:
+            job_dir = Path(status.output_dir)
             sp = job_dir / "status.json"
             if not sp.is_file():
                 continue
@@ -1598,13 +1617,8 @@ class AicfGUI:
             self._highlight_selected_job()
         else:
             # 无运行任务，默认显示最新任务的状态
-            all_jobs = sorted(
-                [p for p in outputs.iterdir() if p.is_dir()],
-                key=lambda p: p.stat().st_mtime,
-                reverse=True,
-            )
-            if all_jobs:
-                self._display_job_id = all_jobs[0].name
+            if statuses:
+                self._display_job_id = statuses[0].job_id
                 self.job_tree.selection_set(self._display_job_id)
                 self.job_tree.focus(self._display_job_id)
                 self._highlight_selected_job()
@@ -1636,16 +1650,10 @@ class AicfGUI:
 
     def _detect_running_job(self) -> None:
         """检测当前是否有正在运行的任务，更新 _polling_job_id 和按钮状态。"""
-        outputs = project_root() / "outputs"
-        if not outputs.is_dir():
-            self._polling_job_id = ""
-            self._set_buttons_running(False)
-            return
         terminal_states = {"COMPLETED", "INIT", "FAILED_RETRYABLE", "FAILED_NEEDS_ATTENTION"}
         newest_running: tuple[float, str] | None = None
-        for job_dir in outputs.iterdir():
-            if not job_dir.is_dir():
-                continue
+        for status in self._get_repo().list_jobs():
+            job_dir = Path(status.output_dir)
             sp = job_dir / "status.json"
             if not sp.is_file():
                 continue
@@ -1823,18 +1831,21 @@ class AicfGUI:
         self._user_selected_job = False
         self._ensure_direction_file()
         try:
+            repo = self._get_repo()
+            try:
+                repo.get_job(job_id)
+            except KeyError:
+                repo.create_job(job_id, self._get_job_dir(job_id))
             settings = self._collect_production_settings()
             if settings is None:
                 return
-            settings.freeze_for_job(
-                self._get_job_dir(job_id)
-            )
+            settings.save_for_job(self._get_job_dir(job_id))
         except ValueError as error:
             messagebox.showerror("生产设置无效", str(error))
             return
         self._log(f"任务 [{job_id}] 开始生成", "info")
         self._run_command_async(
-            [python_executable(), "-m", "aicf", "autopilot", "--job", job_id],
+            worker_start_command(job_id),
             env_extra={"AICF_PROJECT_ROOT": str(project_root())},
         )
 
@@ -1850,18 +1861,20 @@ class AicfGUI:
         self._load_job_production_settings(job_id)
         self._log(f"任务 [{job_id}] 继续/恢复", "info")
         self._run_command_async(
-            [python_executable(), "-m", "aicf", "resume", "--job", job_id],
+            worker_start_command(job_id),
             env_extra={"AICF_PROJECT_ROOT": str(project_root())},
         )
 
     def _stop_job(self) -> None:
-        if self.current_process and self.running:
+        job_id = self._polling_job_id or self._current_job_id()
+        record = read_worker_record(self._get_job_dir(job_id)) if job_id else None
+        if record and record.finished_at is None:
             if not messagebox.askyesno(
                 "确认停止",
                 "确定要停止当前正在运行的任务吗？\n已生成的部分资源会被保留。",
             ):
                 return
-            pid = self.current_process.pid
+            pid = record.pid
             self._log(f"正在停止任务 (PID={pid})...", "info")
             try:
                 # Windows: 使用 taskkill /T /F 终止整个进程树
@@ -1871,10 +1884,7 @@ class AicfGUI:
                     timeout=10,
                 )
             except Exception:
-                try:
-                    self.current_process.terminate()
-                except Exception:
-                    pass
+                pass
             self._log("已发送停止信号", "info")
 
     def _current_job_id(self) -> str:
@@ -1976,13 +1986,8 @@ class AicfGUI:
     def _refresh_job_list(self) -> None:
         current_selection = self.job_tree.selection()
         self.job_tree.delete(*self.job_tree.get_children())
-        outputs = project_root() / "outputs"
-        if not outputs.is_dir():
-            return
-        jobs = sorted(outputs.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
-        for job_dir in jobs:
-            if not job_dir.is_dir():
-                continue
+        for status in self._get_repo().list_jobs():
+            job_dir = Path(status.output_dir)
             sp = job_dir / "status.json"
             status_text = "未开始"
             stage_text = "-"
@@ -2023,8 +2028,8 @@ class AicfGUI:
                     status_text = "状态异常"
 
             self.job_tree.insert(
-                "", "end", iid=job_dir.name,
-                values=(job_dir.name, status_text, stage_text, updated),
+                "", "end", iid=status.job_id,
+                values=(status.job_id, status_text, stage_text, updated),
             )
         if current_selection:
             existing = [item for item in current_selection if self.job_tree.exists(item)]
@@ -2062,7 +2067,7 @@ class AicfGUI:
         if not job_id:
             path = project_root() / "outputs"
         else:
-            path = self._get_job_dir(job_id)
+            path = project_root() / "outputs" / job_id
             if not path.is_dir():
                 path = project_root() / "outputs"
         path.mkdir(parents=True, exist_ok=True)
@@ -2073,7 +2078,10 @@ class AicfGUI:
         if not job_id:
             messagebox.showwarning("提示", "请先选择任务")
             return
-        video = final_video_for_job(self._get_job_dir(job_id))
+        video = final_video_for_job(
+            self._get_job_dir(job_id),
+            project_root() / "outputs" / job_id,
+        )
         if video is None:
             messagebox.showwarning("提示", "所选平台尚无最终视频")
             return
@@ -2131,6 +2139,26 @@ class AicfGUI:
         stages_info = data.get("stages", {})
         if not isinstance(stages_info, dict):
             return
+        worker_log = job_dir / "_work" / "runtime" / "worker.log"
+        if worker_log.is_file():
+            cache_key = f"{job_id}/worker.log"
+            last_pos = self._log_file_offsets.get(cache_key, 0)
+            try:
+                size = worker_log.stat().st_size
+                if size < last_pos:
+                    last_pos = 0
+                if size > last_pos:
+                    with worker_log.open(
+                        "r", encoding="utf-8", errors="replace"
+                    ) as handle:
+                        handle.seek(last_pos)
+                        content = handle.read()
+                    self._log_file_offsets[cache_key] = size
+                    for line in content.splitlines():
+                        if line.strip():
+                            self._log(line.rstrip(), "")
+            except OSError:
+                pass
         # 读取所有有 log_path 的阶段日志
         for stage_key, stage_info in stages_info.items():
             if not isinstance(stage_info, dict):
@@ -2231,24 +2259,6 @@ class AicfGUI:
     # ------------------------------------------------------------------
     def _on_close(self) -> None:
         self._stop_preview()
-        # 如果有任务正在运行，提示用户
-        if self.current_process and self.current_process.poll() is None:
-            confirm = messagebox.askyesno(
-                "确认退出",
-                "当前有任务正在生成中，关闭窗口将中断任务。\n\n下次打开时可以点击「继续/恢复」从断点继续。\n\n确定要退出吗？",
-                icon="warning",
-            )
-            if not confirm:
-                return
-            # 终止正在运行的子进程
-            try:
-                self.current_process.terminate()
-                self.current_process.wait(timeout=5)
-            except Exception:
-                try:
-                    self.current_process.kill()
-                except Exception:
-                    pass
         self.root.destroy()
 
     def run(self) -> None:

@@ -13,7 +13,7 @@
 - 已完成从 direction 到 `ready_to_publish` 的内容编排；审核不通过时停在 `needs_revision`，不会生成发布包。
 - M0-M6 已具备代码与自动化测试；真实作业 `M2REAL001` 当前等待可用的 Dreamina CLI/凭据后继续。
 - M7 当前只生成本地发布包，不会调用任何平台上传或发布 API。
-- `run_autopilot.ps1` 仍只执行基础就绪检查，不会伪装成完整成片流程。
+- `worker-start` 会启动独立后台 Worker；关闭 GUI 不会中断任务。
 
 ## 安装
 
@@ -77,11 +77,14 @@ $env:JIMENG_CLI_EXECUTABLE = "真实即梦CLI命令"
 .\scripts\doctor.ps1
 .\scripts\test.ps1
 .\.venv\Scripts\python.exe -m aicf tts-smoke --output outputs\tts_smoke.wav
-.\.venv\Scripts\python.exe -m aicf batch-synthesize --script outputs\M2E2E001\script.json --output-dir outputs\M2E2E001\audio
-.\.venv\Scripts\python.exe -m aicf render --audio outputs\M2E2E001\audio\voiceover.wav --subtitles outputs\M2E2E001\audio\subtitles.ass --output outputs\M2E2E001\final\integration_sample.mp4 --duration 10.166 --title "AI视频不稳定，先别怪模型"
+.\.venv\Scripts\python.exe -m aicf batch-synthesize --script data\jobs\M2E2E001\script.json --output-dir data\jobs\M2E2E001\audio
+.\.venv\Scripts\python.exe -m aicf render --visual-plan data\jobs\M2E2E001\visual_plan.json --audio data\jobs\M2E2E001\audio\voiceover.wav --subtitles data\jobs\M2E2E001\audio\subtitles.ass --output data\jobs\M2E2E001\final\integration_sample.mp4 --title "AI视频不稳定，先别怪模型"
 .\.venv\Scripts\python.exe -m aicf init-job --job JOB001
 .\.venv\Scripts\python.exe -m aicf status --job JOB001
 .\.venv\Scripts\python.exe -m aicf resume --job JOB001
+.\.venv\Scripts\python.exe -m aicf worker-start --job JOB001
+.\.venv\Scripts\python.exe -m aicf worker-status --job JOB001
+.\.venv\Scripts\python.exe -m aicf finalize-delivery --job JOB001
 .\.venv\Scripts\python.exe -m aicf retry --job JOB001 --stage DIRECTION_LOADED
 ```
 
@@ -92,9 +95,42 @@ $env:JIMENG_CLI_EXECUTABLE = "真实即梦CLI命令"
 Job 状态同时写入：
 
 - `data\content.db`
-- `outputs\<job_id>\status.json`
+- `data\jobs\<job_id>\status.json`
 
 每个阶段记录开始/完成时间、调用次数、重试次数、错误、日志路径、可恢复性和恢复命令。成功阶段保留在 `completed_stages`，失败不会清除已完成结果。
+
+## 最终文件
+
+每个任务完成后，用户只需打开 `outputs\<job_id>\`：
+
+```text
+最终视频.mp4
+无字幕视频.mp4
+封面.jpg
+发布文案.md
+验收摘要.json
+```
+
+研究、素材、字幕、母版、QA和恢复记录位于 `data\jobs\<job_id>\`，不与最终
+文件混放，也不会提交到 Git。
+
+## 锁屏后台运行
+
+GUI 通过独立 Worker 启动任务。任务运行期间：
+
+- Windows 可以锁屏，GUI 可以关闭；
+- Worker 使用 `SetThreadExecutionState`临时阻止系统自动睡眠；
+- 任务完成或失败后自动释放电源请求并退出；
+- 重新打开 GUI 后从 SQLite 状态和 Worker 日志恢复显示；
+- 用户主动关机、注销或强制睡眠不在支持范围内。
+
+停止任务必须使用 GUI 的“停止”按钮。不要通过状态查询探测或终止进程。
+
+## GitHub 隐私边界
+
+`.gitignore`排除 `outputs/`、`data/`、`logs/`、`.env*`、个人YAML配置和媒体
+产物。发布代码时只显式暂存源码、测试、示例配置和文档；禁止使用
+`git add -A`提交运行工作区。
 
 所有临时文件/目录到正式路径的原子替换统一由 `aicf.atomic_io.atomic_replace` 执行。仅 Windows 的共享冲突 `WinError 5/32` 使用指数短重试，总等待不超过 1 秒；其他系统或错误立即原样抛出。
 
@@ -128,9 +164,8 @@ uv run --extra dev pytest
 uv run --extra dev pytest --cov=aicf --cov-report=term-missing
 ```
 
-当前整体覆盖率为 60.87%，尚未达到工程配置的 80% 质量门槛。主要缺口集中在
-Tkinter GUI 和设置窗口，发布前仍需补充窗口生命周期、异步检测、登录流程和
-配置保存的自动化测试。
+完整测试以 `pytest`退出码为准；GUI窗口生命周期、后台Worker、电源请求、设置
+保存和扁平交付均有独立回归测试。
 
 ## 已知环境结果
 

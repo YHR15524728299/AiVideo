@@ -75,7 +75,8 @@ def test_cli_init_job_status_and_resume_use_project_database(
     assert main(["resume", "--job", "JOB-中文"]) == 0
     resume_output = json.loads(capsys.readouterr().out)
     assert resume_output["status"] == "READY_TO_PUBLISH"
-    assert (tmp_path / "outputs" / "JOB-中文" / "status.json").exists()
+    assert (tmp_path / "data" / "jobs" / "JOB-中文" / "status.json").exists()
+    assert not (tmp_path / "outputs" / "JOB-中文" / "status.json").exists()
 
 
 def _failed_attention_job(tmp_path: Path, job_id: str) -> JobRepository:
@@ -155,7 +156,7 @@ def test_cli_rebuild_status_snapshot_from_sqlite(
 ) -> None:
     monkeypatch.setenv("AICF_PROJECT_ROOT", str(tmp_path))
     assert main(["init-job", "--job", "JOB-REBUILD"]) == 0
-    snapshot = tmp_path / "outputs" / "JOB-REBUILD" / "status.json"
+    snapshot = tmp_path / "data" / "jobs" / "JOB-REBUILD" / "status.json"
     snapshot.unlink()
 
     assert main(["rebuild-snapshot", "--job", "JOB-REBUILD"]) == 0

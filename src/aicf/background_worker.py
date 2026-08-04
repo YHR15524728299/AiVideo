@@ -12,7 +12,6 @@ import uuid
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 from datetime import datetime, timezone
-from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +19,14 @@ from pydantic import BaseModel
 
 from .atomic_io import atomic_write_text
 from .file_lock import os_file_lock
+from .process_identity import (
+    ProcessIdentity,
+    ProcessProbe,
+    ProcessProbeStatus,
+    get_process_identity,
+    probe_process_identity,
+    process_is_running,
+)
 
 
 def _now() -> str:
@@ -46,23 +53,6 @@ class WorkerStartResult(BaseModel):
     pid: int
     reused: bool
     log_path: str
-
-
-class ProcessIdentity(BaseModel):
-    pid: int
-    created_at_ns: int
-    executable: str
-
-
-class ProcessProbeStatus(str, Enum):
-    RUNNING = "RUNNING"
-    NOT_RUNNING = "NOT_RUNNING"
-    UNKNOWN = "UNKNOWN"
-
-
-class ProcessProbe(BaseModel):
-    status: ProcessProbeStatus
-    identity: ProcessIdentity | None = None
 
 
 class WorkerIdentityError(RuntimeError):
@@ -185,126 +175,6 @@ def write_worker_record(job_dir: str | Path, record: WorkerRecord) -> None:
         worker_record_path(job_dir),
         record.model_dump_json(indent=2) + "\n",
     )
-
-
-def probe_process_identity(pid: int) -> ProcessProbe:
-    if pid <= 0:
-        return ProcessProbe(status=ProcessProbeStatus.NOT_RUNNING)
-    if os.name == "nt":
-        process_query_limited_information = 0x1000
-        still_active = 259
-
-        class FileTime(ctypes.Structure):
-            _fields_ = [
-                ("low", ctypes.c_ulong),
-                ("high", ctypes.c_ulong),
-            ]
-
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.OpenProcess.argtypes = [
-            ctypes.c_ulong,
-            ctypes.c_int,
-            ctypes.c_ulong,
-        ]
-        kernel32.OpenProcess.restype = ctypes.c_void_p
-        kernel32.GetExitCodeProcess.argtypes = [
-            ctypes.c_void_p,
-            ctypes.POINTER(ctypes.c_ulong),
-        ]
-        kernel32.GetExitCodeProcess.restype = ctypes.c_int
-        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
-        kernel32.CloseHandle.restype = ctypes.c_int
-        kernel32.GetProcessTimes.argtypes = [
-            ctypes.c_void_p,
-            ctypes.POINTER(FileTime),
-            ctypes.POINTER(FileTime),
-            ctypes.POINTER(FileTime),
-            ctypes.POINTER(FileTime),
-        ]
-        kernel32.GetProcessTimes.restype = ctypes.c_int
-        kernel32.QueryFullProcessImageNameW.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_ulong,
-            ctypes.c_wchar_p,
-            ctypes.POINTER(ctypes.c_ulong),
-        ]
-        kernel32.QueryFullProcessImageNameW.restype = ctypes.c_int
-        handle = kernel32.OpenProcess(
-            process_query_limited_information,
-            False,
-            pid,
-        )
-        if not handle:
-            error_code = ctypes.get_last_error()
-            status = (
-                ProcessProbeStatus.NOT_RUNNING
-                if error_code == 87
-                else ProcessProbeStatus.UNKNOWN
-            )
-            return ProcessProbe(status=status)
-        try:
-            exit_code = ctypes.c_ulong()
-            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
-                return ProcessProbe(status=ProcessProbeStatus.UNKNOWN)
-            if exit_code.value != still_active:
-                return ProcessProbe(status=ProcessProbeStatus.NOT_RUNNING)
-            creation = FileTime()
-            exit_time = FileTime()
-            kernel_time = FileTime()
-            user_time = FileTime()
-            if not kernel32.GetProcessTimes(
-                handle,
-                ctypes.byref(creation),
-                ctypes.byref(exit_time),
-                ctypes.byref(kernel_time),
-                ctypes.byref(user_time),
-            ):
-                return ProcessProbe(status=ProcessProbeStatus.UNKNOWN)
-            size = ctypes.c_ulong(32768)
-            image = ctypes.create_unicode_buffer(size.value)
-            if not kernel32.QueryFullProcessImageNameW(
-                handle,
-                0,
-                image,
-                ctypes.byref(size),
-            ):
-                return ProcessProbe(status=ProcessProbeStatus.UNKNOWN)
-            created_at_ns = ((creation.high << 32) | creation.low) * 100
-            return ProcessProbe(
-                status=ProcessProbeStatus.RUNNING,
-                identity=ProcessIdentity(
-                    pid=pid,
-                    created_at_ns=created_at_ns,
-                    executable=str(Path(image.value).resolve()),
-                ),
-            )
-        finally:
-            kernel32.CloseHandle(handle)
-    proc_dir = Path(f"/proc/{pid}")
-    if not proc_dir.exists():
-        return ProcessProbe(status=ProcessProbeStatus.NOT_RUNNING)
-    try:
-        stat_fields = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split()
-        executable = str(Path(f"/proc/{pid}/exe").resolve(strict=True))
-    except (OSError, SystemError):
-        return ProcessProbe(status=ProcessProbeStatus.UNKNOWN)
-    return ProcessProbe(
-        status=ProcessProbeStatus.RUNNING,
-        identity=ProcessIdentity(
-            pid=pid,
-            created_at_ns=int(stat_fields[21]),
-            executable=executable,
-        ),
-    )
-
-
-def get_process_identity(pid: int) -> ProcessIdentity | None:
-    probe = probe_process_identity(pid)
-    return probe.identity if probe.status == ProcessProbeStatus.RUNNING else None
-
-
-def process_is_running(pid: int) -> bool:
-    return probe_process_identity(pid).status == ProcessProbeStatus.RUNNING
 
 
 def _identity_matches(record: WorkerRecord, identity: ProcessIdentity | None) -> bool:

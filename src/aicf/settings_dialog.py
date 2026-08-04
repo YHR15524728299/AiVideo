@@ -857,6 +857,7 @@ class SettingsDialog(Toplevel):
         self.transient(master)
         self.grab_set()
         self._on_saved = on_saved
+        self.after_idle(self._bring_to_front)
 
         env_path = _root() / ".env"
         outer = ttk.Frame(self, padding=8)
@@ -905,6 +906,24 @@ class SettingsDialog(Toplevel):
         self.after(6500, self._refresh_ov)
         if first_time:
             self.after(800, self._welcome)
+
+    def _bring_to_front(self) -> None:
+        """确保模态设置窗口不会被主窗口遮挡。"""
+        self.update_idletasks()
+        master = self.master
+        if master is not None:
+            x = master.winfo_rootx() + max(
+                0, (master.winfo_width() - self.winfo_width()) // 2
+            )
+            y = master.winfo_rooty() + max(
+                0, (master.winfo_height() - self.winfo_height()) // 2
+            )
+            self.geometry(f"+{x}+{y}")
+        self.deiconify()
+        self.lift()
+        self.attributes("-topmost", True)
+        self.after(100, lambda: self.attributes("-topmost", False))
+        self.focus_force()
 
     def _refresh_all(self):
         self.vp._detect_jm()

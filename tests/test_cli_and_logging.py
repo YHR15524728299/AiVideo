@@ -12,7 +12,7 @@ import pytest
 from aicf.cli import main
 from aicf.database import JobRepository
 from aicf.logging_utils import configure_logging, sanitize_error
-from aicf.state_machine import PipelineStage
+from aicf.state_machine import ORDERED_STAGES, PipelineStage
 
 
 def test_importing_cli_does_not_replace_process_streams() -> None:
@@ -77,6 +77,34 @@ def test_cli_init_job_status_and_resume_use_project_database(
     assert resume_output["status"] == "READY_TO_PUBLISH"
     assert (tmp_path / "data" / "jobs" / "JOB-中文" / "status.json").exists()
     assert not (tmp_path / "outputs" / "JOB-中文" / "status.json").exists()
+
+
+def test_worker_start_rejects_completed_job_before_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("AICF_PROJECT_ROOT", str(tmp_path))
+    repo = JobRepository(tmp_path / "data" / "content.db")
+    repo.create_job("JOB-DONE", tmp_path / "data" / "jobs" / "JOB-DONE")
+    for stage in ORDERED_STAGES:
+        repo.start_stage("JOB-DONE", stage)
+        repo.complete_stage("JOB-DONE", stage)
+        if stage == PipelineStage.COMPLETED:
+            break
+
+    class FailIfLaunched:
+        def __init__(self, **_kwargs: object) -> None:
+            pytest.fail("已完成任务不应构造 WorkerLauncher")
+
+    monkeypatch.setattr("aicf.cli.WorkerLauncher", FailIfLaunched)
+
+    assert main(["worker-start", "--job", "JOB-DONE"]) == 2
+
+    result = json.loads(capsys.readouterr().out)
+    assert result["status"] == "ALREADY_COMPLETED"
+    assert result["job_id"] == "JOB-DONE"
+    assert "新任务ID" in result["next_action"]
 
 
 def _failed_attention_job(tmp_path: Path, job_id: str) -> JobRepository:

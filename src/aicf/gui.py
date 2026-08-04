@@ -34,6 +34,13 @@ from .background_worker import WorkerIdentityError, read_worker_record, stop_wor
 from .config import load_config
 from .database import JobRepository
 from .file_lock import lock_is_active
+from .job_actions import (
+    JobActionState,
+    derive_job_actions,
+    failed_attention_can_auto_reopen,
+    first_available_job_id,
+    job_storage_exists,
+)
 from .production_settings import (
     ProductionSettings,
     MOTION_MODE_DISPLAY_NAMES,
@@ -241,6 +248,22 @@ class ModelSelectionDialog:
         self.win.grab_set()
 
         self._build()
+        self.win.after_idle(self._bring_to_front)
+
+    def _bring_to_front(self) -> None:
+        self.win.update_idletasks()
+        x = self.parent.winfo_rootx() + max(
+            0, (self.parent.winfo_width() - self.win.winfo_width()) // 2
+        )
+        y = self.parent.winfo_rooty() + max(
+            0, (self.parent.winfo_height() - self.win.winfo_height()) // 2
+        )
+        self.win.geometry(f"+{x}+{y}")
+        self.win.deiconify()
+        self.win.lift()
+        self.win.attributes("-topmost", True)
+        self.win.after(100, lambda: self.win.attributes("-topmost", False))
+        self.win.focus_force()
 
     def _build(self) -> None:
         # ---- 顶部：当前模型 ----
@@ -709,6 +732,9 @@ class AicfGUI:
         btn_frame = ttk.Frame(root, padding=(10, 4))
         btn_frame.pack(fill="x")
 
+        self.btn_new = ttk.Button(btn_frame, text="＋ 新建任务", command=self._new_job)
+        self.btn_new.pack(side="left", padx=(0, 6))
+
         self.btn_start = ttk.Button(btn_frame, text="▶ 开始生成", command=self._start_job)
         self.btn_start.pack(side="left", padx=(0, 6))
 
@@ -813,7 +839,18 @@ class AicfGUI:
     # ------------------------------------------------------------------
     def _auto_job_id(self) -> str:
         now = datetime.now()
-        return f"VIDEO{now.strftime('%m%d%H%M')}"
+        base = f"VIDEO{now.strftime('%m%d%H%M%S')}"
+        return first_available_job_id(base, self._job_id_taken)
+
+    def _job_id_taken(self, job_id: str) -> bool:
+        try:
+            self._get_repo().get_job(job_id)
+            return True
+        except KeyError:
+            return job_storage_exists(
+                self._get_job_dir(job_id),
+                project_root() / "outputs" / job_id,
+            )
 
     def _show_direction_placeholder(self):
         """显示内容方向的placeholder提示文字。"""
@@ -1149,29 +1186,98 @@ class AicfGUI:
         # 默认：返回简化的错误信息，技术详情放日志
         return f"操作失败：{error_msg}\n\n详细错误信息请查看日志。"
 
+    def _current_job_actions(self) -> JobActionState:
+        selected = self.job_tree.selection() if hasattr(self, "job_tree") else ()
+        job_id = str(selected[0]) if selected else ""
+        if not job_id:
+            return derive_job_actions(
+                existing_job=False,
+                app_has_running_job=bool(self._polling_job_id) or self.running,
+            )
+
+        data: dict[str, object] = {}
+        try:
+            status = self._get_repo().get_job(job_id)
+            loaded = status.model_dump(mode="json")
+            if isinstance(loaded, dict):
+                data = loaded
+        except KeyError:
+            status_path = self._get_status_path(job_id)
+            if status_path.is_file():
+                try:
+                    loaded = json.loads(status_path.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict):
+                        data = loaded
+                except (OSError, json.JSONDecodeError):
+                    data = {}
+        except (OSError, ValueError):
+            status_path = self._get_status_path(job_id)
+            try:
+                loaded = json.loads(status_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    data = loaded
+            except (OSError, json.JSONDecodeError):
+                data = {}
+        current_stage = str(data.get("current_stage") or "")
+        failed_stage = str(data.get("failed_stage") or "")
+        recoverable = False
+        stages = data.get("stages")
+        if failed_stage and isinstance(stages, dict):
+            failed_record = stages.get(failed_stage)
+            if isinstance(failed_record, dict):
+                recoverable = bool(failed_record.get("recoverable"))
+            if current_stage == "FAILED_NEEDS_ATTENTION":
+                recoverable = recoverable or failed_attention_can_auto_reopen(
+                    failed_stage,
+                    stages,
+                )
+        job_dir = self._get_job_dir(job_id)
+        job_is_running = self._is_job_really_running(job_dir, data)
+        final_video = final_video_for_job(
+            job_dir,
+            project_root() / "outputs" / job_id,
+        )
+        return derive_job_actions(
+            existing_job=True,
+            current_stage=current_stage,
+            failed_stage=failed_stage,
+            recoverable=recoverable,
+            job_is_running=job_is_running,
+            app_has_running_job=bool(self._polling_job_id) or self.running,
+            has_final_video=final_video is not None,
+        )
+
+    def _show_current_job_guidance(self) -> None:
+        self._set_status(self._current_job_actions().guidance)
+
     def _update_button_states(self) -> None:
         """根据当前运行状态和环境配置更新按钮可用状态。"""
         has_video = bool(self._available_providers)
         has_api = bool(_get_env_value("OPENROUTER_API_KEY"))
-        can_start = (not self.running) and has_video and has_api
+        actions = self._current_job_actions()
+        can_start = actions.can_start and has_video and has_api
 
         self.btn_start.configure(state="normal" if can_start else "disabled")
-        self.btn_resume.configure(state="disabled" if self.running else "normal")
+        self.btn_resume.configure(
+            state="normal" if actions.can_resume else "disabled"
+        )
 
-        # 停止按钮只在运行中可用
         if hasattr(self, "btn_stop"):
-            self.btn_stop.configure(state="normal" if self.running else "disabled")
+            self.btn_stop.configure(
+                state="normal" if actions.can_stop else "disabled"
+            )
 
-        # 打开最终视频按钮只在有选中任务时可用
         if hasattr(self, "btn_open_video") and hasattr(self, "job_tree"):
-            selected = self._current_job_id()
-            self.btn_open_video.configure(state="normal" if selected else "disabled")
+            self.btn_open_video.configure(
+                state="normal" if actions.can_open_video else "disabled"
+            )
 
-        # 更新开始按钮提示文字
         if not has_api:
             self.btn_start.configure(text="▶ 请先配置API Key")
         elif not has_video:
             self.btn_start.configure(text="▶ 请先配置视频服务")
+        elif not actions.can_start and self.job_tree.selection():
+            self.btn_start.configure(text="▶ 已有任务不可重复生成")
         else:
             self.btn_start.configure(text="▶ 开始生成")
 
@@ -1811,6 +1917,32 @@ class AicfGUI:
         except Exception:
             pass
 
+    def _new_job(self) -> None:
+        """退出历史任务查看状态，准备一个不会覆盖旧结果的新任务。"""
+        for item in self.job_tree.selection():
+            self.job_tree.selection_remove(item)
+        self.job_tree.focus("")
+        self._highlight_selected_job()
+        self._display_job_id = ""
+        self._user_selected_job = False
+        self.job_id_var.set(self._auto_job_id())
+        self._reset_stages()
+        try:
+            self._apply_production_settings(load_default_settings())
+        except Exception:
+            pass
+        self.direction_text.delete("1.0", "end")
+        default_direction = self._load_default_direction()
+        if default_direction:
+            self.direction_text.insert("1.0", default_direction)
+            self.direction_text.configure(foreground="#111827")
+            self._direction_has_placeholder = False
+        else:
+            self._show_direction_placeholder()
+        self.job_id_entry.focus_set()
+        self._update_button_states()
+        self._show_current_job_guidance()
+
     def _start_job(self) -> None:
         self._logged_stages.clear()
         self._log_file_offsets.clear()
@@ -1819,6 +1951,19 @@ class AicfGUI:
         import re
         if not re.match(r'^[a-zA-Z0-9_-]+$', job_id):
             messagebox.showwarning("任务ID无效", "任务ID只能包含字母、数字、下划线(_)和短横线(-)")
+            return
+        if self._job_id_taken(job_id):
+            messagebox.showwarning(
+                "任务ID已存在",
+                f"任务 [{job_id}] 已存在，为避免覆盖原结果，本次未启动。\n\n"
+                "如需继续旧任务，请点击“继续/恢复”；"
+                "如需制作新视频，请点击“新建任务”。",
+            )
+            self._refresh_job_list()
+            if self.job_tree.exists(job_id):
+                self.job_tree.selection_set(job_id)
+                self.job_tree.focus(job_id)
+                self._on_job_select()
             return
         # 校验内容方向不为空
         if self._is_showing_placeholder() or not self._get_direction_content():
@@ -1829,16 +1974,13 @@ class AicfGUI:
         # 新任务启动，显示切到新任务
         self._display_job_id = job_id
         self._user_selected_job = False
-        self._ensure_direction_file()
         try:
             repo = self._get_repo()
-            try:
-                repo.get_job(job_id)
-            except KeyError:
-                repo.create_job(job_id, self._get_job_dir(job_id))
             settings = self._collect_production_settings()
             if settings is None:
                 return
+            self._ensure_direction_file()
+            repo.create_job(job_id, self._get_job_dir(job_id))
             settings.save_for_job(self._get_job_dir(job_id))
         except ValueError as error:
             messagebox.showerror("生产设置无效", str(error))
@@ -2062,6 +2204,8 @@ class AicfGUI:
                         self._set_buttons_running(self._polling_job_id != "")
                 except Exception:
                     pass
+            self._update_button_states()
+            self._show_current_job_guidance()
 
     def _open_output(self) -> None:
         job_id = self._current_job_id()
@@ -2094,9 +2238,7 @@ class AicfGUI:
         if item:
             self.job_tree.selection_set(item)
             self.job_tree.focus(item)
-            self._highlight_selected_job()
-            self.job_id_var.set(str(item))
-            self._refresh_status()
+            self._on_job_select()
             try:
                 self.job_context_menu.tk_popup(event.x_root, event.y_root)  # type: ignore[attr-defined]
             finally:

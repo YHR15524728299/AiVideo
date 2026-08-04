@@ -12,11 +12,17 @@ import yaml
 from PIL import Image
 
 from .autopilot import Autopilot
-from .background_worker import WorkerLauncher, run_worker, worker_status
+from .background_worker import (
+    WorkerIdentityError,
+    WorkerLauncher,
+    run_worker,
+    worker_status,
+)
 from .cache import FileCache
 from .config import load_config
 from .database import JobRepository
 from .delivery_view import finalize_user_delivery, migrate_legacy_job
+from .job_actions import failed_attention_can_auto_reopen
 from .doctor import Doctor
 from .engines.m6_engine import M6Pipeline, RepairEngine
 from .engines.narration_engine import NarrationPipeline
@@ -481,11 +487,45 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         job_dir = Path(status.output_dir)
         if args.command == "worker-start":
-            result = WorkerLauncher(python_executable=sys.executable).start(
-                args.job,
-                job_dir,
-                project_root=project_root(),
-            )
+            if status.current_stage == PipelineStage.COMPLETED:
+                print(
+                    json.dumps(
+                        {
+                            "status": "ALREADY_COMPLETED",
+                            "job_id": args.job,
+                            "reason": "该任务已经完成，为避免覆盖现有结果，未重复启动。",
+                            "next_action": "如需制作新视频，请使用新任务ID。",
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                )
+                return 2
+            try:
+                result = WorkerLauncher(
+                    python_executable=sys.executable,
+                    launch_guard=lambda: (
+                        repo.get_job(args.job).current_stage
+                        != PipelineStage.COMPLETED
+                    ),
+                ).start(
+                    args.job,
+                    job_dir,
+                    project_root=project_root(),
+                )
+            except WorkerIdentityError as error:
+                print(
+                    json.dumps(
+                        {
+                            "status": "START_REJECTED",
+                            "job_id": args.job,
+                            "reason": str(error),
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                )
+                return 2
             print(result.model_dump_json(indent=2))
             return 0
         if args.command == "worker-status":
@@ -546,12 +586,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             failed_stage = status.failed_stage
             can_auto_reopen = False
             if failed_stage is not None:
-                record = status.stages.get(failed_stage.value, {})
-                error_msg = str(record.get("error", "")).lower()
-                # 网络/HTTP/验证类错误自动重试
-                network_errors = ("http ", "url ", "timeout", "connection", "不可达", "403", "429", "502", "503", "504", "拦截", "验证")
-                if any(kw in error_msg for kw in network_errors):
-                    can_auto_reopen = True
+                can_auto_reopen = failed_attention_can_auto_reopen(
+                    failed_stage.value,
+                    status.stages,
+                )
             if can_auto_reopen:
                 try:
                     repo.reopen_failed_attention(

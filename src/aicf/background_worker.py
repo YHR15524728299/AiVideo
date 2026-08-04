@@ -131,12 +131,14 @@ class WorkerLauncher:
         process_probe: Callable[[int], ProcessProbe] = probe_process_identity,
         popen: Callable[..., subprocess.Popen[Any]] = subprocess.Popen,
         cleanup_spawn: Callable[[Any], None] | None = None,
+        launch_guard: Callable[[], bool] | None = None,
         ready_timeout: float = 2.0,
     ) -> None:
         self.python_executable = python_executable
         self._process_probe = process_probe
         self._popen = popen
         self._cleanup_spawn = cleanup_spawn or self._cleanup_spawn_process
+        self._launch_guard = launch_guard
         self._ready_timeout = ready_timeout
 
     @staticmethod
@@ -217,6 +219,10 @@ class WorkerLauncher:
             ):
                 raise WorkerIdentityError(
                     "现有Worker进程身份与运行记录不一致，已拒绝启动"
+                )
+            if self._launch_guard is not None and not self._launch_guard():
+                raise WorkerIdentityError(
+                    "任务状态已变化，为避免重复处理，已拒绝启动Worker"
                 )
 
             log_path = runtime_dir / "worker.log"

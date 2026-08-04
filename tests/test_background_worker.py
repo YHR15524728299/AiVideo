@@ -183,6 +183,23 @@ def test_launcher_refuses_unknown_process_probe(tmp_path: Path) -> None:
     assert spawned == []
 
 
+def test_launcher_rechecks_job_guard_inside_lifecycle_lock(
+    tmp_path: Path,
+) -> None:
+    spawned: list[object] = []
+    launcher = WorkerLauncher(
+        python_executable="python",
+        launch_guard=lambda: False,
+        popen=lambda *args, **kwargs: spawned.append((args, kwargs)),
+        ready_timeout=0,
+    )
+
+    with pytest.raises(WorkerIdentityError, match="任务状态"):
+        launcher.start("JOB1", tmp_path)
+
+    assert spawned == []
+
+
 def test_launcher_replaces_stale_record(tmp_path: Path) -> None:
     record_path = tmp_path / "_work" / "runtime" / "worker.json"
     record_path.parent.mkdir(parents=True)

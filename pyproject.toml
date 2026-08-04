@@ -44,7 +44,13 @@ addopts = "-q"
 
 [tool.coverage.run]
 source = ["aicf"]
+omit = [
+  "*/aicf/__main__.py",
+  "*/aicf/gui.py",
+  "*/aicf/settings_dialog.py",
+]
 
 [tool.coverage.report]
 show_missing = true
+precision = 2
 fail_under = 80

@@ -30,7 +30,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from .atomic_io import atomic_write_text
-from .background_worker import read_worker_record
+from .background_worker import WorkerIdentityError, read_worker_record, stop_worker
 from .config import load_config
 from .database import JobRepository
 from .file_lock import lock_is_active
@@ -1877,14 +1877,15 @@ class AicfGUI:
             pid = record.pid
             self._log(f"正在停止任务 (PID={pid})...", "info")
             try:
-                # Windows: 使用 taskkill /T /F 终止整个进程树
-                subprocess.run(
-                    ["taskkill", "/PID", str(pid), "/T", "/F"],
-                    capture_output=True,
-                    timeout=10,
-                )
-            except Exception:
-                pass
+                stop_worker(self._get_job_dir(job_id))
+            except WorkerIdentityError as error:
+                self._log(str(error), "error")
+                messagebox.showerror("停止失败", str(error))
+                return
+            except OSError as error:
+                self._log(f"停止Worker失败: {error}", "error")
+                messagebox.showerror("停止失败", str(error))
+                return
             self._log("已发送停止信号", "info")
 
     def _current_job_id(self) -> str:

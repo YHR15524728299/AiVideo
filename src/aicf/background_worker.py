@@ -3,10 +3,8 @@ from __future__ import annotations
 import ctypes
 import json
 import os
-import re
 import subprocess
 import sys
-import threading
 import time
 import uuid
 from collections.abc import Callable
@@ -26,6 +24,12 @@ from .process_identity import (
     get_process_identity,
     probe_process_identity,
     process_is_running,
+)
+from .worker_stop_ipc import (
+    StopRequestMonitor,
+    WorkerIdentityError,
+    stop_request_path,
+    terminate_current_process_tree,
 )
 
 
@@ -53,80 +57,6 @@ class WorkerStartResult(BaseModel):
     pid: int
     reused: bool
     log_path: str
-
-
-class WorkerIdentityError(RuntimeError):
-    pass
-
-
-def stop_request_path(job_dir: str | Path, instance_id: str) -> Path:
-    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", instance_id):
-        raise WorkerIdentityError("Worker实例令牌格式无效")
-    return (
-        Path(job_dir)
-        / "_work"
-        / "runtime"
-        / f"stop-{instance_id}.request"
-    )
-
-
-def _terminate_current_process_tree() -> None:
-    if os.name == "nt":
-        subprocess.run(
-            ["taskkill", "/PID", str(os.getpid()), "/T", "/F"],
-            capture_output=True,
-            timeout=10,
-        )
-        os._exit(130)
-    os.kill(os.getpid(), 15)
-
-
-class StopRequestMonitor(AbstractContextManager["StopRequestMonitor"]):
-    def __init__(
-        self,
-        job_dir: str | Path,
-        instance_id: str,
-        *,
-        terminate_self: Callable[[], None] = _terminate_current_process_tree,
-        poll_interval: float = 0.2,
-    ) -> None:
-        self._request_path = stop_request_path(job_dir, instance_id)
-        self._terminate_self = terminate_self
-        self._poll_interval = poll_interval
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
-
-    def __enter__(self) -> "StopRequestMonitor":
-        def watch() -> None:
-            while not self._stop.is_set():
-                if self._request_path.is_file():
-                    try:
-                        self._terminate_self()
-                    except BaseException as error:
-                        atomic_write_text(
-                            self._request_path.with_suffix(".error"),
-                            f"{type(error).__name__}: {error}\n",
-                        )
-                    else:
-                        atomic_write_text(
-                            self._request_path.with_suffix(".ack"),
-                            "stop signal handled\n",
-                        )
-                        return
-                self._stop.wait(self._poll_interval)
-
-        self._thread = threading.Thread(
-            target=watch,
-            name="aicf-worker-stop-monitor",
-            daemon=True,
-        )
-        self._thread.start()
-        return self
-
-    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=self._poll_interval + 1.0)
 
 
 class SleepInhibitor(AbstractContextManager["SleepInhibitor"]):
@@ -443,7 +373,7 @@ def run_worker(
                 )
                 terminal_committed = True
                 if stop_won:
-                    _terminate_current_process_tree()
+                    terminate_current_process_tree()
                     raise WorkerIdentityError("Worker停止处理返回异常")
                 raise
             terminal_status = str(result.get("status", "UNKNOWN"))
@@ -454,7 +384,7 @@ def run_worker(
             )
             terminal_committed = True
             if stop_won:
-                _terminate_current_process_tree()
+                terminate_current_process_tree()
                 raise WorkerIdentityError("Worker停止处理返回异常")
         return 0 if terminal_status in {"READY_TO_PUBLISH", "COMPLETED"} else 1
     except BaseException as error:

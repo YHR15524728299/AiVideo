@@ -509,8 +509,23 @@ def test_stop_request_wins_before_terminal_commit(
         "aicf.background_worker.get_process_identity",
         lambda _pid: identity,
     )
+
+    def stop_monitor(
+        job_dir: str | Path,
+        monitor_instance_id: str,
+    ) -> StopRequestMonitor:
+        return StopRequestMonitor(
+            job_dir,
+            monitor_instance_id,
+            terminate_self=lambda: None,
+        )
+
     monkeypatch.setattr(
-        "aicf.background_worker._terminate_current_process_tree",
+        "aicf.background_worker.StopRequestMonitor",
+        stop_monitor,
+    )
+    monkeypatch.setattr(
+        "aicf.background_worker.terminate_current_process_tree",
         lambda: (_ for _ in ()).throw(SystemExit(130)),
     )
 

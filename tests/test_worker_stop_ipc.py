@@ -20,6 +20,7 @@ def test_stop_request_path_rejects_unsafe_instance_id(tmp_path) -> None:
 
 def test_monitor_ignores_other_instance(tmp_path) -> None:
     terminated = threading.Event()
+    own = stop_request_path(tmp_path, "instance-a")
     other = stop_request_path(tmp_path, "instance-b")
     other.parent.mkdir(parents=True)
     other.write_text("stop", encoding="utf-8")
@@ -31,8 +32,10 @@ def test_monitor_ignores_other_instance(tmp_path) -> None:
         poll_interval=0.01,
     ):
         time.sleep(0.03)
+        assert terminated.is_set() is False
+        own.write_text("stop", encoding="utf-8")
+        assert terminated.wait(timeout=1)
 
-    assert terminated.is_set() is False
     assert other.is_file()
 
 
@@ -50,6 +53,7 @@ def test_monitor_handles_existing_request_and_writes_ack(tmp_path) -> None:
     ):
         assert terminated.wait(timeout=0.2)
 
+    assert request.is_file()
     assert request.with_suffix(".ack").is_file()
 
 

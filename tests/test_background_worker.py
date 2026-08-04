@@ -19,8 +19,41 @@ from aicf.background_worker import (
     WorkerRecord,
     stop_worker,
     run_worker,
-    process_is_running,
 )
+
+
+def test_background_worker_reexports_infrastructure_symbols() -> None:
+    from aicf import background_worker
+    from aicf import process_identity
+    from aicf import worker_stop_ipc
+
+    assert background_worker.ProcessIdentity is process_identity.ProcessIdentity
+    assert background_worker.ProcessProbe is process_identity.ProcessProbe
+    assert (
+        background_worker.ProcessProbeStatus
+        is process_identity.ProcessProbeStatus
+    )
+    assert (
+        background_worker.get_process_identity
+        is process_identity.get_process_identity
+    )
+    assert (
+        background_worker.probe_process_identity
+        is process_identity.probe_process_identity
+    )
+    assert (
+        background_worker.process_is_running
+        is process_identity.process_is_running
+    )
+    assert (
+        background_worker.StopRequestMonitor
+        is worker_stop_ipc.StopRequestMonitor
+    )
+    assert (
+        background_worker.WorkerIdentityError
+        is worker_stop_ipc.WorkerIdentityError
+    )
+    assert background_worker.stop_request_path is worker_stop_ipc.stop_request_path
 
 
 def test_sleep_inhibitor_releases_after_success() -> None:
@@ -30,11 +63,6 @@ def test_sleep_inhibitor_releases_after_success() -> None:
         assert calls
 
     assert calls[-1] == SleepInhibitor.ES_CONTINUOUS
-
-
-def test_process_probe_does_not_terminate_current_process() -> None:
-    assert process_is_running(os.getpid()) is True
-    assert process_is_running(os.getpid()) is True
 
 
 def test_sleep_inhibitor_releases_after_exception() -> None:
@@ -375,46 +403,6 @@ def test_stop_worker_requests_stop_for_matching_instance(tmp_path: Path) -> None
     )
     assert request.is_file()
     assert stopped.stop_requested_at is not None
-
-
-def test_stop_monitor_terminates_only_its_instance(tmp_path: Path) -> None:
-    terminated = threading.Event()
-    own_request = (
-        tmp_path / "_work" / "runtime" / "stop-instance-a.request"
-    )
-    other_request = (
-        tmp_path / "_work" / "runtime" / "stop-instance-b.request"
-    )
-    other_request.parent.mkdir(parents=True)
-    other_request.write_text("stop", encoding="utf-8")
-
-    with StopRequestMonitor(
-        tmp_path,
-        "instance-a",
-        terminate_self=lambda: terminated.set(),
-        poll_interval=0.01,
-    ):
-        time.sleep(0.03)
-        assert terminated.is_set() is False
-        own_request.write_text("stop", encoding="utf-8")
-        assert terminated.wait(timeout=1)
-
-
-def test_stop_monitor_handles_request_present_before_start(tmp_path: Path) -> None:
-    terminated = threading.Event()
-    own_request = (
-        tmp_path / "_work" / "runtime" / "stop-instance-a.request"
-    )
-    own_request.parent.mkdir(parents=True)
-    own_request.write_text("stop", encoding="utf-8")
-
-    with StopRequestMonitor(
-        tmp_path,
-        "instance-a",
-        terminate_self=lambda: terminated.set(),
-        poll_interval=0.5,
-    ):
-        assert terminated.wait(timeout=0.2)
 
 
 def test_worker_run_requires_launcher_token(tmp_path: Path) -> None:

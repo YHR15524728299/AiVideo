@@ -589,6 +589,8 @@ class AicfGUI:
         self.job_id_var = StringVar(value=self._auto_job_id())
         self.job_id_entry = ttk.Entry(setup_frame, textvariable=self.job_id_var, width=22)
         self.job_id_entry.grid(row=0, column=1, sticky="w")
+        self.job_id_entry.bind("<FocusIn>", self._on_job_id_focus)
+        self.job_id_entry.bind("<KeyPress>", self._on_job_id_keypress)
 
         ttk.Label(setup_frame, text="（留空则自动生成）").grid(row=0, column=2, sticky="w", padx=(4, 0))
 
@@ -1942,6 +1944,56 @@ class AicfGUI:
         self.job_id_entry.focus_set()
         self._update_button_states()
         self._show_current_job_guidance()
+
+    def _on_job_id_keypress(self, event: object) -> None:
+        """用户编辑任务 ID 时切换到新任务状态，避免自动刷新覆盖输入。"""
+        keysym = str(getattr(event, "keysym", ""))
+        char = str(getattr(event, "char", ""))
+        state = int(getattr(event, "state", 0))
+        navigation_keys = {
+            "Left",
+            "Right",
+            "Home",
+            "End",
+            "Tab",
+            "Return",
+            "Escape",
+            "Shift_L",
+            "Shift_R",
+            "Control_L",
+            "Control_R",
+            "Alt_L",
+            "Alt_R",
+        }
+        is_control_shortcut = bool(state & 0x4) and keysym.lower() not in {
+            "v",
+            "x",
+        }
+        is_edit = (
+            bool(char)
+            or keysym in {"BackSpace", "Delete"}
+            or (bool(state & 0x4) and keysym.lower() in {"v", "x"})
+        )
+        if keysym in navigation_keys or is_control_shortcut or not is_edit:
+            return
+        self._enter_job_id_edit_mode()
+
+    def _on_job_id_focus(self, _event: object) -> None:
+        """输入框获得焦点即退出历史任务查看，兼容粘贴和输入法。"""
+        self._enter_job_id_edit_mode()
+
+    def _enter_job_id_edit_mode(self) -> None:
+        selected = self.job_tree.selection()
+        if not selected:
+            return
+        for item in selected:
+            self.job_tree.selection_remove(item)
+        self.job_tree.focus("")
+        self._highlight_selected_job()
+        self._display_job_id = ""
+        self._user_selected_job = False
+        self._reset_stages()
+        self.root.after_idle(self._update_button_states)
 
     def _start_job(self) -> None:
         self._logged_stages.clear()

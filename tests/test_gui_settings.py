@@ -1,6 +1,8 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 from aicf.gui import (
+    AicfGUI,
     build_production_settings,
     final_video_for_job,
     update_direction_config,
@@ -77,6 +79,41 @@ def test_final_video_prefers_flat_user_delivery(tmp_path: Path) -> None:
 def test_gui_starts_detached_worker_command() -> None:
     command = worker_start_command("JOB001")
     assert command[-4:] == ["aicf", "worker-start", "--job", "JOB001"]
+
+
+def test_focusing_job_id_exits_history_selection_before_refresh() -> None:
+    calls: list[object] = []
+
+    class FakeTree:
+        def selection(self) -> tuple[str, ...]:
+            return ("OLD_JOB",)
+
+        def selection_remove(self, item: str) -> None:
+            calls.append(("selection_remove", item))
+
+        def focus(self, item: str) -> None:
+            calls.append(("focus", item))
+
+    gui = SimpleNamespace(
+        job_tree=FakeTree(),
+        _display_job_id="OLD_JOB",
+        _user_selected_job=True,
+        _highlight_selected_job=lambda: calls.append("highlight"),
+        _reset_stages=lambda: calls.append("reset"),
+        _update_button_states=lambda: calls.append("buttons"),
+        root=SimpleNamespace(
+            after_idle=lambda callback: (calls.append("after_idle"), callback())
+        ),
+    )
+    gui._enter_job_id_edit_mode = lambda: AicfGUI._enter_job_id_edit_mode(gui)
+
+    AicfGUI._on_job_id_focus(gui, SimpleNamespace())
+
+    assert gui._display_job_id == ""
+    assert gui._user_selected_job is False
+    assert ("selection_remove", "OLD_JOB") in calls
+    assert ("focus", "") in calls
+    assert "reset" in calls
 
 
 def test_update_direction_config_preserves_other_settings(tmp_path: Path) -> None:

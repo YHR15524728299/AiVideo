@@ -5,6 +5,7 @@ from aicf.job_actions import (
     failed_attention_can_auto_reopen,
     first_available_job_id,
     job_storage_exists,
+    summarize_research_failure,
 )
 
 
@@ -52,6 +53,26 @@ def test_recoverable_failure_exposes_resume_action() -> None:
     assert actions.can_resume is True
     assert actions.can_start is False
     assert "继续/恢复" in actions.guidance
+
+
+def test_research_failure_exposes_dedicated_retry_and_plain_summary() -> None:
+    summary = summarize_research_failure([
+        {"category": "PERMANENT_SOURCE_FAILURE"} for _ in range(7)
+    ] + [{"category": "UNSUPPORTED_CLAIM"}])
+    actions = derive_job_actions(
+        existing_job=True,
+        current_stage="FAILED_RETRYABLE",
+        failed_stage="RESEARCHED",
+        recoverable=True,
+        research_failure_summary=summary,
+    )
+
+    assert actions.can_retry_research is True
+    assert actions.can_resume is False
+    assert actions.guidance == (
+        "资料研究失败：8 条资料中 7 个网页不存在，"
+        "1 条内容无法证明相关说法。"
+    )
 
 
 def test_interrupted_job_exposes_resume_action() -> None:

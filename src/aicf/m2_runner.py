@@ -150,6 +150,15 @@ class M2ContentRunner:
                 if status.failed_stage == PipelineStage.RESEARCHED
                 else "initial"
             )
+            retry_request_path = output_dir / "research_retry_request.json"
+            if retry_request_path.exists():
+                retry_request = self._read_json(retry_request_path)
+                if (
+                    isinstance(retry_request, dict)
+                    and retry_request.get("reason") == "user_retry"
+                ):
+                    attempt_reason = "user_retry"
+                retry_request_path.unlink(missing_ok=True)
             self._write_json(
                 output_dir / "research_attempt.json",
                 {

@@ -30,6 +30,7 @@ class JobActionState:
     can_stop: bool
     can_open_video: bool
     guidance: str
+    can_retry_research: bool = False
 
 
 def derive_job_actions(
@@ -41,6 +42,7 @@ def derive_job_actions(
     job_is_running: bool = False,
     app_has_running_job: bool = False,
     has_final_video: bool = False,
+    research_failure_summary: str = "",
 ) -> JobActionState:
     """把后台状态转换为互斥、面向用户的下一步操作。"""
     can_open_video = existing_job and has_final_video
@@ -96,6 +98,22 @@ def derive_job_actions(
             can_stop=False,
             can_open_video=can_open_video,
             guidance="任务失败且需要人工处理，请查看日志中的修复提示。",
+        )
+
+    if (
+        current_stage == "FAILED_RETRYABLE"
+        and failed_stage == "RESEARCHED"
+    ):
+        return JobActionState(
+            can_start=False,
+            can_resume=False,
+            can_stop=False,
+            can_open_video=can_open_video,
+            guidance=(
+                research_failure_summary
+                or "资料研究失败，可重新搜索一批真实资料。"
+            ),
+            can_retry_research=True,
         )
 
     can_resume = (
@@ -154,3 +172,27 @@ def first_available_job_id(
     while is_taken(f"{base}-{suffix}"):
         suffix += 1
     return f"{base}-{suffix}"
+
+
+def summarize_research_failure(
+    evidence: list[Mapping[str, Any]],
+) -> str:
+    counts: dict[str, int] = {}
+    for item in evidence:
+        category = str(item.get("category") or "INSUFFICIENT_EVIDENCE")
+        counts[category] = counts.get(category, 0) + 1
+    total = len(evidence)
+    parts: list[str] = []
+    labels = (
+        ("PERMANENT_SOURCE_FAILURE", "个网页不存在"),
+        ("TEMPORARY_SOURCE_FAILURE", "个网页暂时无法访问"),
+        ("UNSUPPORTED_CLAIM", "条内容无法证明相关说法"),
+        ("INSUFFICIENT_FRESHNESS", "条资料时效不足"),
+        ("INSUFFICIENT_EVIDENCE", "项资料数量不足"),
+    )
+    for category, label in labels:
+        count = counts.get(category, 0)
+        if count:
+            parts.append(f"{count} {label}")
+    detail = "，".join(parts) if parts else "没有找到可验证资料"
+    return f"资料研究失败：{total} 条资料中 {detail}。"

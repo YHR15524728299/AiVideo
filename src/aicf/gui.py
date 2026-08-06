@@ -40,6 +40,7 @@ from .job_actions import (
     failed_attention_can_auto_reopen,
     first_available_job_id,
     job_storage_exists,
+    summarize_research_failure,
 )
 from .production_settings import (
     ProductionSettings,
@@ -743,6 +744,13 @@ class AicfGUI:
         self.btn_resume = ttk.Button(btn_frame, text="⏵ 继续/恢复", command=self._resume_job)
         self.btn_resume.pack(side="left", padx=6)
 
+        self.btn_retry_research = ttk.Button(
+            btn_frame,
+            text="🔎 重新搜索资料",
+            command=self._retry_research,
+        )
+        self.btn_retry_research.pack(side="left", padx=6)
+
         ttk.Button(btn_frame, text="🔄 立即刷新", command=self._refresh_all).pack(side="left", padx=6)
         ttk.Button(btn_frame, text="📂 打开输出目录", command=self._open_output).pack(side="left", padx=6)
         self.btn_open_video = ttk.Button(btn_frame, text="▶ 打开最终视频", command=self._open_final_video)
@@ -1239,6 +1247,23 @@ class AicfGUI:
             job_dir,
             project_root() / "outputs" / job_id,
         )
+        research_failure_summary = ""
+        if failed_stage == "RESEARCHED":
+            evidence_path = job_dir / "research_sources.json"
+            if evidence_path.is_file():
+                try:
+                    evidence = json.loads(
+                        evidence_path.read_text(encoding="utf-8")
+                    )
+                    if isinstance(evidence, list):
+                        research_failure_summary = summarize_research_failure(
+                            [
+                                item for item in evidence
+                                if isinstance(item, dict)
+                            ]
+                        )
+                except (OSError, json.JSONDecodeError):
+                    pass
         return derive_job_actions(
             existing_job=True,
             current_stage=current_stage,
@@ -1247,6 +1272,7 @@ class AicfGUI:
             job_is_running=job_is_running,
             app_has_running_job=bool(self._polling_job_id) or self.running,
             has_final_video=final_video is not None,
+            research_failure_summary=research_failure_summary,
         )
 
     def _show_current_job_guidance(self) -> None:
@@ -1262,6 +1288,9 @@ class AicfGUI:
         self.btn_start.configure(state="normal" if can_start else "disabled")
         self.btn_resume.configure(
             state="normal" if actions.can_resume else "disabled"
+        )
+        self.btn_retry_research.configure(
+            state="normal" if actions.can_retry_research else "disabled"
         )
 
         if hasattr(self, "btn_stop"):
@@ -2058,6 +2087,35 @@ class AicfGUI:
             worker_start_command(job_id),
             env_extra={"AICF_PROJECT_ROOT": str(project_root())},
         )
+
+    def _retry_research(self) -> None:
+        job_id = self._current_job_id()
+        if not job_id:
+            messagebox.showwarning("提示", "请先选择资料研究失败的任务")
+            return
+        try:
+            status = self._get_repo().get_job(job_id)
+        except KeyError:
+            messagebox.showerror("无法重试", f"任务 [{job_id}] 不存在")
+            return
+        if (
+            status.current_stage.value != "FAILED_RETRYABLE"
+            or status.failed_stage is None
+            or status.failed_stage.value != "RESEARCHED"
+        ):
+            messagebox.showwarning("无法重试", "当前任务不是资料研究失败状态")
+            return
+        marker_path = Path(status.output_dir) / "research_retry_request.json"
+        atomic_write_text(
+            marker_path,
+            json.dumps(
+                {"reason": "user_retry"},
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
+        self._log(f"任务 [{job_id}] 重新搜索资料", "info")
+        self._resume_job()
 
     def _stop_job(self) -> None:
         job_id = self._polling_job_id or self._current_job_id()

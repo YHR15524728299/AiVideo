@@ -159,6 +159,14 @@ class ReviewResult(BaseModel):
     issues: list[NonBlankText] = Field(default_factory=list)
     revision_instructions: list[NonBlankText] = Field(default_factory=list)
 
+    @field_validator("issues", "revision_instructions")
+    @classmethod
+    def require_readable_feedback(cls, values: list[str]) -> list[str]:
+        for value in values:
+            if not any(character.isalnum() for character in value):
+                raise ValueError("审核意见必须包含可读文字，不能只有标点或格式符号")
+        return values
+
     @model_validator(mode="before")
     @classmethod
     def copy_revision_instructions_to_missing_failed_issues(

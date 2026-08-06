@@ -305,6 +305,25 @@ def test_review_result_copies_revision_instructions_to_missing_failed_issues() -
     assert review.revision_instructions == ["补齐事实引用", "移除无来源数字"]
 
 
+@pytest.mark.parametrize("garbled", [":{", "]}{", "```", "---"])
+def test_review_result_rejects_punctuation_only_feedback(garbled: str) -> None:
+    with pytest.raises(ValidationError):
+        ReviewResult.model_validate(
+            {
+                "passed": False,
+                "scores": {
+                    "direction_fit": 80,
+                    "hook": 50,
+                    "clarity": 80,
+                    "evidence": 40,
+                    "safety": 100,
+                },
+                "issues": [garbled],
+                "revision_instructions": [garbled],
+            }
+        )
+
+
 @pytest.mark.parametrize(
     "field",
     ["series_name", "core_direction", "audience", "content_goal", "visual_style"],

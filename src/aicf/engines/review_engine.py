@@ -22,11 +22,14 @@ class ReviewEngine(StructuredEngine):
         profile: DirectionProfile,
         research: ResearchResult,
         script: ScriptResult,
+        *,
+        review_attempt_id: str = "legacy",
     ) -> ReviewResult:
         return self.generate(
             {
                 "direction_profile": profile.model_dump(mode="json"),
                 "research": research.model_dump(mode="json"),
                 "script": script.model_dump(mode="json"),
+                "review_attempt_id": review_attempt_id,
             }
         )

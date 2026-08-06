@@ -155,6 +155,11 @@ def failed_attention_can_auto_reopen(
     if not isinstance(record, Mapping):
         return False
     error_message = str(record.get("error", "")).lower()
+    if (
+        failed_stage == "CONTENT_PACKAGED"
+        and "m2 内容审核未通过" in error_message
+    ):
+        return True
     return any(marker in error_message for marker in AUTO_REOPEN_ERROR_MARKERS)
 
 

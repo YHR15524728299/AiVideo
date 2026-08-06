@@ -147,6 +147,17 @@ def test_failed_attention_auto_reopen_uses_error_contract() -> None:
     ) is False
 
 
+def test_legacy_packaging_failure_from_review_can_reopen() -> None:
+    stages = {
+        "CONTENT_PACKAGED": {
+            "error": "M2 内容审核未通过",
+            "recoverable": False,
+        }
+    }
+
+    assert failed_attention_can_auto_reopen("CONTENT_PACKAGED", stages) is True
+
+
 def test_initialized_job_requires_new_task_instead_of_resume() -> None:
     actions = derive_job_actions(
         existing_job=True,

@@ -301,15 +301,43 @@ def test_m2_runner_stops_after_two_failed_repair_rounds(tmp_path: Path) -> None:
     client = SequencedClient(responses)
     repo = JobRepository(tmp_path / "data" / "content.db")
 
-    manifest = _runner(client, repo, tmp_path / "outputs").run(
-        "M2JOB003",
-        _config(),
-    )
+    with pytest.raises(ValueError, match="脚本审核未通过"):
+        _runner(client, repo, tmp_path / "outputs").run(
+            "M2JOB003",
+            _config(),
+        )
 
-    assert manifest["status"] == "needs_revision"
-    assert manifest["revision_rounds"] == 2
     assert "package" not in client.calls
-    assert repo.get_job("M2JOB003").current_stage == PipelineStage.SCRIPT_REVIEWED
+    status = repo.get_job("M2JOB003")
+    assert status.current_stage == PipelineStage.FAILED_RETRYABLE
+    assert status.failed_stage == PipelineStage.SCRIPT_REVIEWED
+    assert status.stages[PipelineStage.SCRIPT_REVIEWED.value]["recoverable"] is True
+
+
+def test_m2_runner_rechecks_reusable_failed_review_with_new_attempt(
+    tmp_path: Path,
+) -> None:
+    responses = {
+        "direction": [_direction()],
+        "topics": [{"candidates": [_topic(i) for i in range(1, 9)]}],
+        "research": [_research()],
+        "script": [_script()],
+        "review": [_review(False), _review(False), _review(False), _review(True)],
+        "script_revision": [_script("一改"), _script("二改")],
+        "package": [_package()],
+    }
+    client = SequencedClient(responses)
+    repo = JobRepository(tmp_path / "data" / "content.db")
+    runner = _runner(client, repo, tmp_path / "outputs")
+
+    with pytest.raises(ValueError, match="脚本审核未通过"):
+        runner.run("M2JOB004", _config())
+
+    manifest = runner.run("M2JOB004", _config())
+
+    assert manifest["status"] == "ready_to_publish"
+    assert client.calls.count("review") == 4
+    assert repo.get_job("M2JOB004").failed_stage is None
 
 
 def test_m2_runner_persists_generated_script_before_review_validation_failure(

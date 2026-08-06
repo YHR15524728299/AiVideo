@@ -191,12 +191,19 @@ class M2ContentRunner:
                 lambda: self.script_engine.write(profile, selected, research),
             )
             self._write_script(output_dir, script)
+        review = None
+        revision_rounds = 0
         if PipelineStage.SCRIPT_REVIEWED in reusable_stages:
             review = ReviewResult.model_validate(
                 self._read_json(output_dir / "review.json")
             )
-            revision_rounds = 0
-        else:
+            if not review.passed:
+                self.repository.invalidate_from(
+                    job_id,
+                    PipelineStage.SCRIPT_REVIEWED,
+                )
+                reusable_stages.discard(PipelineStage.SCRIPT_REVIEWED)
+        if PipelineStage.SCRIPT_REVIEWED not in reusable_stages:
             script, review, revision_rounds = self._stage(
                 job_id,
                 PipelineStage.SCRIPT_REVIEWED,
@@ -209,6 +216,7 @@ class M2ContentRunner:
                 ),
             )
 
+        assert review is not None
         self._write_script(output_dir, script)
         self._write_json(output_dir / "review.json", review.model_dump(mode="json"))
         if not review.passed:
@@ -396,7 +404,13 @@ class M2ContentRunner:
         output_dir: Path,
     ) -> tuple[Any, Any, int]:
         rounds = 0
-        review = self.review_engine.review(profile, research, script)
+        review_attempt_id = uuid4().hex
+        review = self.review_engine.review(
+            profile,
+            research,
+            script,
+            review_attempt_id=review_attempt_id,
+        )
         while not review.passed and rounds < min(max_rounds, 2):
             rounds += 1
             script = self.revision_engine.revise(
@@ -409,11 +423,24 @@ class M2ContentRunner:
                 output_dir / f"script_revision_{rounds}.json",
                 script.model_dump(mode="json"),
             )
-            review = self.review_engine.review(profile, research, script)
+            review = self.review_engine.review(
+                profile,
+                research,
+                script,
+                review_attempt_id=review_attempt_id,
+            )
             self._write_json(
                 output_dir / f"review_{rounds}.json",
                 review.model_dump(mode="json"),
             )
+        if not review.passed:
+            self._write_script(output_dir, script)
+            self._write_json(
+                output_dir / "review.json",
+                review.model_dump(mode="json"),
+            )
+            summary = "；".join(review.issues[:3])
+            raise ValueError(f"脚本审核未通过：{summary}")
         return script, review, rounds
 
     def _stage(

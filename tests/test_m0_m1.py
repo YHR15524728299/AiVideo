@@ -259,7 +259,6 @@ def test_review_result_rejects_passed_issues_contradiction(
     ("passed", "issues", "revision_instructions"),
     [
         (True, [], ["不应存在修订指令"]),
-        (False, ["   "], ["修复问题"]),
         (False, ["问题"], ["\t"]),
     ],
 )
@@ -303,6 +302,28 @@ def test_review_result_copies_revision_instructions_to_missing_failed_issues() -
 
     assert review.issues == ["补齐事实引用", "移除无来源数字"]
     assert review.revision_instructions == ["补齐事实引用", "移除无来源数字"]
+
+
+@pytest.mark.parametrize("garbled_issue", ["   ", ":{"])
+def test_review_result_replaces_garbled_issues_with_readable_instructions(
+    garbled_issue: str,
+) -> None:
+    review = ReviewResult.model_validate(
+        {
+            "passed": False,
+            "scores": {
+                "direction_fit": 80,
+                "hook": 50,
+                "clarity": 80,
+                "evidence": 40,
+                "safety": 100,
+            },
+            "issues": [garbled_issue],
+            "revision_instructions": ["补齐事实引用并移除无来源数字"],
+        }
+    )
+
+    assert review.issues == ["补齐事实引用并移除无来源数字"]
 
 
 @pytest.mark.parametrize("garbled", [":{", "]}{", "```", "---"])

@@ -175,14 +175,33 @@ class ReviewResult(BaseModel):
     ) -> object:
         if not isinstance(value, dict):
             return value
+        issues = value.get("issues")
+        readable_issues = (
+            isinstance(issues, list)
+            and any(
+                isinstance(item, str)
+                and any(character.isalnum() for character in item)
+                for item in issues
+            )
+        )
+        instructions = value.get("revision_instructions")
+        readable_instructions = (
+            isinstance(instructions, list)
+            and [
+                item
+                for item in instructions
+                if isinstance(item, str)
+                and any(character.isalnum() for character in item)
+            ]
+        )
         if (
             value.get("passed") is False
-            and not value.get("issues")
-            and value.get("revision_instructions")
+            and not readable_issues
+            and readable_instructions
         ):
             return {
                 **value,
-                "issues": list(value["revision_instructions"]),
+                "issues": readable_instructions,
             }
         return value
 

@@ -325,6 +325,7 @@ class SourceVerifier:
             "fetched_at": self.clock(),
             "sha256": hashlib.sha256(body).hexdigest(),
             "claim_supported": supported or preflight,
+            "published_at": self._extract_published_at(text, final_url),
         }
         if preflight:
             return evidence
@@ -395,6 +396,29 @@ class SourceVerifier:
             "error": error,
             "category": classify_source_error(error).value,
         }
+
+    @staticmethod
+    def _extract_published_at(html_text: str, url: str) -> str | None:
+        patterns = (
+            r"(?:article:published_time|datePublished|datepublished)"
+            r"""[^>]{0,160}?(20\d{2}-\d{2}-\d{2})""",
+            r"/(20\d{2})/(\d{2})/(\d{2})(?:/|$)",
+            r"(20\d{2})(\d{2})(\d{2})",
+        )
+        for source, pattern in ((html_text, patterns[0]), (url, patterns[1]), (url, patterns[2])):
+            match = re.search(pattern, source, flags=re.IGNORECASE)
+            if not match:
+                continue
+            value = (
+                match.group(1)
+                if len(match.groups()) == 1
+                else "-".join(match.groups())
+            )
+            try:
+                return datetime.fromisoformat(value).date().isoformat()
+            except ValueError:
+                continue
+        return None
 
     def _validate_public_url(self, url: str) -> None:
         parsed = urlparse(url)

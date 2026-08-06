@@ -58,7 +58,14 @@ def test_discovery_omits_rejected_duplicate_and_unreachable_candidates() -> None
         limit=10,
     )
 
-    assert [item.url for item in discovered] == ["https://example.com/good"]
+    assert [item.url for item in discovered.candidates] == [
+        "https://example.com/good"
+    ]
+    assert discovered.rejections == [{
+        "url": "https://example.com/missing",
+        "category": "PERMANENT_SOURCE_FAILURE",
+        "reason": "URL HTTP 404",
+    }]
 
 
 def test_discovery_marks_old_candidate_as_non_core() -> None:
@@ -85,4 +92,46 @@ def test_discovery_marks_old_candidate_as_non_core() -> None:
         limit=5,
     )
 
-    assert discovered[0].core_eligible is False
+    assert discovered.candidates[0].core_eligible is False
+
+
+def test_discovery_uses_preflight_published_date_when_search_has_none() -> None:
+    candidate = SourceCandidate("https://example.com/current", "Current")
+
+    class Provider:
+        def search(self, query: str, *, limit: int) -> list[SourceCandidate]:
+            return [candidate]
+
+    result = SourceDiscovery(
+        Provider(),
+        preflight=lambda item: {
+            "final_url": item.url,
+            "published_at": "2026-07-29",
+        },
+    ).discover(
+        queries=["current"],
+        freshness=FreshnessRequirement(
+            required=True,
+            cutoff_date=date(2025, 8, 6),
+        ),
+        rejected_urls=set(),
+        limit=5,
+    )
+
+    assert result.candidates[0].published_at == date(2026, 7, 29)
+    assert result.candidates[0].core_eligible is True
+
+
+def test_official_source_detection_rejects_spoofed_domains() -> None:
+    assert (
+        BingRSSSearchProvider._source_type("https://who.int/report")
+        == "official"
+    )
+    assert (
+        BingRSSSearchProvider._source_type("https://who.int.example.org/report")
+        == "web"
+    )
+    assert (
+        BingRSSSearchProvider._source_type("https://report.gov.example.com")
+        == "web"
+    )

@@ -751,6 +751,13 @@ class AicfGUI:
         )
         self.btn_retry_research.pack(side="left", padx=6)
 
+        self.btn_research_details = ttk.Button(
+            btn_frame,
+            text="查看失败详情",
+            command=self._show_research_failure_details,
+        )
+        self.btn_research_details.pack(side="left", padx=6)
+
         ttk.Button(btn_frame, text="🔄 立即刷新", command=self._refresh_all).pack(side="left", padx=6)
         ttk.Button(btn_frame, text="📂 打开输出目录", command=self._open_output).pack(side="left", padx=6)
         self.btn_open_video = ttk.Button(btn_frame, text="▶ 打开最终视频", command=self._open_final_video)
@@ -1249,7 +1256,12 @@ class AicfGUI:
         )
         research_failure_summary = ""
         if failed_stage == "RESEARCHED":
-            evidence_path = job_dir / "research_sources.json"
+            evidence_path = (
+                project_root()
+                / "outputs"
+                / job_id
+                / "research_sources.json"
+            )
             if evidence_path.is_file():
                 try:
                     evidence = json.loads(
@@ -1291,6 +1303,13 @@ class AicfGUI:
         )
         self.btn_retry_research.configure(
             state="normal" if actions.can_retry_research else "disabled"
+        )
+        self.btn_research_details.configure(
+            state=(
+                "normal"
+                if actions.can_view_research_failure
+                else "disabled"
+            )
         )
 
         if hasattr(self, "btn_stop"):
@@ -2105,7 +2124,12 @@ class AicfGUI:
         ):
             messagebox.showwarning("无法重试", "当前任务不是资料研究失败状态")
             return
-        marker_path = Path(status.output_dir) / "research_retry_request.json"
+        marker_path = (
+            project_root()
+            / "outputs"
+            / job_id
+            / "research_retry_request.json"
+        )
         atomic_write_text(
             marker_path,
             json.dumps(
@@ -2116,6 +2140,18 @@ class AicfGUI:
         )
         self._log(f"任务 [{job_id}] 重新搜索资料", "info")
         self._resume_job()
+
+    def _show_research_failure_details(self) -> None:
+        actions = self._current_job_actions()
+        if not actions.can_view_research_failure:
+            messagebox.showwarning("提示", "当前任务没有资料研究失败详情")
+            return
+        messagebox.showinfo(
+            "资料研究失败详情",
+            actions.guidance
+            + "\n\n重新搜索会避开已经确认失效的网址，"
+            "并保留已完成的方向分析和选题。",
+        )
 
     def _stop_job(self) -> None:
         job_id = self._polling_job_id or self._current_job_id()

@@ -35,13 +35,17 @@ class ResearchPolicy:
         verified: int,
         total: int,
         authoritative: int,
+        independent: int,
     ) -> bool:
         if total <= 0:
             return False
         return (
             verified >= self.minimum_verified_facts
             and verified / total >= self.minimum_verified_ratio
-            and authoritative >= self.minimum_authoritative_sources
+            and (
+                authoritative >= self.minimum_authoritative_sources
+                or independent >= 2
+            )
         )
 
 

@@ -31,6 +31,7 @@ class JobActionState:
     can_open_video: bool
     guidance: str
     can_retry_research: bool = False
+    can_view_research_failure: bool = False
 
 
 def derive_job_actions(
@@ -114,6 +115,7 @@ def derive_job_actions(
                 or "资料研究失败，可重新搜索一批真实资料。"
             ),
             can_retry_research=True,
+            can_view_research_failure=True,
         )
 
     can_resume = (
@@ -177,11 +179,30 @@ def first_available_job_id(
 def summarize_research_failure(
     evidence: list[Mapping[str, Any]],
 ) -> str:
+    failed = [
+        item for item in evidence
+        if item.get("claim_supported") is not True and item.get("category")
+    ]
+    sentinel = next(
+        (
+            item for item in failed
+            if "verified" in item and "total" in item
+        ),
+        None,
+    )
+    source_failures = [
+        item for item in failed
+        if item is not sentinel
+    ]
     counts: dict[str, int] = {}
-    for item in evidence:
-        category = str(item.get("category") or "INSUFFICIENT_EVIDENCE")
+    for item in source_failures:
+        category = str(item["category"])
         counts[category] = counts.get(category, 0) + 1
-    total = len(evidence)
+    total = (
+        int(sentinel["total"])
+        if sentinel is not None
+        else len(source_failures)
+    )
     parts: list[str] = []
     labels = (
         ("PERMANENT_SOURCE_FAILURE", "个网页不存在"),
@@ -194,5 +215,10 @@ def summarize_research_failure(
         count = counts.get(category, 0)
         if count:
             parts.append(f"{count} {label}")
+    if sentinel is not None:
+        parts.append(
+            f"资料验证通过 {int(sentinel['verified'])}/{total}，"
+            "未达到质量门槛"
+        )
     detail = "，".join(parts) if parts else "没有找到可验证资料"
     return f"资料研究失败：{total} 条资料中 {detail}。"

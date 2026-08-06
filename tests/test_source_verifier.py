@@ -71,7 +71,9 @@ def test_source_verifier_captures_final_url_title_summary_time_and_sha256() -> N
 
 def test_source_verifier_preflight_checks_reachability_without_claim_match() -> None:
     body = (
-        b"<html><title>Completely different title</title>"
+        b'<html><head><title>Completely different title</title>'
+        b'<meta property="article:published_time" '
+        b'content="2026-07-29T12:00:00Z"></head>'
         b"<body>Reachable public article.</body></html>"
     )
     verifier = SourceVerifier(
@@ -84,6 +86,7 @@ def test_source_verifier_preflight_checks_reachability_without_claim_match() -> 
 
     assert evidence["final_url"] == "https://docs.example.com/final"
     assert evidence["claim_supported"] is True
+    assert evidence["published_at"] == "2026-07-29"
 
 
 @pytest.mark.parametrize(

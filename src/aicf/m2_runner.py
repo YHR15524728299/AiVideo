@@ -290,11 +290,16 @@ class M2ContentRunner:
             str(selected.get("core_question") or "").strip(),
         ]
         queries = [query for query in queries if query]
-        candidates = self.source_discovery.discover(
+        discovery = self.source_discovery.discover(
             queries=queries,
             freshness=freshness,
             rejected_urls=rejected_urls,
             limit=12,
+        )
+        candidates = discovery.candidates
+        self._persist_research_rejections(
+            output_dir,
+            [dict(item) for item in discovery.rejections],
         )
         self._write_json(
             output_dir / "research_candidates.json",
@@ -496,7 +501,8 @@ class M2ContentRunner:
             ):
                 continue
             url = str(
-                item.get("original_url")
+                item.get("url")
+                or item.get("original_url")
                 or item.get("final_url")
                 or ""
             )

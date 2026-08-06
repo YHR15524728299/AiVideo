@@ -126,3 +126,31 @@ def test_research_accepts_five_verified_candidates_with_authoritative_source() -
     request = client.calls[0]["user_payload"]
     assert len(request["source_candidates"]) == 5
     assert request["cutoff_date"] == "2025-08-06"
+
+
+def test_research_freshness_uses_candidate_date_not_model_claimed_date() -> None:
+    url = "https://example.com/old"
+    client = Client(_research([url] * 5))
+    candidates = [
+        SourceCandidate(
+            url,
+            "Old source",
+            published_at=date(2024, 1, 1),
+            source_type="official",
+            core_eligible=False,
+        )
+    ]
+
+    with pytest.raises(SourceVerificationError, match="时效不足"):
+        ResearchEngine(client).research_verified(
+            _profile(),
+            {"title": "当前全球主线"},
+            Verifier(),
+            research_attempt_id="attempt-1",
+            source_candidates=candidates,
+            freshness=FreshnessRequirement(
+                required=True,
+                cutoff_date=date(2025, 8, 6),
+            ),
+            policy=ResearchPolicy(),
+        )

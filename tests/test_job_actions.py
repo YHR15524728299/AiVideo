@@ -68,10 +68,33 @@ def test_research_failure_exposes_dedicated_retry_and_plain_summary() -> None:
     )
 
     assert actions.can_retry_research is True
+    assert actions.can_view_research_failure is True
     assert actions.can_resume is False
     assert actions.guidance == (
         "资料研究失败：8 条资料中 7 个网页不存在，"
         "1 条内容无法证明相关说法。"
+    )
+
+
+def test_research_failure_summary_ignores_success_evidence_and_sentinel() -> None:
+    summary = summarize_research_failure([
+        {"claim_supported": True},
+        {"claim_supported": True},
+        {
+            "claim_supported": False,
+            "category": "UNSUPPORTED_CLAIM",
+        },
+        {
+            "claim_supported": False,
+            "category": "INSUFFICIENT_EVIDENCE",
+            "verified": 2,
+            "total": 3,
+        },
+    ])
+
+    assert summary == (
+        "资料研究失败：3 条资料中 1 条内容无法证明相关说法，"
+        "资料验证通过 2/3，未达到质量门槛。"
     )
 
 

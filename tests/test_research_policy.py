@@ -41,7 +41,18 @@ def test_explicit_historical_year_does_not_force_recent_cutoff() -> None:
 def test_default_research_policy_requires_five_facts_and_sixty_percent() -> None:
     policy = ResearchPolicy()
 
-    assert policy.accepts(verified=5, total=8, authoritative=1) is True
-    assert policy.accepts(verified=4, total=8, authoritative=1) is False
-    assert policy.accepts(verified=5, total=10, authoritative=1) is False
-    assert policy.accepts(verified=5, total=8, authoritative=0) is False
+    assert policy.accepts(
+        verified=5, total=8, authoritative=1, independent=1
+    ) is True
+    assert policy.accepts(
+        verified=5, total=8, authoritative=0, independent=2
+    ) is True
+    assert policy.accepts(
+        verified=4, total=8, authoritative=1, independent=2
+    ) is False
+    assert policy.accepts(
+        verified=5, total=10, authoritative=1, independent=2
+    ) is False
+    assert policy.accepts(
+        verified=5, total=8, authoritative=0, independent=1
+    ) is False

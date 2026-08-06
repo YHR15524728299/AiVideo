@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import urlparse
 
 from aicf.engines.llm_engine import StructuredEngine
 from aicf.models.contracts import DirectionProfile, ResearchResult
@@ -89,6 +90,9 @@ class ResearchEngine(StructuredEngine):
             research = self.generate(payload)
             if source_candidates is not None:
                 allowed_urls = {candidate.url for candidate in source_candidates}
+                candidate_by_url = {
+                    candidate.url: candidate for candidate in source_candidates
+                }
                 invented_urls = sorted({
                     fact.source_url
                     for fact in research.facts
@@ -99,12 +103,20 @@ class ResearchEngine(StructuredEngine):
                         "研究结果引用了候选来源之外的 URL："
                         + "、".join(invented_urls),
                     )
+                for fact in research.facts:
+                    candidate = candidate_by_url[fact.source_url]
+                    fact.published_at = candidate.published_at
+                    fact.source_type = candidate.source_type
                 if freshness.required and freshness.cutoff_date is not None:
                     stale = [
                         fact.source_url
                         for fact in research.facts
-                        if fact.published_at is None
-                        or fact.published_at < freshness.cutoff_date
+                        if (
+                            candidate_by_url[fact.source_url].published_at is None
+                            or candidate_by_url[fact.source_url].published_at
+                            < freshness.cutoff_date
+                            or not candidate_by_url[fact.source_url].core_eligible
+                        )
                     ]
                     if stale:
                         raise SourceVerificationError(
@@ -133,10 +145,15 @@ class ResearchEngine(StructuredEngine):
                         for fact in research.facts
                         if candidate_types.get(fact.source_url) == "official"
                     })
+                    independent = len({
+                        (urlparse(fact.source_url).hostname or "").casefold()
+                        for fact in research.facts
+                    })
                     if not policy.accepts(
                         verified=verified,
                         total=len(research.facts),
                         authoritative=authoritative,
+                        independent=independent,
                     ):
                         raise SourceVerificationError(
                             "资料数量或验证通过比例不足",

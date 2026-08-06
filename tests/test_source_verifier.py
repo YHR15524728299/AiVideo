@@ -132,6 +132,7 @@ def test_source_verifier_reports_http_reachability_failure_without_leaking_body(
         "sha256": "",
         "claim_supported": False,
         "error": "URL HTTP 404",
+        "category": "PERMANENT_SOURCE_FAILURE",
     }]
 
 
@@ -159,6 +160,7 @@ def test_source_verifier_checks_chinese_and_english_keyword_support() -> None:
 
     assert captured.value.evidence[0]["final_url"] == "https://docs.example.com/final"
     assert captured.value.evidence[0]["claim_supported"] is False
+    assert captured.value.evidence[0]["category"] == "UNSUPPORTED_CLAIM"
     assert captured.value.evidence[0]["sha256"] == hashlib.sha256(
         "<html><title>官方工作流</title><body>分阶段校验可以降低返工成本。</body></html>".encode(
             "utf-8"

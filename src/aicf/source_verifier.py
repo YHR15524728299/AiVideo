@@ -16,6 +16,8 @@ from urllib.request import (
     build_opener,
 )
 
+from aicf.research_policy import classify_source_error
+
 # 真实浏览器 User-Agent，避免被反爬识别
 _BROWSER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -308,9 +310,13 @@ class SourceVerifier:
                 evidence["claim_supported"] = True
                 evidence["low_confidence"] = True
                 return evidence
-            raise SourceVerificationError(
+            failure_message = (
                 "claim 关键词支持度不足"
-                f"（匹配 {matched}/{required}）：{claim[:120]}",
+                f"（匹配 {matched}/{required}）：{claim[:120]}"
+            )
+            evidence["category"] = classify_source_error(failure_message).value
+            raise SourceVerificationError(
+                failure_message,
                 evidence=[evidence],
             )
         return evidence
@@ -358,6 +364,7 @@ class SourceVerifier:
             "sha256": "",
             "claim_supported": False,
             "error": error,
+            "category": classify_source_error(error).value,
         }
 
     def _validate_public_url(self, url: str) -> None:

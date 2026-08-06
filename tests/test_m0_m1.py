@@ -499,6 +499,33 @@ def test_repository_persists_stage_records_and_resume_command(tmp_path: Path) ->
     assert status.snapshot_dirty is False
 
 
+def test_delete_job_removes_database_record_and_usage_events(
+    tmp_path: Path,
+) -> None:
+    repository = JobRepository(tmp_path / "content.db")
+    job_dir = tmp_path / "jobs" / "JOB-DELETE"
+    repository.create_job("JOB-DELETE", job_dir)
+    repository.record_m4_submission(
+        "JOB-DELETE",
+        request_id="REQ-DELETE",
+        jimeng_images=1,
+    )
+
+    repository.delete_job("JOB-DELETE")
+
+    with pytest.raises(KeyError):
+        repository.get_job("JOB-DELETE")
+    assert repository.list_jobs() == []
+    with repository._connect() as connection:
+        remaining = connection.execute(
+            "SELECT COUNT(*) AS count FROM m4_usage_events "
+            "WHERE job_id = ?",
+            ("JOB-DELETE",),
+        ).fetchone()
+    assert remaining["count"] == 0
+    assert job_dir.is_dir()
+
+
 def test_repository_keeps_sqlite_authoritative_when_snapshot_write_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

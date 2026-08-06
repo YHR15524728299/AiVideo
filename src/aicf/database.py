@@ -153,6 +153,27 @@ class JobRepository:
             ).fetchall()
         return [JobStatus.model_validate_json(row["status_json"]) for row in rows]
 
+    def delete_job(self, job_id: str) -> bool:
+        """原子删除任务权威记录及其关联用量事件。"""
+        self._validate_job_id(job_id)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT 1 FROM jobs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if existing is None:
+                return False
+            connection.execute(
+                "DELETE FROM m4_usage_events WHERE job_id = ?",
+                (job_id,),
+            )
+            connection.execute(
+                "DELETE FROM jobs WHERE job_id = ?",
+                (job_id,),
+            )
+        return True
+
     def relocate_output_dir(
         self,
         job_id: str,

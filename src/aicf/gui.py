@@ -2245,31 +2245,55 @@ class AicfGUI:
                 self.job_context_menu.grab_release()
 
     def _delete_selected_job(self) -> None:
-        """删除选中的历史任务目录。"""
+        """删除选中任务的数据库记录、工作文件和用户交付文件。"""
         job_id = self._current_job_id()
         if not job_id:
             messagebox.showwarning("提示", "请先选择要删除的任务")
             return
         job_dir = self._get_job_dir(job_id)
-        if not job_dir.is_dir():
-            messagebox.showwarning("提示", f"任务目录不存在: {job_dir}")
-            return
+        output_dir = project_root() / "outputs" / job_id
         # 如果任务正在运行，不允许删除
         if self._polling_job_id == job_id and self.running:
             messagebox.showwarning("提示", "任务正在运行中，请先停止后再删除")
             return
+        locations = [
+            str(path)
+            for path in (job_dir, output_dir)
+            if path.exists()
+        ]
+        location_text = "\n".join(locations) if locations else "任务文件已不存在，仅清理列表记录"
         confirm = messagebox.askyesno(
             "确认删除",
-            f"确定要删除任务 [{job_id}] 吗？\n\n目录: {job_dir}\n\n此操作不可恢复。",
+            f"确定要删除任务 [{job_id}] 吗？\n\n"
+            f"将清理：\n{location_text}\n\n此操作不可恢复。",
         )
         if not confirm:
             return
         try:
-            shutil.rmtree(job_dir)
+            self._get_repo().delete_job(job_id)
+            cleanup_errors: list[str] = []
+            unique_paths = {job_dir.resolve(), output_dir.resolve()}
+            for path in unique_paths:
+                if path.is_dir():
+                    try:
+                        shutil.rmtree(path)
+                    except OSError as error:
+                        cleanup_errors.append(f"{path}: {error}")
             self._log(f"已删除任务: {job_id}", "info")
             self._refresh_job_list()
             self._reset_stages()
-            self._set_status("就绪")
+            self._display_job_id = ""
+            self._user_selected_job = False
+            self._update_button_states()
+            if cleanup_errors:
+                self._set_status(f"任务 [{job_id}] 已从列表删除，部分文件需手工清理")
+                messagebox.showwarning(
+                    "任务记录已删除",
+                    "任务已从列表中移除，但以下文件未能自动删除：\n\n"
+                    + "\n".join(cleanup_errors),
+                )
+            else:
+                self._set_status(f"任务 [{job_id}] 已彻底删除")
         except Exception as e:
             messagebox.showerror("错误", f"删除失败: {e}")
 

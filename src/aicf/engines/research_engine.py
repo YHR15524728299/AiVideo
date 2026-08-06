@@ -23,9 +23,15 @@ class ResearchEngine(StructuredEngine):
         self,
         profile: DirectionProfile,
         topic: dict[str, object],
+        *,
+        research_attempt_id: str = "legacy",
     ) -> ResearchResult:
         return self.generate(
-            {"direction_profile": profile.model_dump(mode="json"), "topic": topic}
+            {
+                "direction_profile": profile.model_dump(mode="json"),
+                "topic": topic,
+                "research_attempt_id": research_attempt_id,
+            }
         )
 
     def research_verified(
@@ -33,10 +39,13 @@ class ResearchEngine(StructuredEngine):
         profile: DirectionProfile,
         topic: dict[str, object],
         verifier: object,
+        *,
+        research_attempt_id: str,
     ) -> tuple[ResearchResult, list[dict[str, Any]]]:
         original_request = {
             "direction_profile": profile.model_dump(mode="json"),
             "topic": topic,
+            "research_attempt_id": research_attempt_id,
         }
         payload: dict[str, object] = original_request
         last_error: SourceVerificationError | None = None

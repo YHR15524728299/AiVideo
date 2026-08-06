@@ -530,3 +530,81 @@ def test_m2_runner_blocks_after_two_source_support_repairs(tmp_path: Path) -> No
     )
     assert failed_sources[0]["claim_supported"] is False
     assert failed_sources[0]["sha256"] == "f" * 64
+
+
+def test_research_resume_uses_new_attempt_id_without_repeating_earlier_stages(
+    tmp_path: Path,
+) -> None:
+    first_client = SequencedClient({
+        "direction": [_direction()],
+        "topics": [{"candidates": [_topic(i) for i in range(1, 9)]}],
+        "research": [_research(), _research(), _research()],
+    })
+    repo = JobRepository(tmp_path / "data" / "content.db")
+    outputs_root = tmp_path / "outputs"
+    failing_verifier = StubSourceVerifier([
+        ["facts[0] URL HTTP 404"],
+        ["facts[0] URL HTTP 404"],
+        ["facts[0] URL HTTP 404"],
+    ])
+
+    with pytest.raises(SourceVerificationError):
+        _runner(
+            first_client,
+            repo,
+            outputs_root,
+            failing_verifier,
+        ).run("M2ATTEMPT001", _config())
+
+    first_research_calls = [
+        detail for detail in first_client.call_details
+        if detail["stage"] == "research"
+    ]
+    assert all(
+        "research_attempt_id" in detail["user_payload"]
+        or (
+            "original_request" in detail["user_payload"]
+            and "research_attempt_id"
+            in detail["user_payload"]["original_request"]
+        )
+        for detail in first_research_calls
+    )
+    first_ids = {
+        detail["user_payload"]["research_attempt_id"]
+        if "research_attempt_id" in detail["user_payload"]
+        else detail["user_payload"]["original_request"]["research_attempt_id"]
+        for detail in first_research_calls
+    }
+    assert len(first_ids) == 1
+
+    resumed_client = SequencedClient({
+        "research": [_research()],
+        "script": [_script()],
+        "review": [_review(True)],
+        "package": [_package()],
+    })
+    _runner(
+        resumed_client,
+        repo,
+        outputs_root,
+        StubSourceVerifier(),
+    ).run("M2ATTEMPT001", _config())
+
+    resumed_research = next(
+        detail for detail in resumed_client.call_details
+        if detail["stage"] == "research"
+    )
+    second_id = resumed_research["user_payload"]["research_attempt_id"]
+    assert second_id not in first_ids
+    assert "direction" not in resumed_client.calls
+    assert "topics" not in resumed_client.calls
+
+    attempt = json.loads(
+        (
+            outputs_root
+            / "M2ATTEMPT001"
+            / "research_attempt.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert attempt["attempt_id"] == second_id
+    assert attempt["reason"] == "automatic_retry"

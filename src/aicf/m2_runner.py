@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 from urllib.error import URLError
+from uuid import uuid4
 
 from pydantic import ValidationError
 
@@ -132,6 +134,20 @@ class M2ContentRunner:
                 research_sources = self.source_verifier.verify_research(research)
                 self._write_json(sources_path, research_sources)
         else:
+            research_attempt_id = uuid4().hex
+            attempt_reason = (
+                "automatic_retry"
+                if status.failed_stage == PipelineStage.RESEARCHED
+                else "initial"
+            )
+            self._write_json(
+                output_dir / "research_attempt.json",
+                {
+                    "attempt_id": research_attempt_id,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "reason": attempt_reason,
+                },
+            )
             research, research_sources = self._stage(
                 job_id,
                 PipelineStage.RESEARCHED,
@@ -139,6 +155,7 @@ class M2ContentRunner:
                     profile,
                     selected,
                     self.source_verifier,
+                    research_attempt_id=research_attempt_id,
                 ),
             )
             self._write_json(output_dir / "research.json", research.model_dump(mode="json"))

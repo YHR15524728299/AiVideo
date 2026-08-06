@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date
 from typing import Annotated, Literal
 
 from pydantic import (
@@ -86,6 +87,8 @@ class ResearchFact(BaseModel):
     source_title: NonBlankText
     source_url: NonBlankText
     confidence: float = Field(ge=0, le=1)
+    published_at: date | None = None
+    source_type: str | None = None
 
 
 class ResearchResult(BaseModel):

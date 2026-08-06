@@ -43,6 +43,8 @@ from .providers.tts import (
     discover_ffmpeg_toolchain,
 )
 from .state_machine import PipelineStage
+from .source_discovery import BingRSSSearchProvider, SourceDiscovery
+from .source_verifier import SourceVerifier
 from .voice_validation import VoiceValidator, build_optional_asr
 
 
@@ -79,10 +81,17 @@ def build_m2_runner(
 ) -> M2ContentRunner:
     root = project_root()
     client = OpenRouterClient(cache=FileCache(root / "data" / "openrouter_cache"))
+    verifier = SourceVerifier()
+    discovery = SourceDiscovery(
+        BingRSSSearchProvider(),
+        preflight=lambda candidate: verifier.preflight(candidate.url),
+    )
     return M2ContentRunner(
         client,
         job_repository or repository(),
         root / "outputs",
+        source_verifier=verifier,
+        source_discovery=discovery,
     )
 
 

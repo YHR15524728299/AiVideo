@@ -31,6 +31,12 @@ from aicf.models.contracts import (
     ScriptResult,
 )
 from aicf.providers.openrouter import OpenRouterHTTPError, UpstreamRateLimitError
+from aicf.research_policy import (
+    ResearchPolicy,
+    SourceFailureKind,
+    derive_freshness,
+)
+from aicf.source_discovery import SourceDiscovery
 from aicf.source_verifier import SourceVerificationError, SourceVerifier
 from aicf.state_machine import PipelineStage
 
@@ -43,11 +49,15 @@ class M2ContentRunner:
         outputs_root: str | Path,
         *,
         source_verifier: object | None = None,
+        source_discovery: SourceDiscovery | None = None,
+        research_policy: ResearchPolicy | None = None,
     ) -> None:
         self.client = client
         self.repository = repository
         self.outputs_root = Path(outputs_root)
         self.source_verifier = source_verifier or SourceVerifier()
+        self.source_discovery = source_discovery
+        self.research_policy = research_policy or ResearchPolicy()
         self._run_start_counters = self._client_counters()
         self._synced_run_counters = {"calls": 0, "prompt": 0, "completion": 0}
         self.direction_engine = DirectionEngine(client)
@@ -151,10 +161,11 @@ class M2ContentRunner:
             research, research_sources = self._stage(
                 job_id,
                 PipelineStage.RESEARCHED,
-                lambda: self.research_engine.research_verified(
-                    profile,
-                    selected,
-                    self.source_verifier,
+                lambda: self._run_research(
+                    profile=profile,
+                    selected=selected,
+                    direction=config.direction,
+                    output_dir=output_dir,
                     research_attempt_id=research_attempt_id,
                 ),
             )
@@ -230,6 +241,90 @@ class M2ContentRunner:
         }
         self._finish(output_dir, job_id, manifest)
         return manifest
+
+    def _run_research(
+        self,
+        *,
+        profile: DirectionProfile,
+        selected: dict[str, object],
+        direction: str,
+        output_dir: Path,
+        research_attempt_id: str,
+    ) -> tuple[ResearchResult, list[dict[str, Any]]]:
+        if self.source_discovery is None:
+            return self.research_engine.research_verified(
+                profile,
+                selected,
+                self.source_verifier,
+                research_attempt_id=research_attempt_id,
+            )
+
+        freshness = derive_freshness(
+            f"{direction}\n{selected.get('title', '')}\n"
+            f"{selected.get('core_question', '')}",
+            today=datetime.now(timezone.utc).date(),
+        )
+        rejection_path = output_dir / "research_rejections.json"
+        rejected_urls: set[str] = set()
+        if rejection_path.exists():
+            loaded = self._read_json(rejection_path)
+            if isinstance(loaded, dict):
+                rows = loaded.get("urls", [])
+                if isinstance(rows, list):
+                    rejected_urls = {
+                        str(row.get("url"))
+                        for row in rows
+                        if isinstance(row, dict) and row.get("url")
+                    }
+        queries = [
+            str(selected.get("title") or "").strip(),
+            str(selected.get("core_question") or "").strip(),
+        ]
+        queries = [query for query in queries if query]
+        candidates = self.source_discovery.discover(
+            queries=queries,
+            freshness=freshness,
+            rejected_urls=rejected_urls,
+            limit=12,
+        )
+        self._write_json(
+            output_dir / "research_candidates.json",
+            [
+                {
+                    "url": item.url,
+                    "title": item.title,
+                    "published_at": (
+                        item.published_at.isoformat()
+                        if item.published_at
+                        else None
+                    ),
+                    "source_type": item.source_type,
+                    "query": item.query,
+                    "core_eligible": item.core_eligible,
+                }
+                for item in candidates
+            ],
+        )
+        if len(candidates) < self.research_policy.minimum_verified_facts:
+            raise SourceVerificationError(
+                f"可用候选资料不足：找到 {len(candidates)} 条，"
+                f"至少需要 {self.research_policy.minimum_verified_facts} 条",
+                evidence=[{
+                    "claim_supported": False,
+                    "category": SourceFailureKind.INSUFFICIENT_EVIDENCE.value,
+                    "verified": 0,
+                    "total": len(candidates),
+                }],
+            )
+        return self.research_engine.research_verified(
+            profile,
+            selected,
+            self.source_verifier,
+            research_attempt_id=research_attempt_id,
+            source_candidates=candidates,
+            freshness=freshness,
+            policy=self.research_policy,
+        )
 
     def revise_for_duration(
         self,
@@ -328,6 +423,10 @@ class M2ContentRunner:
                     output_dir / "research_sources.json",
                     error.evidence,
                 )
+                self._persist_research_rejections(
+                    output_dir,
+                    error.evidence,
+                )
             # M2 阶段中的 ValueError / ValidationError 来自结构化生成结果，而非静态
             # 用户配置；重跑该阶段会重新生成，因此属于可恢复失败。
             retryable = (
@@ -360,6 +459,47 @@ class M2ContentRunner:
         self.repository.complete_stage(job_id, stage)
         self._sync_usage(job_id)
         return result
+
+    def _persist_research_rejections(
+        self,
+        output_dir: Path,
+        evidence: list[dict[str, object]],
+    ) -> None:
+        path = output_dir / "research_rejections.json"
+        rows: list[dict[str, object]] = []
+        if path.exists():
+            loaded = self._read_json(path)
+            if isinstance(loaded, dict) and isinstance(loaded.get("urls"), list):
+                rows = [
+                    dict(item)
+                    for item in loaded["urls"]
+                    if isinstance(item, dict)
+                ]
+        by_url = {
+            str(item.get("url")): item
+            for item in rows
+            if item.get("url")
+        }
+        for item in evidence:
+            if (
+                item.get("category")
+                != SourceFailureKind.PERMANENT_SOURCE_FAILURE.value
+            ):
+                continue
+            url = str(
+                item.get("original_url")
+                or item.get("final_url")
+                or ""
+            )
+            if not url:
+                continue
+            by_url[url] = {
+                "url": url,
+                "category": item["category"],
+                "reason": str(item.get("error") or "永久失效来源"),
+            }
+        if by_url:
+            self._write_json(path, {"urls": list(by_url.values())})
 
     def _finish(
         self,

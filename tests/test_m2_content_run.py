@@ -10,6 +10,7 @@ from aicf.config import AppConfig
 from aicf.database import JobRepository
 from aicf.m2_runner import M2ContentRunner
 from aicf.providers.openrouter import StructuredResult, TokenUsage
+from aicf.research_policy import classify_source_error
 from aicf.source_verifier import SourceVerificationError
 from aicf.state_machine import PipelineStage
 
@@ -54,6 +55,8 @@ class StubSourceVerifier:
                     "fetched_at": "2026-07-20T12:00:00+00:00",
                     "sha256": "f" * 64,
                     "claim_supported": False,
+                    "error": errors[0],
+                    "category": classify_source_error(errors[0]).value,
                 }],
             )
         fact = research.facts[0]
@@ -555,6 +558,15 @@ def test_research_resume_uses_new_attempt_id_without_repeating_earlier_stages(
             outputs_root,
             failing_verifier,
         ).run("M2ATTEMPT001", _config())
+
+    rejections = json.loads(
+        (
+            outputs_root
+            / "M2ATTEMPT001"
+            / "research_rejections.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert rejections["urls"][0]["category"] == "PERMANENT_SOURCE_FAILURE"
 
     first_research_calls = [
         detail for detail in first_client.call_details

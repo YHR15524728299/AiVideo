@@ -4,6 +4,12 @@ from typing import Any
 
 from aicf.engines.llm_engine import StructuredEngine
 from aicf.models.contracts import DirectionProfile, ResearchResult
+from aicf.research_policy import (
+    FreshnessRequirement,
+    ResearchPolicy,
+    SourceFailureKind,
+)
+from aicf.source_discovery import SourceCandidate
 from aicf.source_verifier import SourceVerificationError
 
 
@@ -15,8 +21,10 @@ class ResearchEngine(StructuredEngine):
         "置信度。优先使用政府、标准组织、大学、项目官方文档或厂商官方文档等一手"
         "官方来源。URL 必须是可公开访问的 HTTP(S) 正文页面，claim 必须能由来源"
         "正文中的中文或英文关键词直接支持。无法确认的内容放入 unknowns，禁止编造"
-        "精确数字、引文或来源。收到 source_verification_errors 时，必须逐项更换"
-        "不可达来源或收窄不受正文支持的 claim。"
+        "精确数字、引文或来源。当请求包含 source_candidates 时，source_url 必须"
+        "逐字选自候选列表，禁止新增、改写或猜测 URL；同时原样填写候选来源的"
+        " published_at 和 source_type。收到 source_verification_errors 时，必须"
+        "逐项更换不可达来源或收窄不受正文支持的 claim。"
     )
 
     def research(
@@ -41,18 +49,107 @@ class ResearchEngine(StructuredEngine):
         verifier: object,
         *,
         research_attempt_id: str,
+        source_candidates: list[SourceCandidate] | None = None,
+        freshness: FreshnessRequirement | None = None,
+        policy: ResearchPolicy | None = None,
     ) -> tuple[ResearchResult, list[dict[str, Any]]]:
+        freshness = freshness or FreshnessRequirement(required=False)
+        candidate_payload = [
+            {
+                "url": candidate.url,
+                "title": candidate.title,
+                "published_at": (
+                    candidate.published_at.isoformat()
+                    if candidate.published_at
+                    else None
+                ),
+                "source_type": candidate.source_type,
+                "core_eligible": candidate.core_eligible,
+            }
+            for candidate in source_candidates or []
+        ]
         original_request = {
             "direction_profile": profile.model_dump(mode="json"),
             "topic": topic,
             "research_attempt_id": research_attempt_id,
         }
+        if source_candidates is not None:
+            original_request.update({
+                "source_candidates": candidate_payload,
+                "freshness_required": freshness.required,
+                "cutoff_date": (
+                    freshness.cutoff_date.isoformat()
+                    if freshness.cutoff_date
+                    else None
+                ),
+            })
         payload: dict[str, object] = original_request
         last_error: SourceVerificationError | None = None
         for repair_round in range(3):
             research = self.generate(payload)
+            if source_candidates is not None:
+                allowed_urls = {candidate.url for candidate in source_candidates}
+                invented_urls = sorted({
+                    fact.source_url
+                    for fact in research.facts
+                    if fact.source_url not in allowed_urls
+                })
+                if invented_urls:
+                    raise SourceVerificationError(
+                        "研究结果引用了候选来源之外的 URL："
+                        + "、".join(invented_urls),
+                    )
+                if freshness.required and freshness.cutoff_date is not None:
+                    stale = [
+                        fact.source_url
+                        for fact in research.facts
+                        if fact.published_at is None
+                        or fact.published_at < freshness.cutoff_date
+                    ]
+                    if stale:
+                        raise SourceVerificationError(
+                            "核心资料时效不足：" + "、".join(stale),
+                            evidence=[{
+                                "original_url": url,
+                                "claim_supported": False,
+                                "category": (
+                                    SourceFailureKind.INSUFFICIENT_FRESHNESS.value
+                                ),
+                            } for url in stale],
+                        )
             try:
                 evidence = verifier.verify_research(research)
+                if policy is not None and source_candidates is not None:
+                    verified = sum(
+                        1 for item in evidence
+                        if item.get("claim_supported")
+                    )
+                    candidate_types = {
+                        candidate.url: candidate.source_type
+                        for candidate in source_candidates
+                    }
+                    authoritative = len({
+                        fact.source_url
+                        for fact in research.facts
+                        if candidate_types.get(fact.source_url) == "official"
+                    })
+                    if not policy.accepts(
+                        verified=verified,
+                        total=len(research.facts),
+                        authoritative=authoritative,
+                    ):
+                        raise SourceVerificationError(
+                            "资料数量或验证通过比例不足",
+                            evidence=evidence + [{
+                                "claim_supported": False,
+                                "category": (
+                                    SourceFailureKind.INSUFFICIENT_EVIDENCE.value
+                                ),
+                                "verified": verified,
+                                "total": len(research.facts),
+                                "authoritative": authoritative,
+                            }],
+                        )
                 return research, evidence
             except SourceVerificationError as error:
                 last_error = error
@@ -65,7 +162,10 @@ class ResearchEngine(StructuredEngine):
                     )
                     total_count = len(research.facts)
                     # 如果至少有30%的事实通过验证，就继续流程
-                    if verified_count >= max(1, total_count * 0.3):
+                    if (
+                        policy is None
+                        and verified_count >= max(1, total_count * 0.3)
+                    ):
                         import logging
                         logging.warning(
                             f"来源验证降级通过：{verified_count}/{total_count} 个事实验证通过，"

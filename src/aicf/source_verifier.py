@@ -197,7 +197,34 @@ class SourceVerifier:
             raise last_error
         raise SourceVerificationError("事实核查未知错误")
 
-    def _verify_once(self, url: str, *, claim: str) -> dict[str, object]:
+    def preflight(self, url: str) -> dict[str, object]:
+        """只确认公网来源可访问且有正文，不要求支持具体 claim。"""
+        self._validate_public_url(url)
+        last_error: SourceVerificationError | None = None
+        for attempt in range(_MAX_RETRIES + 1):
+            try:
+                return self._verify_once(url, claim="", preflight=True)
+            except SourceVerificationError as error:
+                last_error = error
+                category = classify_source_error(str(error))
+                if (
+                    category.value == "TEMPORARY_SOURCE_FAILURE"
+                    and attempt < _MAX_RETRIES
+                ):
+                    time.sleep(_RETRY_DELAY * (attempt + 1))
+                    continue
+                raise
+        if last_error:
+            raise last_error
+        raise SourceVerificationError("来源预检未知错误")
+
+    def _verify_once(
+        self,
+        url: str,
+        *,
+        claim: str,
+        preflight: bool = False,
+    ) -> dict[str, object]:
         request = Request(
             url,
             headers={
@@ -297,8 +324,10 @@ class SourceVerifier:
             "body_summary": visible_text[: self.summary_chars],
             "fetched_at": self.clock(),
             "sha256": hashlib.sha256(body).hexdigest(),
-            "claim_supported": supported,
+            "claim_supported": supported or preflight,
         }
+        if preflight:
+            return evidence
         if not supported:
             # 放宽：如果页面标题或摘要中包含来源域名（如公司名），至少证明URL可达
             # 对于关键词匹配不足的情况，给出警告但不阻断

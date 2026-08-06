@@ -417,6 +417,32 @@ def test_m2_runner_resumes_failed_stage_and_reuses_completed_artifacts(
     assert status.failed_stage is None
 
 
+def test_m2_runner_discards_garbled_reusable_review(tmp_path: Path) -> None:
+    review_path = tmp_path / "review.json"
+    review_path.write_text(
+        json.dumps(
+            {
+                "passed": False,
+                "scores": {
+                    "direction_fit": 8,
+                    "hook": 5,
+                    "clarity": 8,
+                    "evidence": 4,
+                    "safety": 10,
+                },
+                "issues": [":{"],
+                "revision_instructions": ["]}{"],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    repo = JobRepository(tmp_path / "data" / "content.db")
+    runner = _runner(SequencedClient({}), repo, tmp_path / "outputs")
+
+    assert runner._read_reusable_review(review_path) is None
+
+
 def test_m2_runner_accumulates_only_each_run_usage_delta_across_resume(
     tmp_path: Path,
 ) -> None:

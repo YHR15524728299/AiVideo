@@ -194,10 +194,8 @@ class M2ContentRunner:
         review = None
         revision_rounds = 0
         if PipelineStage.SCRIPT_REVIEWED in reusable_stages:
-            review = ReviewResult.model_validate(
-                self._read_json(output_dir / "review.json")
-            )
-            if not review.passed:
+            review = self._read_reusable_review(output_dir / "review.json")
+            if review is None or not review.passed:
                 self.repository.invalidate_from(
                     job_id,
                     PipelineStage.SCRIPT_REVIEWED,
@@ -258,6 +256,12 @@ class M2ContentRunner:
         }
         self._finish(output_dir, job_id, manifest)
         return manifest
+
+    def _read_reusable_review(self, path: Path) -> ReviewResult | None:
+        try:
+            return ReviewResult.model_validate(self._read_json(path))
+        except (OSError, ValueError, ValidationError):
+            return None
 
     def _run_research(
         self,

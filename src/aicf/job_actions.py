@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Collection, Mapping
 
 
 AUTO_REOPEN_ERROR_MARKERS = (
@@ -22,6 +22,13 @@ AUTO_REOPEN_ERROR_MARKERS = (
     "验证",
 )
 
+ZOMBIE_RECOVERY_TERMINAL_STAGES = {
+    "COMPLETED",
+    "INIT",
+    "FAILED_RETRYABLE",
+    "FAILED_NEEDS_ATTENTION",
+}
+
 
 @dataclass(frozen=True)
 class JobActionState:
@@ -32,6 +39,21 @@ class JobActionState:
     guidance: str
     can_retry_research: bool = False
     can_view_research_failure: bool = False
+
+
+def should_recover_zombie_job(
+    *,
+    current_stage: str,
+    failed_stage: str,
+    completed_stages: Collection[str],
+) -> bool:
+    """仅按持久化状态判断任务是否可能需要僵尸恢复。"""
+    return bool(
+        current_stage
+        and current_stage not in ZOMBIE_RECOVERY_TERMINAL_STAGES
+        and not failed_stage
+        and current_stage not in completed_stages
+    )
 
 
 def derive_job_actions(

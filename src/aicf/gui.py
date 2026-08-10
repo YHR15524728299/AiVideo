@@ -40,6 +40,7 @@ from .job_actions import (
     failed_attention_can_auto_reopen,
     first_available_job_id,
     job_storage_exists,
+    should_recover_zombie_job,
     summarize_research_failure,
 )
 from .production_settings import (
@@ -1032,10 +1033,16 @@ class AicfGUI:
     def _recover_zombie_job(self, job_id: str, data: dict) -> bool:
         """检测并自动恢复僵尸任务（进程已死但状态显示运行中）。
         返回 True 表示成功恢复为可重试状态。"""
-        cur = data.get("current_stage", "")
-        failed = data.get("failed_stage", "")
-        terminal = {"COMPLETED", "INIT", "FAILED_RETRYABLE", "FAILED_NEEDS_ATTENTION"}
-        if not cur or cur in terminal or failed:
+        cur = str(data.get("current_stage") or "")
+        failed = str(data.get("failed_stage") or "")
+        completed = data.get("completed_stages", [])
+        if not isinstance(completed, (list, tuple, set)):
+            completed = ()
+        if not should_recover_zombie_job(
+            current_stage=cur,
+            failed_stage=failed,
+            completed_stages=completed,
+        ):
             return False
         # 检查是否真的是僵尸（锁文件失效=进程已死）
         job_dir = self._get_job_dir(job_id)
@@ -1048,7 +1055,25 @@ class AicfGUI:
             repo = self._get_repo()
             # 读取当前状态确认
             status = repo.get_job(job_id)
-            if status.current_stage == stage and status.failed_stage is None:
+            if (
+                status.current_stage == stage
+                and should_recover_zombie_job(
+                    current_stage=(
+                        status.current_stage.value
+                        if status.current_stage is not None
+                        else ""
+                    ),
+                    failed_stage=(
+                        status.failed_stage.value
+                        if status.failed_stage is not None
+                        else ""
+                    ),
+                    completed_stages=[
+                        completed_stage.value
+                        for completed_stage in status.completed_stages
+                    ],
+                )
+            ):
                 repo.fail_stage(
                     job_id,
                     stage,

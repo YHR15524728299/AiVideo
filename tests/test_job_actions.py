@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from aicf import job_actions
 from aicf.job_actions import (
     derive_job_actions,
     failed_attention_can_auto_reopen,
@@ -7,6 +8,22 @@ from aicf.job_actions import (
     job_storage_exists,
     summarize_research_failure,
 )
+
+
+def test_completed_current_stage_is_not_a_zombie_candidate() -> None:
+    assert job_actions.should_recover_zombie_job(
+        current_stage="RESEARCHED",
+        failed_stage="",
+        completed_stages=["DIRECTION_LOADED", "RESEARCHED"],
+    ) is False
+
+
+def test_incomplete_nonterminal_stage_is_a_zombie_candidate() -> None:
+    assert job_actions.should_recover_zombie_job(
+        current_stage="RESEARCHED",
+        failed_stage="",
+        completed_stages=["DIRECTION_LOADED"],
+    ) is True
 
 
 def test_new_job_exposes_only_start_action() -> None:

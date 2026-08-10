@@ -9,9 +9,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from aicf.cli import main
+from aicf.cli import build_m4_asset_runner, main
 from aicf.database import JobRepository
 from aicf.logging_utils import configure_logging, sanitize_error
+from aicf.production_settings import ProductionSettings
 from aicf.state_machine import ORDERED_STAGES, PipelineStage
 
 
@@ -34,6 +35,32 @@ def test_importing_cli_does_not_replace_process_streams() -> None:
     )
 
     assert completed.returncode == 0, completed.stderr
+
+
+def test_build_m4_runner_initializes_only_selected_jimeng(
+    monkeypatch,
+) -> None:
+    jimeng = object()
+    monkeypatch.setattr(
+        "aicf.cli.discover_ffmpeg_toolchain",
+        lambda: SimpleNamespace(ffprobe=Path("ffprobe")),
+    )
+    monkeypatch.setattr(
+        "aicf.cli.load_config",
+        lambda _path: SimpleNamespace(
+            generation_budget=SimpleNamespace(enable_asset_cache=False)
+        ),
+    )
+    monkeypatch.setattr("aicf.cli.build_dreamina_adapter", lambda: jimeng)
+
+    def reject_kling_probe() -> object:
+        raise AssertionError("选择即梦时不应探测可灵")
+
+    monkeypatch.setattr("aicf.cli.build_kling_adapter", reject_kling_probe)
+
+    runner = build_m4_asset_runner("jimeng")
+
+    assert runner.providers == {"jimeng": jimeng}
 
 
 def test_cli_doctor_runs_and_never_prints_secret(
@@ -408,6 +435,7 @@ def test_cli_asset_run_forwards_resume_and_reports_waiting_external(
 ) -> None:
     plan_path = tmp_path / "visual_plan.json"
     plan_path.write_text("{}", encoding="utf-8")
+    ProductionSettings(video_provider="kling").save_for_job(tmp_path)
     captured: dict[str, object] = {}
 
     class FakeRunner:
@@ -418,14 +446,22 @@ def test_cli_asset_run_forwards_resume_and_reports_waiting_external(
                 "recovery_command": "python -m aicf asset-run --resume",
             }
 
-    monkeypatch.setattr("aicf.cli.build_m4_asset_runner", lambda: FakeRunner())
+    def build_runner(provider: str) -> FakeRunner:
+        captured["provider"] = provider
+        return FakeRunner()
+
+    monkeypatch.setattr("aicf.cli.build_m4_asset_runner", build_runner)
 
     exit_code = main(
         ["asset-run", "--visual-plan", str(plan_path), "--resume"]
     )
 
     assert exit_code == 2
-    assert captured == {"visual_plan_path": plan_path, "resume": True}
+    assert captured == {
+        "provider": "kling",
+        "visual_plan_path": plan_path,
+        "resume": True,
+    }
     output = json.loads(capsys.readouterr().out)
     assert output["status"] == "WAITING_EXTERNAL"
 

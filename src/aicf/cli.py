@@ -42,6 +42,7 @@ from .providers.tts import (
     build_default_tts_service,
     discover_ffmpeg_toolchain,
 )
+from .production_settings import ProductionSettings
 from .state_machine import PipelineStage
 from .source_discovery import BingRSSSearchProvider, SourceDiscovery
 from .source_verifier import SourceVerifier
@@ -141,7 +142,7 @@ def build_dreamina_adapter() -> JimengCliAdapter | None:
     )
 
 
-def build_m4_asset_runner() -> M4AssetRunner:
+def build_m4_asset_runner(provider: str) -> M4AssetRunner:
     root = project_root()
     ffprobe = discover_ffmpeg_toolchain().ffprobe
     config = load_config(root / "config" / "content_direction.yaml")
@@ -158,28 +159,19 @@ def build_m4_asset_runner() -> M4AssetRunner:
                 }
         return {"kind": "video", **asdict(probe_media(ffprobe, path))}
 
-    # 构建所有可用的视频生成提供商适配器
-    providers: dict[str, object] = {}
-
-    # 即梦CLI
-    jimeng_adapter = build_dreamina_adapter()
-    if jimeng_adapter is not None:
-        providers["jimeng"] = jimeng_adapter
-
-    # 可灵CLI
-    kling_adapter = build_kling_adapter()
-    if kling_adapter is not None:
-        providers["kling"] = kling_adapter
-
-    if not providers:
-        raise RuntimeError(
-            "没有可用的视频生成适配器。请配置即梦CLI或可灵CLI。\n"
-            "即梦：运行 `python -m aicf jimeng-login`\n"
-            "可灵：运行 `npm i -g @klingai/cli-cn` 然后 `kling login`"
-        )
+    if provider == "jimeng":
+        adapter = build_dreamina_adapter()
+        recovery = "运行 `python -m aicf jimeng-login`"
+    elif provider == "kling":
+        adapter = build_kling_adapter()
+        recovery = "运行 `npm i -g @klingai/cli-cn` 然后 `kling login`"
+    else:
+        raise ValueError(f"不支持的视频生成提供商: {provider}")
+    if adapter is None:
+        raise RuntimeError(f"视频生成提供商 {provider} 不可用。请{recovery}")
 
     return M4AssetRunner(
-        providers,
+        {provider: adapter},
         media_probe=media_probe,
         asset_cache_dir=(
             root / "data" / "dreamina_asset_cache"
@@ -199,7 +191,7 @@ def build_autopilot(job_repository: JobRepository) -> Autopilot:
         content_runner=build_m2_runner(job_repository),
         narration_pipeline=build_narration_pipeline(),
         visual_plan_runner=M5VisualPlanRunner(),
-        asset_runner=build_m4_asset_runner(),
+        asset_runner_factory=build_m4_asset_runner,
         renderer=renderer,
         m6_pipeline=M6Pipeline(
             toolchain,
@@ -208,6 +200,7 @@ def build_autopilot(job_repository: JobRepository) -> Autopilot:
         config=config,
         voice_validator=VoiceValidator(build_optional_asr()),
         user_output_root=root / "outputs",
+        content_output_root=root / "outputs",
     )
 
 
@@ -400,7 +393,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if args.command == "asset-run":
         try:
-            result = build_m4_asset_runner().run(
+            provider = ProductionSettings.load_for_job(
+                args.visual_plan.parent
+            ).video_provider
+            result = build_m4_asset_runner(provider).run(
                 args.visual_plan,
                 resume=args.resume,
             )

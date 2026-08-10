@@ -11,6 +11,7 @@ from aicf.config import AppConfig
 from aicf.database import JobRepository
 from aicf.engines.narration_engine import NeedsScriptDurationRevision
 from aicf.file_lock import os_file_lock
+from aicf.production_settings import ProductionSettings
 from aicf.providers.openrouter import UpstreamRateLimitError
 from aicf.state_machine import ORDERED_STAGES, PipelineStage
 from aicf.voice_validation import VoiceValidator
@@ -335,6 +336,172 @@ def test_content_packaged_is_between_script_reviewed_and_audio() -> None:
     assert ORDERED_STAGES.index(PipelineStage.PACKAGED) > ORDERED_STAGES.index(
         PipelineStage.QA_CHECKED
     )
+
+
+def test_autopilot_hashes_content_from_separate_output_root(tmp_path: Path) -> None:
+    repository = JobRepository(tmp_path / "content.db")
+    job_dir = tmp_path / "data" / "jobs" / "SEPARATE001"
+    content_root = tmp_path / "outputs"
+    content_dir = content_root / "SEPARATE001"
+    repository.create_job("SEPARATE001", job_dir)
+    content = FakeContentRunner(repository, content_dir)
+    autopilot = Autopilot(
+        repository,
+        content_runner=content,
+        config=AppConfig(direction="测试"),
+        content_output_root=content_root,
+    )
+
+    result = autopilot._ensure_content("SEPARATE001", job_dir)
+
+    assert result is None
+    status = repository.get_job("SEPARATE001")
+    hashes = status.stages[CONTENT_PACKAGED.value]["artifact_hashes"]
+    assert str(content_dir / "script.json") in hashes
+    assert str(content_dir / "package.json") in hashes
+
+
+def test_autopilot_consumes_content_from_separate_output_root(
+    tmp_path: Path,
+) -> None:
+    repository = JobRepository(tmp_path / "content.db")
+    job_id = "CONSUME001"
+    job_dir = tmp_path / "data" / "jobs" / job_id
+    content_root = tmp_path / "outputs"
+    content_dir = content_root / job_id
+    repository.create_job(job_id, job_dir)
+    content_dir.mkdir(parents=True)
+    script = {
+        "title": "内容目录标题",
+        "hook": "开场",
+        "segments": [
+            {
+                "segment_id": "SEG001",
+                "narration": "来自内容目录。",
+            }
+        ],
+        "call_to_action": "结束",
+        "key_phrases": ["内容目录"],
+    }
+    package = {"douyin": {"title": "内容目录发布标题"}}
+    (content_dir / "script.json").write_text(
+        json.dumps(script, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (content_dir / "package.json").write_text(
+        json.dumps(package, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    captured: dict[str, object] = {}
+
+    class CapturingNarration(FakeNarration):
+        def batch_synthesize(
+            self,
+            received_script: object,
+            output: Path,
+            **durations: object,
+        ) -> object:
+            captured["narration_script"] = received_script
+            return super().batch_synthesize(
+                received_script,
+                output,
+                **durations,
+            )
+
+    class CapturingVisual(FakeVisualPlan):
+        def run(self, *, script_path: Path, **kwargs: object) -> object:
+            captured["visual_script_path"] = script_path
+            return super().run(**kwargs)
+
+    class CapturingRenderer(FakeRenderer):
+        def render_and_validate(self, *, title: str, **kwargs: object) -> object:
+            captured["render_title"] = title
+            return super().render_and_validate(**kwargs)
+
+    class CapturingM6(FakeM6):
+        def run(
+            self,
+            *,
+            script: object,
+            package: object,
+            **kwargs: object,
+        ) -> dict[str, object]:
+            captured["m6_script"] = script
+            captured["m6_package"] = package
+            return super().run(**kwargs)
+
+    autopilot = Autopilot(
+        repository,
+        narration_pipeline=CapturingNarration(),
+        visual_plan_runner=CapturingVisual(),
+        renderer=CapturingRenderer(),
+        m6_pipeline=CapturingM6(),
+        config=AppConfig(direction="测试"),
+        content_output_root=content_root,
+    )
+
+    autopilot._invoke(
+        job_id,
+        PipelineStage.AUDIO_GENERATED,
+        job_dir,
+        continuing=False,
+    )
+    autopilot._invoke(
+        job_id,
+        PipelineStage.STORYBOARD_GENERATED,
+        job_dir,
+        continuing=False,
+    )
+    autopilot._invoke(
+        job_id,
+        PipelineStage.RENDERED,
+        job_dir,
+        continuing=False,
+    )
+    autopilot._invoke(
+        job_id,
+        PipelineStage.QA_CHECKED,
+        job_dir,
+        continuing=False,
+    )
+
+    assert captured == {
+        "narration_script": script,
+        "visual_script_path": content_dir / "script.json",
+        "render_title": "内容目录标题",
+        "m6_script": script,
+        "m6_package": package,
+    }
+
+
+def test_autopilot_builds_only_job_selected_asset_provider(tmp_path: Path) -> None:
+    repository = JobRepository(tmp_path / "content.db")
+    job_dir = tmp_path / "data" / "jobs" / "PROVIDER001"
+    repository.create_job("PROVIDER001", job_dir)
+    ProductionSettings(video_provider="jimeng").save_for_job(job_dir)
+    selected: list[str] = []
+
+    class FakeSelectedRunner:
+        def run(self, _plan_path: Path, **_kwargs: object) -> dict[str, object]:
+            return {"status": "COMPLETED"}
+
+    autopilot = Autopilot(
+        repository,
+        asset_runner_factory=lambda provider: (
+            selected.append(provider) or FakeSelectedRunner()
+        ),
+        config=AppConfig(direction="测试"),
+    )
+
+    result = autopilot._invoke(
+        "PROVIDER001",
+        PipelineStage.KEYFRAMES_GENERATED,
+        job_dir,
+        continuing=False,
+    )
+
+    assert result["status"] == "COMPLETED"
+    assert selected == ["jimeng"]
 
 
 def test_fake_autopilot_runs_real_m2_to_m6_stage_chain(tmp_path: Path) -> None:

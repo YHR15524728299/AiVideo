@@ -5,13 +5,12 @@ import hashlib
 import subprocess
 import time
 from pathlib import Path
-from typing import Any
-from urllib.error import URLError
-from .delivery_view import finalize_user_delivery
+from typing import Any, Callable
 from urllib.error import URLError
 
 from aicf.config import AppConfig
 from aicf.database import JobRepository
+from aicf.delivery_view import finalize_user_delivery
 from aicf.engines.narration_engine import NeedsScriptDurationRevision
 from aicf.file_lock import os_file_lock
 from aicf.logging_utils import sanitize_error
@@ -41,6 +40,8 @@ class Autopilot:
         config: AppConfig | None = None,
         voice_validator: VoiceValidator | None = None,
         user_output_root: str | Path | None = None,
+        content_output_root: str | Path | None = None,
+        asset_runner_factory: Callable[[str], object] | None = None,
     ) -> None:
         self.repository = repository
         self.m6_pipeline = m6_pipeline
@@ -48,11 +49,15 @@ class Autopilot:
         self.narration_pipeline = narration_pipeline
         self.visual_plan_runner = visual_plan_runner
         self.asset_runner = asset_runner
+        self.asset_runner_factory = asset_runner_factory
         self.renderer = renderer
         self.config = config
         self.voice_validator = voice_validator or VoiceValidator()
         self.user_output_root = (
             Path(user_output_root) if user_output_root is not None else None
+        )
+        self.content_output_root = (
+            Path(content_output_root) if content_output_root is not None else None
         )
         self.sleep = time.sleep
 
@@ -209,9 +214,10 @@ class Autopilot:
         job_dir: Path,
     ) -> dict[str, Any] | None:
         status = self.repository.get_job(job_id)
+        content_dir = self._content_dir(job_id, job_dir)
         if PipelineStage.CONTENT_PACKAGED in status.completed_stages:
             hashes = self._artifact_hashes(
-                [job_dir / "script.json", job_dir / "package.json"]
+                [content_dir / "script.json", content_dir / "package.json"]
             )
             recorded = status.stages.get(
                 PipelineStage.CONTENT_PACKAGED.value, {}
@@ -239,7 +245,7 @@ class Autopilot:
                     f"python -m aicf resume --job {job_id}",
                 )
             hashes = self._artifact_hashes(
-                [job_dir / "script.json", job_dir / "package.json"]
+                [content_dir / "script.json", content_dir / "package.json"]
             )
             self.repository.record_artifact_hashes(
                 job_id,
@@ -468,10 +474,11 @@ class Autopilot:
         *,
         continuing: bool,
     ) -> dict[str, Any]:
+        content_dir = self._content_dir(job_id, job_dir)
         if stage == PipelineStage.AUDIO_GENERATED:
             if self.narration_pipeline is None or self.config is None:
                 raise NeedsAttention("缺少 M3 旁白处理器", "")
-            script = self._read_json(job_dir / "script.json")
+            script = self._read_json(content_dir / "script.json")
             production = ProductionSettings.load_for_job(job_dir)
             service = getattr(self.narration_pipeline, "service", None)
             select_voice = getattr(service, "select_voice", None)
@@ -510,16 +517,20 @@ class Autopilot:
                 raise NeedsAttention("缺少 storyboard/visual plan 处理器", "")
             production = ProductionSettings.load_for_job(job_dir)
             self.visual_plan_runner.run(
-                script_path=job_dir / "script.json",
+                script_path=content_dir / "script.json",
                 timeline_path=job_dir / "audio" / "timeline.json",
                 output_dir=job_dir,
                 orientation=production.orientation,
             )
             return {"status": "COMPLETED"}
         if stage == PipelineStage.KEYFRAMES_GENERATED:
-            if self.asset_runner is None:
+            asset_runner = self.asset_runner
+            if self.asset_runner_factory is not None:
+                provider = ProductionSettings.load_for_job(job_dir).video_provider
+                asset_runner = self.asset_runner_factory(provider)
+            if asset_runner is None:
                 raise NeedsAttention("缺少 M4 素材处理器", "")
-            return self.asset_runner.run(
+            return asset_runner.run(
                 job_dir / "visual_plan.json",
                 resume=continuing,
                 usage_recorder=self._m4_usage_recorder(job_id),
@@ -528,7 +539,7 @@ class Autopilot:
         if stage == PipelineStage.RENDERED:
             if self.renderer is None:
                 raise NeedsAttention("缺少 M5 渲染处理器", "")
-            script = self._read_json(job_dir / "script.json")
+            script = self._read_json(content_dir / "script.json")
             production = ProductionSettings.load_for_job(job_dir)
             self.renderer.render_and_validate(
                 visual_plan_path=job_dir / "visual_plan.json",
@@ -544,7 +555,7 @@ class Autopilot:
                 raise NeedsAttention("缺少 M6 QA/package 处理器", "")
             production = ProductionSettings.load_for_job(job_dir)
             return self.m6_pipeline.run(
-                **self._load_inputs("", job_dir),
+                **self._load_inputs(job_id, job_dir),
                 selected_platforms=production.selected_platforms,
                 orientation=production.orientation,
             )
@@ -825,6 +836,7 @@ class Autopilot:
         finalize_user_delivery(job_dir, self.user_output_root / job_id)
 
     def _load_inputs(self, job_id: str, job_dir: Path) -> dict[str, object]:
+        content_dir = self._content_dir(job_id, job_dir)
         final_dir = job_dir / "final"
         master = self._first_existing(
             final_dir / "master.mp4",
@@ -853,28 +865,30 @@ class Autopilot:
         if timeline is None:
             missing.append("时间线 audio/timeline.json")
         for name in ("script.json", "package.json"):
-            if not (job_dir / name).is_file():
+            if not (content_dir / name).is_file():
                 missing.append(name)
         if missing:
             raise NeedsAttention(
                 "缺少 M6 输入产物: " + "、".join(missing),
                 f"python -m aicf resume --job {job_id}",
             )
-        duration = self._expected_duration(job_dir)
+        duration = self._expected_duration(job_dir, content_dir)
         production = ProductionSettings.load_for_job(job_dir)
         return {
             "master_video": master,
             "clean_video": clean,
             "subtitle_path": subtitles,
             "timeline_path": timeline,
-            "script": self._read_json(job_dir / "script.json"),
-            "package": self._read_json(job_dir / "package.json"),
+            "script": self._read_json(content_dir / "script.json"),
+            "package": self._read_json(content_dir / "package.json"),
             "output_dir": job_dir / "delivery",
             "expected_duration_seconds": duration,
             "repair_context": {
                 "visual_plan_path": job_dir / "visual_plan.json",
                 "audio_path": job_dir / "audio" / "voiceover.wav",
-                "title": str(self._read_json(job_dir / "script.json").get("title", "")),
+                "title": str(
+                    self._read_json(content_dir / "script.json").get("title", "")
+                ),
                 "orientation": production.orientation,
             },
         }
@@ -914,7 +928,7 @@ class Autopilot:
             raise ValueError(f"{path.name} 顶层必须是对象")
         return value
 
-    def _expected_duration(self, job_dir: Path) -> float:
+    def _expected_duration(self, job_dir: Path, content_dir: Path) -> float:
         timeline_path = job_dir / "audio" / "timeline.json"
         if timeline_path.is_file():
             value = json.loads(timeline_path.read_text(encoding="utf-8-sig"))
@@ -933,5 +947,10 @@ class Autopilot:
         raise NeedsAttention(
             "无法确定成片期望时长",
             f"python -m aicf batch-synthesize --script "
-            f'"{job_dir / "script.json"}" --output-dir "{job_dir / "audio"}"',
+            f'"{content_dir / "script.json"}" --output-dir "{job_dir / "audio"}"',
         )
+
+    def _content_dir(self, job_id: str, job_dir: Path) -> Path:
+        if self.content_output_root is None:
+            return job_dir
+        return self.content_output_root / job_id

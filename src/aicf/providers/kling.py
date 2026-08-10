@@ -18,6 +18,14 @@ from PIL import Image, UnidentifiedImageError
 
 from aicf.engines.clip_planner import choose_generation_duration
 from aicf.logging_utils import sanitize_error
+from aicf.subprocess_utils import silent_run
+from aicf.constants import (
+    IMAGE_EXTENSIONS,
+    VIDEO_EXTENSIONS,
+    COMMON_PENDING_STATES,
+    COMMON_SUCCESS_STATES,
+    COMMON_FAILURE_STATES,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -87,19 +95,12 @@ class KlingConfigError(RuntimeError):
 Sleep = Callable[[float], None]
 Clock = Callable[[], float]
 
-_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
-_VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm"}
-_PENDING_STATES = {
-    "submitted",
-    "queued",
-    "queueing",
-    "processing",
-    "running",
-    "generating",
-    "waiting",
-}
-_SUCCESS_STATES = {"succeed", "success", "succeeded", "completed", "done", "partial_completed"}
-_FAILURE_STATES = {"failed", "failure", "error", "cancelled", "canceled"}
+_IMAGE_EXTENSIONS = IMAGE_EXTENSIONS
+_VIDEO_EXTENSIONS = VIDEO_EXTENSIONS
+# 可灵特定状态扩展公共状态
+_PENDING_STATES = COMMON_PENDING_STATES | {"submitted"}
+_SUCCESS_STATES = COMMON_SUCCESS_STATES | {"succeed", "partial_completed"}
+_FAILURE_STATES = COMMON_FAILURE_STATES
 _DETECTION_LOCK = threading.Lock()
 _DETECTION_CACHE_TTL_SECONDS = 15.0
 _DETECTION_STALE_SUCCESS_TTL_SECONDS = 300.0
@@ -192,7 +193,7 @@ def detect_kling_cli(
             authentication_state="unknown",
         )
 
-    runner = command_runner or subprocess.run
+    runner = command_runner or silent_run
     with _DETECTION_LOCK:
         now = clock()
         cached = _DETECTION_CACHE.get(cli_path)
@@ -367,7 +368,7 @@ class KlingCliAdapter:
         last_error: Exception | None = None
         for attempt in range(self.retry_count + 1):
             try:
-                result = subprocess.run(
+                result = silent_run(
                     cmd,
                     capture_output=True,
                     text=True,
@@ -792,7 +793,7 @@ class KlingCliAdapter:
             str(path),
         ]
         try:
-            result = subprocess.run(
+            result = silent_run(
                 command,
                 capture_output=True,
                 text=True,

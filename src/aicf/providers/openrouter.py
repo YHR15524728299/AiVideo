@@ -9,13 +9,12 @@ from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from dotenv import load_dotenv
-
 from aicf.cache import FileCache
+from aicf.path_utils import project_root
+from aicf.constants import OPENROUTER_API_BASE_URL, OPENROUTER_MODELS_URL
 
-# 加载环境变量
-_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
-load_dotenv(os.path.join(_PROJECT_ROOT, ".env"), override=False)
+# 注意：.env 加载由应用入口点（__main__.py 或 gui.launch()）统一处理
+# 不再在模块级别执行 load_dotenv
 
 # 默认使用 OpenRouter 免费模型（强制 :free 后缀，优先能力强的中文模型）
 DEFAULT_FREE_MODEL = "deepseek/deepseek-chat-v3-0324:free"
@@ -124,8 +123,8 @@ def extract_json_object(content: str) -> dict[str, object]:
 
 
 class OpenRouterClient:
-    endpoint = "https://openrouter.ai/api/v1/chat/completions"
-    models_endpoint = "https://openrouter.ai/api/v1/models"
+    endpoint = f"{OPENROUTER_API_BASE_URL}/chat/completions"
+    models_endpoint = OPENROUTER_MODELS_URL
 
     def __init__(
         self,

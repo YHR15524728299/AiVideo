@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Protocol, Sequence
 
+from aicf.subprocess_utils import silent_run
+
 
 @dataclass(frozen=True)
 class TtsRequest:
@@ -70,7 +72,7 @@ def _default_ffmpeg_candidates() -> list[Path]:
 
 def discover_ffmpeg_toolchain(
     candidates: Sequence[Path] | None = None,
-    command_runner: CommandRunner = subprocess.run,
+    command_runner: CommandRunner = silent_run,
 ) -> FfmpegToolchain:
     probe_name = "ffprobe.exe" if os.name == "nt" else "ffprobe"
     for ffmpeg in candidates or _default_ffmpeg_candidates():
@@ -106,7 +108,7 @@ def discover_ffmpeg_toolchain(
 
 def find_audio_ffmpeg(
     candidates: Sequence[Path] | None = None,
-    command_runner: CommandRunner = subprocess.run,
+    command_runner: CommandRunner = silent_run,
 ) -> str:
     if candidates is None:
         try:
@@ -238,7 +240,7 @@ class KokoroTtsProvider:
             # Kokoro 输出 24000Hz，保存为临时文件再用 ffmpeg 转 48000Hz
             sf.write(str(temporary), samples, sample_rate)
 
-            subprocess.run(
+            silent_run(
                 [
                     self.ffmpeg_executable,
                     "-y",
@@ -269,7 +271,7 @@ class EdgeTtsProvider:
         self,
         voice: str = "zh-CN-YunyangNeural",
         communicate_factory: Callable[[str, str], Any] | None = None,
-        command_runner: CommandRunner = subprocess.run,
+        command_runner: CommandRunner = silent_run,
         ffmpeg_executable: str = "ffmpeg",
         request_timeout_seconds: float | None = None,
     ) -> None:
@@ -339,7 +341,7 @@ class SapiTtsProvider:
     def __init__(
         self,
         voice: str = "Microsoft Huihui Desktop",
-        command_runner: CommandRunner = subprocess.run,
+        command_runner: CommandRunner = silent_run,
         ffmpeg_executable: str = "ffmpeg",
     ) -> None:
         self.voice = voice

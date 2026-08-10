@@ -9,6 +9,11 @@ from typing import Any, Callable
 from urllib.error import URLError
 
 from aicf.config import AppConfig
+from aicf.constants import (
+    AUTOPILOT_MAX_RETRIES,
+    AUTOPILOT_RETRY_BACKOFF_BASE_SECONDS,
+    AUTOPILOT_RETRY_MAX_WAIT_SECONDS,
+)
 from aicf.database import JobRepository
 from aicf.delivery_view import finalize_user_delivery
 from aicf.engines.narration_engine import NeedsScriptDurationRevision
@@ -24,6 +29,14 @@ class NeedsAttention(RuntimeError):
     def __init__(self, message: str, recovery_command: str) -> None:
         super().__init__(message)
         self.recovery_command = recovery_command
+
+
+def _retry_wait_seconds(attempt: int) -> float:
+    """计算指数退避等待时间（秒）。"""
+    return min(
+        AUTOPILOT_RETRY_MAX_WAIT_SECONDS,
+        AUTOPILOT_RETRY_BACKOFF_BASE_SECONDS * (2 ** attempt),
+    )
 
 
 class Autopilot:
@@ -78,8 +91,7 @@ class Autopilot:
             lock.__exit__(None, None, None)
 
     def _run_locked(self, job_id: str) -> dict[str, Any]:
-        max_auto_retries = 3
-        for retry_attempt in range(max_auto_retries + 1):
+        for retry_attempt in range(AUTOPILOT_MAX_RETRIES + 1):
             status = self.repository.get_job(job_id)
             job_dir = Path(status.output_dir)
             if status.current_stage == PipelineStage.COMPLETED:
@@ -89,8 +101,8 @@ class Autopilot:
 
             content_result = self._ensure_content(job_id, job_dir)
             if content_result is not None:
-                if content_result.get("status") == "FAILED_RETRYABLE" and retry_attempt < max_auto_retries:
-                    wait = min(60, 10 * (2**retry_attempt))  # 10s, 20s, 40s
+                if content_result.get("status") == "FAILED_RETRYABLE" and retry_attempt < AUTOPILOT_MAX_RETRIES:
+                    wait = _retry_wait_seconds(retry_attempt)
                     print(f"[autopilot] 内容阶段可重试失败，{wait}s 后自动重试 (第{retry_attempt+1}次)", flush=True)
                     self.sleep(wait)
                     # 重置失败阶段状态以重试
@@ -129,8 +141,8 @@ class Autopilot:
                     manifest = result
 
             if failed_retryable:
-                if retry_attempt < max_auto_retries:
-                    wait = min(60, 10 * (2**retry_attempt))
+                if retry_attempt < AUTOPILOT_MAX_RETRIES:
+                    wait = _retry_wait_seconds(retry_attempt)
                     failed_stage_info = self.repository.get_job(job_id)
                     failed_name = failed_stage_info.failed_stage.value if failed_stage_info.failed_stage else "未知"
                     print(f"[autopilot] 阶段 {failed_name} 可重试失败，{wait}s 后自动重试 (第{retry_attempt+1}次)", flush=True)
@@ -161,8 +173,8 @@ class Autopilot:
                     [job_dir / "delivery" / "publish_manifest.json"],
                 )
                 if repair:
-                    if repair.get("status") == "FAILED_RETRYABLE" and retry_attempt < max_auto_retries:
-                        wait = min(60, 10 * (2**retry_attempt))
+                    if repair.get("status") == "FAILED_RETRYABLE" and retry_attempt < AUTOPILOT_MAX_RETRIES:
+                        wait = _retry_wait_seconds(retry_attempt)
                         self.sleep(wait)
                         self._reset_failed_stage(job_id)
                         continue
@@ -174,8 +186,8 @@ class Autopilot:
                 [job_dir / "delivery" / "publish_manifest.json"],
             )
             if packaged:
-                if packaged.get("status") == "FAILED_RETRYABLE" and retry_attempt < max_auto_retries:
-                    wait = min(60, 10 * (2**retry_attempt))
+                if packaged.get("status") == "FAILED_RETRYABLE" and retry_attempt < AUTOPILOT_MAX_RETRIES:
+                    wait = _retry_wait_seconds(retry_attempt)
                     self.sleep(wait)
                     self._reset_failed_stage(job_id)
                     continue
@@ -405,7 +417,7 @@ class Autopilot:
             )
             return self._failure_result(recovery, RuntimeError(reason))
         revision: dict[str, object] | None = None
-        for retry_attempt in range(4):
+        for retry_attempt in range(AUTOPILOT_MAX_RETRIES + 1):
             try:
                 revision = reviser(job_id, error, round_number)
                 break
@@ -415,9 +427,9 @@ class Autopilot:
                 OSError,
                 UpstreamRateLimitError,
             ):
-                if retry_attempt >= 3:
+                if retry_attempt >= AUTOPILOT_MAX_RETRIES:
                     raise
-                wait = min(60, 10 * (2**retry_attempt))
+                wait = _retry_wait_seconds(retry_attempt)
                 print(
                     "[autopilot] 时长修订遇到临时上游错误，"
                     f"{wait}s 后自动重试 (第{retry_attempt + 1}次)",
@@ -429,9 +441,9 @@ class Autopilot:
                     upstream_error.status_code == 429
                     or upstream_error.status_code >= 500
                 )
-                if not retryable or retry_attempt >= 3:
+                if not retryable or retry_attempt >= AUTOPILOT_MAX_RETRIES:
                     raise
-                wait = min(60, 10 * (2**retry_attempt))
+                wait = _retry_wait_seconds(retry_attempt)
                 print(
                     "[autopilot] 时长修订遇到临时上游错误，"
                     f"{wait}s 后自动重试 (第{retry_attempt + 1}次)",

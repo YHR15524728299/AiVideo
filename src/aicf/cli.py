@@ -30,8 +30,8 @@ from .engines.render_engine import FfmpegRenderer, probe_media
 from .m4_asset_runner import M4AssetRunner
 from .m2_runner import M2ContentRunner
 from .m5_runner import M5VisualPlanRunner
-from .gui import launch as launch_gui
 from .logging_utils import sanitize_error
+from .path_utils import project_root, python_executable
 from .providers.jimeng import JimengCliAdapter, detect_jimeng_cli
 from .providers.kling import KlingCliAdapter, build_kling_adapter
 from .providers.openrouter import OpenRouterClient
@@ -56,11 +56,6 @@ def _configure_windows_stdio() -> None:
         reconfigure = getattr(stream, "reconfigure", None)
         if callable(reconfigure):
             reconfigure(encoding="utf-8", errors="replace")
-
-
-def project_root() -> Path:
-    configured = os.getenv("AICF_PROJECT_ROOT")
-    return Path(configured) if configured else Path.cwd()
 
 
 def repository() -> JobRepository:
@@ -674,6 +669,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"{args.job}: 重试 {stage.value}")
         return 0
     if args.command == "ui":
+        from .gui import launch as launch_gui
         launch_gui()
         return 0
     return 2

@@ -25,6 +25,7 @@ from .process_identity import (
     probe_process_identity,
     process_is_running,
 )
+from .subprocess_utils import silent_popen
 from .worker_stop_ipc import (
     StopRequestMonitor,
     WorkerIdentityError,
@@ -129,7 +130,7 @@ class WorkerLauncher:
         *,
         python_executable: str,
         process_probe: Callable[[int], ProcessProbe] = probe_process_identity,
-        popen: Callable[..., subprocess.Popen[Any]] = subprocess.Popen,
+        popen: Callable[..., subprocess.Popen[Any]] = silent_popen,
         cleanup_spawn: Callable[[Any], None] | None = None,
         launch_guard: Callable[[], bool] | None = None,
         ready_timeout: float = 2.0,

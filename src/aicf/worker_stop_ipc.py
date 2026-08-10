@@ -9,6 +9,7 @@ from contextlib import AbstractContextManager
 from pathlib import Path
 
 from .atomic_io import atomic_write_text
+from .subprocess_utils import silent_run
 
 
 class WorkerIdentityError(RuntimeError):
@@ -28,7 +29,7 @@ def stop_request_path(job_dir: str | Path, instance_id: str) -> Path:
 
 def terminate_current_process_tree() -> None:
     if os.name == "nt":
-        subprocess.run(
+        silent_run(
             ["taskkill", "/PID", str(os.getpid()), "/T", "/F"],
             capture_output=True,
             timeout=10,

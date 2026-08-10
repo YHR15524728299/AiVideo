@@ -13,6 +13,7 @@ from aicf.atomic_io import atomic_replace
 from aicf.engines.subtitle_engine import build_ass, build_srt
 from aicf.production_settings import ProductionSettings
 from aicf.providers.tts import FfmpegToolchain, TtsService
+from aicf.subprocess_utils import silent_run
 
 
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
@@ -161,7 +162,7 @@ class NarrationPipeline:
         self,
         service: TtsService,
         toolchain: FfmpegToolchain,
-        command_runner: CommandRunner = subprocess.run,
+        command_runner: CommandRunner = silent_run,
     ) -> None:
         self.service = service
         self.toolchain = toolchain

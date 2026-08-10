@@ -61,6 +61,9 @@ from .secret_store import load_secret, migrate_secret_from_env
 from .settings_dialog import open_settings, load_default_settings
 from .state_machine import PipelineStage
 from .logging_utils import sanitize_error
+from .subprocess_utils import silent_run
+from .path_utils import project_root, python_executable
+from .constants import OPENROUTER_MODELS_URL
 
 # 阶段顺序与中文名称（完整流水线）
 STAGES = [
@@ -230,8 +233,6 @@ def _set_env_value(key: str, value: str) -> None:
 # ---------------------------------------------------------------------------
 # OpenRouter 模型选择对话框
 # ---------------------------------------------------------------------------
-OR_MODELS_URL = "https://openrouter.ai/api/v1/models"
-
 
 class ModelSelectionDialog:
     """OpenRouter 免费模型选择窗口。"""
@@ -354,7 +355,7 @@ class ModelSelectionDialog:
                     "Authorization": f"Bearer {self.api_key}",
                     "Accept": "application/json",
                 }
-                req = Request(OR_MODELS_URL, headers=headers, method="GET")
+                req = Request(OPENROUTER_MODELS_URL, headers=headers, method="GET")
                 with urlopen(req, timeout=30) as resp:
                     payload = json.loads(resp.read().decode("utf-8"))
                 data = payload.get("data", [])
@@ -467,19 +468,6 @@ class ModelSelectionDialog:
 
     def get_selected_model(self) -> str:
         return self.current_model
-
-
-def project_root() -> Path:
-    configured = os.getenv("AICF_PROJECT_ROOT")
-    return Path(configured) if configured else Path.cwd()
-
-
-def python_executable() -> str:
-    """返回当前 uv 环境的 Python 路径（始终用 python.exe，避免 pythonw.exe 无控制台输出）。"""
-    exe = sys.executable
-    if exe.endswith("pythonw.exe"):
-        exe = exe.replace("pythonw.exe", "python.exe")
-    return exe
 
 
 class AicfGUI:
@@ -1465,7 +1453,7 @@ class AicfGUI:
                 env = os.environ.copy()
                 env["PYTHONIOENCODING"] = "utf-8"
                 env["PYTHONUTF8"] = "1"
-                result = subprocess.run(
+                result = silent_run(
                     [python_executable(), "-m", "aicf", "doctor"],
                     cwd=str(project_root()),
                     capture_output=True,
@@ -1621,7 +1609,7 @@ class AicfGUI:
                 env = os.environ.copy()
                 env["PYTHONIOENCODING"] = "utf-8"
                 env["PYTHONUTF8"] = "1"
-                result = subprocess.run(
+                result = silent_run(
                     [python_executable(), "-m", "aicf", "doctor"],
                     cwd=str(project_root()),
                     capture_output=True,
@@ -2616,5 +2604,11 @@ class AicfGUI:
 
 def launch() -> None:
     """启动桌面窗口入口。"""
+    # GUI 入口点：显式确保环境已初始化
+    from .secret_store import load_runtime_secrets
+    from .path_utils import load_project_env
+    load_project_env(override=False)
+    load_runtime_secrets()
+    
     app = AicfGUI()
     app.run()

@@ -11,6 +11,7 @@ from typing import Callable, Mapping, Sequence
 
 from aicf.models.contracts import SUPPORTED_PLATFORMS
 from aicf.providers.tts import FfmpegToolchain
+from aicf.subprocess_utils import silent_run
 
 
 @dataclass(frozen=True)
@@ -48,7 +49,7 @@ class PlatformExporter:
         self,
         toolchain: FfmpegToolchain,
         *,
-        command_runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+        command_runner: Callable[..., subprocess.CompletedProcess[str]] = silent_run,
     ) -> None:
         self.toolchain = toolchain
         self.command_runner = command_runner

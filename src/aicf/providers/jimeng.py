@@ -14,6 +14,14 @@ from typing import Callable, Iterable, Sequence
 import yaml
 from PIL import Image, UnidentifiedImageError
 from aicf.atomic_io import atomic_replace
+from aicf.subprocess_utils import silent_run
+from aicf.constants import (
+    IMAGE_EXTENSIONS,
+    VIDEO_EXTENSIONS,
+    COMMON_PENDING_STATES,
+    COMMON_SUCCESS_STATES,
+    COMMON_FAILURE_STATES,
+)
 
 from aicf.engines.clip_planner import choose_generation_duration
 from aicf.logging_utils import sanitize_error
@@ -72,20 +80,12 @@ CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 Sleep = Callable[[float], None]
 Clock = Callable[[], float]
 
-_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
-_VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm"}
-_PENDING_STATES = {
-    "pending",
-    "queued",
-    "queueing",
-    "querying",
-    "processing",
-    "running",
-    "generating",
-    "waiting",
-}
-_SUCCESS_STATES = {"success", "succeeded", "completed", "done"}
-_FAILURE_STATES = {"failure", "failed", "error", "cancelled", "canceled"}
+_IMAGE_EXTENSIONS = IMAGE_EXTENSIONS
+_VIDEO_EXTENSIONS = VIDEO_EXTENSIONS
+# Dreamina/Jimeng 特定状态扩展公共状态
+_PENDING_STATES = COMMON_PENDING_STATES | {"pending", "querying", "running"}
+_SUCCESS_STATES = COMMON_SUCCESS_STATES
+_FAILURE_STATES = COMMON_FAILURE_STATES
 
 
 def parse_jimeng_help(help_text: str) -> JimengCapabilities:
@@ -213,7 +213,7 @@ def detect_jimeng_cli(
     *,
     config_path: str | Path | None = None,
     timeout_seconds: float = 5,
-    command_runner: CommandRunner = subprocess.run,
+    command_runner: CommandRunner = silent_run,
 ) -> JimengCapabilities:
     failures: list[str] = []
     prefixes = candidates if candidates is not None else _default_candidates()
@@ -298,7 +298,7 @@ class JimengCliAdapter:
         cache_dir: str | Path | None = None,
         retry_count: int = 1,
         ffprobe_executable: str = "ffprobe",
-        command_runner: CommandRunner = subprocess.run,
+        command_runner: CommandRunner = silent_run,
         sleep: Sleep = time.sleep,
         clock: Clock = time.monotonic,
     ) -> None:

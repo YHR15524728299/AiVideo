@@ -4,16 +4,22 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from dotenv import load_dotenv
 from pydantic import BaseModel, Field, model_validator
 
 from aicf.models.contracts import SupportedPlatform
+from aicf.path_utils import project_root
 from aicf.secret_store import load_runtime_secrets
 
-# 自动加载项目根目录 .env 文件
-_PROJECT_ROOT = Path(__file__).parent.parent.parent
-load_dotenv(_PROJECT_ROOT / ".env", override=False)
-load_runtime_secrets()
+# 注意：.env 加载由应用入口点统一处理
+_runtime_secrets_loaded = False
+
+def _ensure_runtime_secrets() -> None:
+    """确保运行时密钥已加载（幂等，只加载一次）。"""
+    global _runtime_secrets_loaded
+    if not _runtime_secrets_loaded:
+        load_runtime_secrets()
+        _runtime_secrets_loaded = True
+
 DEFAULT_CONTENT_PLATFORMS: tuple[SupportedPlatform, ...] = (
     "douyin",
     "xiaohongshu",

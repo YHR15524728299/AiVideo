@@ -18,6 +18,7 @@ from aicf.models.contracts import SUPPORTED_PLATFORMS
 from aicf.platform_export import PlatformExporter
 from aicf.production_settings import get_resolution
 from aicf.providers.tts import FfmpegToolchain
+from aicf.subprocess_utils import silent_run
 
 
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
@@ -201,7 +202,7 @@ class RepairEngine:
         toolchain: FfmpegToolchain,
         *,
         renderer: object,
-        command_runner: CommandRunner = subprocess.run,
+        command_runner: CommandRunner = silent_run,
     ) -> None:
         self.toolchain = toolchain
         self.renderer = renderer
@@ -375,7 +376,7 @@ class TechnicalQA:
     def __init__(
         self,
         toolchain: FfmpegToolchain,
-        command_runner: CommandRunner = subprocess.run,
+        command_runner: CommandRunner = silent_run,
     ) -> None:
         self.toolchain = toolchain
         self.command_runner = command_runner
@@ -577,7 +578,7 @@ class M6Pipeline:
         toolchain: FfmpegToolchain,
         *,
         technical_qa: object | None = None,
-        command_runner: CommandRunner = subprocess.run,
+        command_runner: CommandRunner = silent_run,
         max_repair_rounds: int = 2,
         media_probe: Callable[..., object] = probe_media,
         repair_engine: object | None = None,

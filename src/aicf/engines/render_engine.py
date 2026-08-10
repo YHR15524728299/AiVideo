@@ -11,6 +11,7 @@ from aicf.models.contracts import VisualPlan, VisualShot
 from aicf.artifact_commit import JournaledFileGroup
 from aicf.production_settings import get_resolution
 from aicf.providers.tts import FfmpegToolchain
+from aicf.subprocess_utils import silent_run
 
 
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
@@ -92,7 +93,7 @@ class RenderResult:
 def probe_media(
     ffprobe_executable: str,
     media_path: str | Path,
-    command_runner: CommandRunner = subprocess.run,
+    command_runner: CommandRunner = silent_run,
 ) -> MediaProbe:
     media = Path(media_path)
     completed = command_runner(
@@ -139,7 +140,7 @@ class FfmpegRenderer:
     def __init__(
         self,
         toolchain: FfmpegToolchain,
-        command_runner: CommandRunner = subprocess.run,
+        command_runner: CommandRunner = silent_run,
     ) -> None:
         self.toolchain = toolchain
         self._command_runner = command_runner

@@ -37,14 +37,16 @@ from .secret_store import (
     remove_secret_from_env,
     store_secret,
 )
-from .doctor import _describe_path
+from .subprocess_utils import silent_popen
+from .path_utils import project_root, describe_path
+from .doctor import _describe_path  # 向后兼容，建议改用 path_utils.describe_path
 # 提前导入doctor，避免线程中首次导入
 from . import doctor as _doctor_mod
 
 
 def _safe_path(path: str | Path) -> str:
     """将绝对路径转换为友好的位置描述。"""
-    return _describe_path(path)
+    return describe_path(path)
 
 
 def _load_env(path: Path) -> dict[str, str]:
@@ -101,7 +103,7 @@ def _save_env(path: Path, vals: dict[str, str]) -> None:
 
 
 def _root() -> Path:
-    return Path(__file__).resolve().parent.parent.parent
+    return project_root()
 
 
 # ---------------------------------------------------------------------------
@@ -527,10 +529,14 @@ Write-Host ""
                 creationflags=subprocess.CREATE_NEW_CONSOLE if hasattr(subprocess, 'CREATE_NEW_CONSOLE') else 0,
             )
         except Exception as e:
-            # 备用方案：直接打开终端
+            # 备用方案：直接打开终端（需要显示窗口供用户登录）
             try:
-                subprocess.Popen(["powershell.exe", "-NoExit", "-Command", command], cwd=str(_root()))
-            except:
+                subprocess.Popen(
+                    ["powershell.exe", "-NoExit", "-Command", command],
+                    cwd=str(_root()),
+                    creationflags=subprocess.CREATE_NEW_CONSOLE if hasattr(subprocess, 'CREATE_NEW_CONSOLE') else 0,
+                )
+            except Exception:
                 os.startfile(str(_root()))
                 messagebox.showinfo("登录指引", f"请在打开的终端中输入以下命令并按回车：\n\n{command}")
 
@@ -675,7 +681,7 @@ class _TtsPage(ttk.Frame):
                     self.after(0, lambda: self.edge.ok("edge-tts 已安装"))
                 else:
                     self.after(0, lambda: self.edge.warn("未安装（可选）"))
-            except:
+            except Exception:
                 self.after(0, lambda: self.edge.err("检测失败"))
             # SAPI检测
             if sys.platform == "win32":
@@ -733,7 +739,7 @@ class _DefaultsPage(ttk.Frame):
         if path.is_file():
             try:
                 d = json.loads(path.read_text(encoding="utf-8"))
-            except:
+            except Exception:
                 pass
 
         # 标题区域（用pack）
@@ -1027,6 +1033,6 @@ def load_default_settings() -> ProductionSettings:
             allowed = {"selected_platforms", "video_provider", "jimeng_model", "kling_model",
                        "video_resolution", "motion_mode", "narration_voice", "orientation"}
             return ProductionSettings(**{k: v for k, v in data.items() if k in allowed})
-        except:
+        except Exception:
             pass
     return ProductionSettings()

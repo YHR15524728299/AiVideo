@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -298,11 +299,50 @@ class M2ContentRunner:
                         for row in rows
                         if isinstance(row, dict) and row.get("url")
                     }
-        queries = [
-            str(selected.get("title") or "").strip(),
-            str(selected.get("core_question") or "").strip(),
-        ]
-        queries = [query for query in queries if query]
+        # 构建搜索query：加入领域限定词避免歧义，多query组合提高召回
+        title = str(selected.get("title") or "").strip()
+        core_question = str(selected.get("core_question") or "").strip()
+        
+        # 提取领域限定词
+        domain_terms: list[str] = []
+        if profile.series_name:
+            domain_terms.append(str(profile.series_name))
+        # 从allowed_topic_types提取金融相关关键词
+        for topic_type in profile.allowed_topic_types or []:
+            topic_str = str(topic_type)
+            if any(kw in topic_str for kw in ["美联储", "FOMC", "利率", "通胀", "非农", "就业"]):
+                # 提取核心金融术语
+                for kw in ["美联储", "FOMC", "利率决议", "通胀数据", "非农就业"]:
+                    if kw in topic_str and kw not in domain_terms:
+                        domain_terms.append(kw)
+                break
+        
+        # 通用财经限定词
+        general_terms = ["财经", "2026"]
+        if "美联储" in title or "降息" in title or "加息" in title or "点阵图" in title:
+            general_terms.append("美联储")
+            general_terms.append("FOMC")
+        
+        queries: list[str] = []
+        
+        # Query 1: 清理标点后的标题 + 领域限定词
+        if title:
+            title_clean = re.sub(r'[？?！!。，,、：:；;""''（）()\[\]【】]', '', title)
+            queries.append(f"{title_clean} {' '.join(general_terms)}")
+        
+        # Query 2: 标题前15字 + 核心领域词
+        if title and len(title) > 10:
+            title_short = title[:15]
+            domain_str = ' '.join(domain_terms[:2]) if domain_terms else '财经新闻'
+            queries.append(f"{title_short} {domain_str}")
+        
+        # Query 3: 核心问题中的关键词 + 限定词
+        if core_question:
+            question_clean = re.sub(r'[？?！!。，,、：:；;""''（）()\[\]【】]', '', core_question)
+            queries.append(f"{question_clean[:20]} 分析")
+        
+        # 去重并过滤过短的query
+        queries = list(dict.fromkeys(q.strip() for q in queries if len(q.strip()) > 8))
         discovery = self.source_discovery.discover(
             queries=queries,
             freshness=freshness,

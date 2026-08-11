@@ -29,9 +29,9 @@ DEFAULT_CONTENT_PLATFORMS: tuple[SupportedPlatform, ...] = (
 
 
 class VideoConfig(BaseModel):
-    target_duration_seconds: int = Field(default=60, ge=1)
-    min_duration_seconds: int = Field(default=45, ge=1)
-    max_duration_seconds: int = Field(default=75, ge=1)
+    target_duration_seconds: int = Field(default=120, ge=1)
+    min_duration_seconds: int = Field(default=60, ge=1)
+    max_duration_seconds: int = Field(default=180, ge=1)
     aspect_ratio: str = "9:16"
     resolution: str = "1080x1920"
     fps: int = Field(default=30, ge=1)

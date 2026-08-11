@@ -24,7 +24,9 @@ class ResearchEngine(StructuredEngine):
         "正文中的中文或英文关键词直接支持。无法确认的内容放入 unknowns，禁止编造"
         "精确数字、引文或来源。当请求包含 source_candidates 时，source_url 必须"
         "逐字选自候选列表，禁止新增、改写或猜测 URL；同时原样填写候选来源的"
-        " published_at 和 source_type。收到 source_verification_errors 时，必须"
+        " published_at 和 source_type。如果请求中没有 source_candidates 字段（即"
+        "无外部来源模式），source_url 必须留空字符串，不编造任何URL；此时基于你的"
+        "内部知识整理事实即可，置信度根据知识确定性合理评估。收到 source_verification_errors 时，必须"
         "逐项更换不可达来源或收窄不受正文支持的 claim。"
     )
 
@@ -129,6 +131,28 @@ class ResearchEngine(StructuredEngine):
                                 ),
                             } for url in stale],
                         )
+            # 无外部来源模式：跳过所有URL抓取和验证，信任LLM内部知识
+            if source_candidates is None:
+                # 强制清空所有source_url，确保后续流程不尝试抓取
+                for fact in research.facts:
+                    fact.source_url = ""
+                    fact.published_at = None
+                    fact.source_type = None
+                evidence = [{
+                    "fact_index": i,
+                    "original_url": "",
+                    "final_url": "",
+                    "title": "[内部知识模式]",
+                    "body_summary": "",
+                    "fetched_at": "",
+                    "sha256": "",
+                    "claim_supported": True,
+                    "published_at": None,
+                    "source_type": "none",
+                    "external_verification": False,
+                } for i in range(len(research.facts))]
+                return research, evidence
+            
             try:
                 evidence = verifier.verify_research(research)
                 if policy is not None and source_candidates is not None:

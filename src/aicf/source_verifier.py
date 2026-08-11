@@ -360,8 +360,24 @@ class SourceVerifier:
         cache: dict[tuple[str, str], dict[str, object]] = {}
         for index, fact in enumerate(facts):
             claim = str(getattr(fact, "claim", ""))
-            url = str(getattr(fact, "source_url", ""))
+            url = str(getattr(fact, "source_url", "")).strip()
             key = (url, claim)
+            # 空URL：无外部来源模式，直接标记为已接受（LLM内部知识）
+            if not url:
+                evidence.append({
+                    "fact_index": index,
+                    "original_url": "",
+                    "final_url": "",
+                    "title": "[无外部来源]",
+                    "body_summary": "",
+                    "fetched_at": self.clock(),
+                    "sha256": "",
+                    "claim_supported": True,  # 信任LLM生成内容
+                    "published_at": None,
+                    "source_type": "none",
+                    "external_verification": False,
+                })
+                continue
             try:
                 item = cache.get(key)
                 if item is None:

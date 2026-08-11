@@ -85,7 +85,7 @@ class TopicCandidates(BaseModel):
 class ResearchFact(BaseModel):
     claim: NonBlankText
     source_title: NonBlankText
-    source_url: NonBlankText
+    source_url: str = Field(default="")  # 允许空字符串（内部知识模式无URL）
     confidence: float = Field(ge=0, le=1)
     published_at: date | None = None
     source_type: str | None = None

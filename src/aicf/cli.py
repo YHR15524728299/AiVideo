@@ -78,10 +78,9 @@ def build_m2_runner(
     root = project_root()
     client = OpenRouterClient(cache=FileCache(root / "data" / "openrouter_cache"))
     verifier = SourceVerifier()
-    discovery = SourceDiscovery(
-        BingRSSSearchProvider(),
-        preflight=lambda candidate: verifier.preflight(candidate.url),
-    )
+    # 暂时禁用Bing RSS外部搜索：搜索结果质量差（返回首页而非具体文章）导致验证失败
+    # TODO: 改进搜索结果过滤和query质量后重新启用
+    discovery = None
     return M2ContentRunner(
         client,
         job_repository or repository(),

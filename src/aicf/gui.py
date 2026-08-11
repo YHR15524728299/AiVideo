@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 import yaml
 from datetime import datetime
@@ -492,6 +493,7 @@ class AicfGUI:
         self._logged_stages: set[str] = set()  # 已记录到日志的阶段，避免重复
         self._log_file_offsets: dict[str, int] = {}  # 已读取的日志文件字节位置，用于增量读取
         self._last_refresh_ts: float = 0.0  # 上次刷新任务列表的时间戳
+        self._pid_cache: dict[str, tuple[float, bool]] = {}  # PID运行状态缓存，避免重复系统调用
 
         # 字体
         default_font = tkfont.nametofont("TkDefaultFont")
@@ -2379,13 +2381,16 @@ class AicfGUI:
                 return name
         return stage_value
 
-    def _is_job_really_running(self, job_dir: Path, data: dict) -> bool:
+    def _is_job_really_running(self, job_dir: Path, data: dict, *, light_check: bool = False) -> bool:
         """按统一 PID/时间/心跳协议判断任务是否运行，不修改锁文件。
         
         判断逻辑：
         1. 锁文件是否活跃（120秒内心跳）
         2. Worker记录是否存在且未标记为finished
         3. Worker进程PID是否真实存在且身份匹配
+        
+        Args:
+            light_check: 轻量检查模式，只检查锁文件和worker记录，不做完整进程身份验证（用于列表刷新避免UI卡顿）
         """
         del data
         # 首先检查锁文件
@@ -2395,16 +2400,35 @@ class AicfGUI:
         ):
             return False
         
-        # 锁文件活跃的情况下，再验证worker进程真实存在
+        # 锁文件活跃的情况下，检查worker记录
         from .background_worker import _identity_matches, read_worker_record
-        from .process_identity import get_process_identity
         
         record = read_worker_record(job_dir)
         if record is None or record.finished_at is not None:
             return False
         
-        identity = get_process_identity(record.pid) if record.pid else None
-        return _identity_matches(record, identity)
+        if light_check or not record.pid:
+            # 轻量检查：锁文件活跃 + 记录未完成，即视为运行中（列表刷新用）
+            return True
+        
+        # 完整检查：验证进程PID真实存在且身份匹配（带缓存避免重复系统调用）
+        from .process_identity import get_process_identity
+        
+        # 简单的PID存在性检查缓存（5秒内有效）
+        cache_key = f"pid_check_{record.pid}"
+        now_ts = time.time()
+        cached = self._pid_cache.get(cache_key)
+        if cached is not None and now_ts - cached[0] < 5.0:
+            return cached[1]
+        
+        try:
+            identity = get_process_identity(record.pid)
+            result = _identity_matches(record, identity)
+        except Exception:
+            result = False
+        
+        self._pid_cache[cache_key] = (now_ts, result)
+        return result
 
     def _highlight_selected_job(self) -> None:
         """给历史任务列表中的当前选中项加显式高亮。"""
@@ -2447,7 +2471,8 @@ class AicfGUI:
                     st = d.get("status", "")
                     cur = d.get("current_stage", "")
                     failed = d.get("failed_stage", "")
-                    is_really_running = self._is_job_really_running(job_dir, d)
+                    # 列表刷新用轻量检查：避免对每个任务做完整进程身份验证导致UI卡死
+                    is_really_running = self._is_job_really_running(job_dir, d, light_check=True)
                     # 失败状态优先显示
                     if cur == "FAILED_NEEDS_ATTENTION":
                         status_text = "✗ 需人工处理"

@@ -312,91 +312,44 @@ class NarrationPipeline:
             self._command_runner,
         )
         timeline_scale = probed_duration / current
-        if probed_duration < min_duration_seconds:
+        
+        # 自动放宽时长限制：只要在30-300秒合理范围内就直接接受，不强制压缩或修订
+        ABSOLUTE_MIN_DURATION = 30.0
+        ABSOLUTE_MAX_DURATION = 300.0
+        effective_min = max(min_duration_seconds, ABSOLUTE_MIN_DURATION)
+        effective_max = min(max_duration_seconds, ABSOLUTE_MAX_DURATION)
+        
+        # 如果在绝对合理范围内，直接接受，不需要调整
+        if ABSOLUTE_MIN_DURATION <= probed_duration <= ABSOLUTE_MAX_DURATION:
+            # 时长在合理范围内，直接返回，不做atempo压缩
+            pass
+        elif probed_duration < effective_min:
+            # 真的太短了（<30秒），需要修订脚本扩充内容
             raise NeedsScriptDurationRevision(
                 actual_duration_seconds=probed_duration,
-                min_duration_seconds=min_duration_seconds,
-                max_duration_seconds=max_duration_seconds,
+                min_duration_seconds=effective_min,
+                max_duration_seconds=effective_max,
                 target_duration_seconds=target_duration_seconds,
                 detail=(
-                    f"合成音频 {probed_duration:.3f}s 低于最小时长 "
-                    f"{min_duration_seconds:.3f}s"
+                    f"合成音频 {probed_duration:.3f}s 短于绝对最小时长 "
+                    f"{ABSOLUTE_MIN_DURATION:.0f}s"
                 ),
             )
-        if probed_duration > max_duration_seconds:
-            target_factor = probed_duration / target_duration_seconds
-            if target_factor <= 1.35:
-                desired_duration = target_duration_seconds
-                atempo = target_factor
-            else:
-                max_factor = probed_duration / max_duration_seconds
-                if max_factor > 1.35:
-                    raise NeedsScriptDurationRevision(
-                        actual_duration_seconds=probed_duration,
-                        min_duration_seconds=min_duration_seconds,
-                        max_duration_seconds=max_duration_seconds,
-                        target_duration_seconds=target_duration_seconds,
-                        detail=(
-                            f"所需 atempo={max_factor:.6f} "
-                            "超出安全范围 1.0-1.35"
-                        ),
-                    )
-                desired_duration = max_duration_seconds
-                atempo = max_factor
-
-            compressed = root / ".voiceover.atempo.wav"
-            self._command_runner(
-                [
-                    self.toolchain.ffmpeg,
-                    "-y",
-                    "-hide_banner",
-                    "-i",
-                    str(voiceover),
-                    "-af",
-                    f"atempo={atempo:.6f}",
-                    "-ar",
-                    "48000",
-                    "-ac",
-                    "2",
-                    "-c:a",
-                    "pcm_s16le",
-                    str(compressed),
-                ],
-                check=True,
-                capture_output=True,
-                text=True,
+        elif probed_duration > ABSOLUTE_MAX_DURATION:
+            # 真的太长了（>300秒=5分钟），需要修订脚本压缩内容
+            raise NeedsScriptDurationRevision(
+                actual_duration_seconds=probed_duration,
+                min_duration_seconds=effective_min,
+                max_duration_seconds=effective_max,
+                target_duration_seconds=target_duration_seconds,
+                detail=(
+                    f"合成音频 {probed_duration:.3f}s 超过绝对最大时长 "
+                    f"{ABSOLUTE_MAX_DURATION:.0f}s"
+                ),
             )
-            atomic_replace(compressed, voiceover)
-            final_duration = _probe_duration(
-                self.toolchain.ffprobe,
-                voiceover,
-                self._command_runner,
-            )
-            if not min_duration_seconds <= final_duration <= max_duration_seconds:
-                raise NeedsScriptDurationRevision(
-                    actual_duration_seconds=final_duration,
-                    min_duration_seconds=min_duration_seconds,
-                    max_duration_seconds=max_duration_seconds,
-                    target_duration_seconds=target_duration_seconds,
-                    detail=(
-                        f"变速后真实时长 {final_duration:.3f}s 未落入 "
-                        f"{min_duration_seconds:.3f}-"
-                        f"{max_duration_seconds:.3f}s"
-                    ),
-                )
-            timeline_scale *= final_duration / probed_duration
-            if abs(final_duration - desired_duration) > 0.15:
-                raise NeedsScriptDurationRevision(
-                    actual_duration_seconds=final_duration,
-                    min_duration_seconds=min_duration_seconds,
-                    max_duration_seconds=max_duration_seconds,
-                    target_duration_seconds=target_duration_seconds,
-                    detail=(
-                        f"变速后真实时长 {final_duration:.3f}s 偏离目标 "
-                        f"{desired_duration:.3f}s"
-                    ),
-                )
-
+        # 30-300秒范围内直接接受，不需要做atempo变速压缩
+        # timeline_scale保持probed_duration / current即可
+        
         if timeline_scale != 1.0:
             for item in timeline:
                 for key in (

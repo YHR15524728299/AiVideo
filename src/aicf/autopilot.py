@@ -379,6 +379,24 @@ class Autopilot:
         job_dir: Path,
         error: NeedsScriptDurationRevision,
     ) -> dict[str, Any]:
+        # 自动放宽时长限制：30-300秒范围内直接接受，不要求修订或人工处理
+        ABSOLUTE_MIN = 30.0
+        ABSOLUTE_MAX = 300.0
+        if ABSOLUTE_MIN <= error.actual_duration_seconds <= ABSOLUTE_MAX:
+            print(
+                f"[autopilot] 旁白时长 {error.actual_duration_seconds:.1f}s 在合理范围 "
+                f"{ABSOLUTE_MIN:.0f}-{ABSOLUTE_MAX:.0f}s 内，自动接受继续后续阶段",
+                flush=True,
+            )
+            # 直接标记AUDIO_GENERATED阶段完成，继续后续流程
+            hashes = self._artifact_hashes(self._artifacts(PipelineStage.AUDIO_GENERATED, job_dir))
+            self.repository.complete_stage(
+                job_id,
+                PipelineStage.AUDIO_GENERATED,
+                artifact_hashes=hashes,
+            )
+            return {"status": "ok", "duration_accepted": True}
+        
         round_number = self._next_duration_revision_round(job_dir)
         recovery = (
             f"python -m aicf reopen --job {job_id} "

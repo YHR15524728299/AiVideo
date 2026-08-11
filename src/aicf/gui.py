@@ -497,6 +497,8 @@ class AicfGUI:
         self._pid_cache: dict[str, tuple[float, bool]] = {}  # PID运行状态缓存，避免重复系统调用
         self._poll_in_progress: bool = False  # 轮询防重入标志
         self._force_refresh_event: Event = Event()  # 强制刷新事件：给后台线程发信号立即刷新
+        self._loading_initial_logs: bool = False  # 正在加载初始日志标志，避免重复加载
+        self._last_loaded_job_id: str | None = None  # 上次加载日志的任务ID，防抖用
 
         # 字体
         default_font = tkfont.nametofont("TkDefaultFont")
@@ -2183,20 +2185,26 @@ class AicfGUI:
                 "", "end", iid=item["job_id"],
                 values=(item["job_id"], item["direction"], item["status"], item["stage"], item["updated"]),
             )
+        # 恢复之前选中的任务（如果还存在）
+        selection_restored = False
         if current_selection:
             existing = [item for item in current_selection if self.job_tree.exists(item)]
             if existing:
                 self.job_tree.selection_set(existing)
                 self.job_tree.focus(existing[0])
+                selection_restored = True
         self._highlight_selected_job()
-        # 自动选中第一个任务
-        if not self.job_tree.selection() and not self._user_selected_job:
+        # 自动选中第一个任务（仅当没有选中项且用户没有手动选择过时），不触发日志重载
+        if not selection_restored and not self.job_tree.selection() and not self._user_selected_job:
             children = self.job_tree.get_children()
             if children:
                 first_job = children[0]
                 self.job_tree.selection_set(first_job)
                 self.job_tree.focus(first_job)
+                # 标记为正在加载初始日志，避免重复
+                self._loading_initial_logs = True
                 self._on_job_select()
+                self._loading_initial_logs = False
         self._update_button_states()
 
     def _get_log_tag(self, line: str) -> str:
@@ -2937,10 +2945,19 @@ class AicfGUI:
         if sel:
             self._highlight_selected_job()
             job_id = str(sel[0])
+            # 防抖：如果选中的是同一个任务且已经加载过日志，跳过重复IO
+            if job_id == getattr(self, '_last_loaded_job_id', None) and not self._loading_initial_logs:
+                self.job_id_var.set(job_id)
+                self._update_button_states()
+                self._show_current_job_guidance()
+                return
+            self._last_loaded_job_id = job_id
             self.job_id_var.set(job_id)
             # 用户手动选中任务，进度条显示该任务的状态
             self._display_job_id = job_id
             self._user_selected_job = True
+            # 注意：_load_job_production_settings、_refresh_status_for_job、_load_job_logs 都是IO操作
+            # 这里会有短暂阻塞，但用户主动点击时可以接受
             self._load_job_production_settings(job_id)
             self._refresh_status_for_job(job_id)
             sp = self._get_status_path(job_id)

@@ -514,7 +514,7 @@ class AicfGUI:
         self._update_button_states()  # 初始化按钮状态
         # 后台异步检测视频提供商和环境状态（不阻塞UI启动）
         for lbl in self.env_labels.values():
-            lbl.configure(text="检测中...", style="EnvIdle.TLabel")
+            lbl.configure(text="检测中...", fg="#666666", font=("TkDefaultFont", 9))
         self._set_status("启动中，正在后台检测环境...")
         self._start_async_provider_detection()
 
@@ -524,9 +524,6 @@ class AicfGUI:
     def _setup_styles(self) -> None:
         style = ttk.Style()
         style.theme_use("vista")
-        style.configure("EnvIdle.TLabel", foreground="#666666", font=("TkDefaultFont", 9))
-        style.configure("EnvOk.TLabel", foreground="#2e7d32", font=("TkDefaultFont", 9, "bold"))
-        style.configure("EnvFail.TLabel", foreground="#c62828", font=("TkDefaultFont", 9, "bold"))
         style.configure("Stage.TLabel", padding=(6, 4), relief="flat")
         style.configure("StageActive.TLabel", padding=(6, 4), background="#1976d2", foreground="white", font=("TkDefaultFont", 9, "bold"))
         style.configure("StageDone.TLabel", padding=(6, 4), background="#2e7d32", foreground="white", font=("TkDefaultFont", 9))
@@ -540,7 +537,7 @@ class AicfGUI:
         env_frame = ttk.LabelFrame(root, text="环境状态", padding=8)
         env_frame.pack(fill="x", padx=10, pady=(10, 4))
 
-        self.env_labels: dict[str, ttk.Label] = {}
+        self.env_labels: dict[str, Label] = {}
         env_items = [
             ("openrouter", "OpenRouter"),
             ("dreamina", "即梦 CLI"),
@@ -549,8 +546,8 @@ class AicfGUI:
             ("tts", "TTS 语音"),
         ]
         for i, (key, text) in enumerate(env_items):
-            ttk.Label(env_frame, text=text + ":").grid(row=0, column=i * 2, sticky="w", padx=(8, 4))
-            lbl = ttk.Label(env_frame, text="未检查", style="EnvIdle.TLabel", cursor="hand2")
+            tk.Label(env_frame, text=text + ":", bg="#f0f0f0").grid(row=0, column=i * 2, sticky="w", padx=(8, 4))
+            lbl = tk.Label(env_frame, text="未检查", fg="#666666", bg="#f0f0f0", font=("TkDefaultFont", 9), cursor="hand2")
             lbl.grid(row=0, column=i * 2 + 1, sticky="w", padx=(0, 16))
             lbl.bind("<Button-1>", lambda e, k=key: self._open_settings_for(k))
             self.env_labels[key] = lbl
@@ -564,8 +561,8 @@ class AicfGUI:
 
         # 当前模型显示 + 选择按钮
         current_model = _get_env_value("OPENROUTER_MODEL") or "未设置"
-        ttk.Label(env_frame, text="模型:").grid(row=1, column=0, sticky="w", padx=(8, 4), pady=(4, 0))
-        self.model_label = ttk.Label(env_frame, text=current_model, foreground="#1976d2", font=("TkDefaultFont", 8, "bold"))
+        tk.Label(env_frame, text="模型:", bg="#f0f0f0").grid(row=1, column=0, sticky="w", padx=(8, 4), pady=(4, 0))
+        self.model_label = tk.Label(env_frame, text=current_model, fg="#1976d2", bg="#f0f0f0", font=("TkDefaultFont", 8, "bold"))
         self.model_label.grid(row=1, column=1, columnspan=7, sticky="w", pady=(4, 0))
         ttk.Button(env_frame, text="模型选择", command=self._open_model_selector).grid(
             row=1, column=len(env_items) * 2, sticky="e", padx=8, pady=(4, 0)
@@ -785,11 +782,11 @@ class AicfGUI:
         self.job_tree.heading("status", text="状态")
         self.job_tree.heading("stage", text="当前阶段")
         self.job_tree.heading("updated", text="更新时间")
-        self.job_tree.column("job_id", width=120, anchor="w")
-        self.job_tree.column("direction", width=150, anchor="w")
-        self.job_tree.column("status", width=90, anchor="w")
-        self.job_tree.column("stage", width=110, anchor="w")
-        self.job_tree.column("updated", width=130, anchor="w")
+        self.job_tree.column("job_id", width=140, anchor="w")
+        self.job_tree.column("direction", width=160, anchor="w")
+        self.job_tree.column("status", width=110, anchor="w")
+        self.job_tree.column("stage", width=140, anchor="w")
+        self.job_tree.column("updated", width=140, anchor="w")
         self.job_tree.tag_configure("selected_row", background="#1976d2", foreground="white")
         self.job_tree.pack(fill="both", expand=True)
         self.job_tree.bind("<<TreeviewSelect>>", self._on_job_select)
@@ -1668,7 +1665,7 @@ class AicfGUI:
     def _update_env_lights(self, output: str, ok: bool) -> None:
         if ok:
             for lbl in self.env_labels.values():
-                lbl.configure(text="✓ 就绪", style="EnvOk.TLabel")
+                lbl.configure(text="✓ 就绪", fg="#2e7d32", font=("TkDefaultFont", 9, "bold"))
             self._set_status("环境检查完成")
             self._log("环境检查通过", "success")
         else:
@@ -1681,9 +1678,9 @@ class AicfGUI:
             }
             for key, lbl in self.env_labels.items():
                 if checks.get(key, False):
-                    lbl.configure(text="✓ 就绪", style="EnvOk.TLabel")
+                    lbl.configure(text="✓ 就绪", fg="#2e7d32", font=("TkDefaultFont", 9, "bold"))
                 else:
-                    lbl.configure(text="✗ 异常", style="EnvFail.TLabel")
+                    lbl.configure(text="✗ 异常", fg="#c62828", font=("TkDefaultFont", 9, "bold"))
             self._set_status("环境存在问题，请查看日志")
             self._log("环境存在问题", "error")
 
@@ -2260,7 +2257,25 @@ class AicfGUI:
                         if sp.is_file():
                             try:
                                 d = json.loads(sp.read_text(encoding="utf-8"))
+                                # 正确识别真正失败的阶段（避免把状态名当成阶段名）
+                                terminal_states = {"COMPLETED", "INIT", "FAILED_RETRYABLE", "FAILED_NEEDS_ATTENTION"}
                                 failed_stage = d.get("current_stage", "UNKNOWN")
+                                if failed_stage in terminal_states:
+                                    # 当前是状态名，需要找真正失败的阶段
+                                    stages = d.get("stages", {})
+                                    completed = set(d.get("completed_stages", []))
+                                    # 找第一个started但未completed的阶段
+                                    found = None
+                                    for stage_enum in [s[0].value for s in STAGES]:
+                                        if stage_enum in stages and stage_enum not in completed:
+                                            stage_data = stages[stage_enum]
+                                            if isinstance(stage_data, dict) and stage_data.get("started_at"):
+                                                found = stage_enum
+                                                break
+                                    if found:
+                                        failed_stage = found
+                                    elif d.get("failed_stage") and d["failed_stage"] not in terminal_states:
+                                        failed_stage = d["failed_stage"]
                                 d["failed_stage"] = failed_stage
                                 d["current_stage"] = "FAILED_RETRYABLE"
                                 d["last_error"] = "任务被用户强制停止，可点击继续/恢复"
@@ -2500,9 +2515,18 @@ class AicfGUI:
             except Exception:
                 pass
         
-        # 读取worker.log
-        worker_log = job_dir / "_work" / "runtime" / "worker.log"
-        if worker_log.is_file():
+        # 读取worker.log - 兼容多个可能的位置
+        worker_log_candidates = [
+            job_dir / "_work" / "runtime" / "worker.log",
+            job_dir / "worker.log",
+            job_dir / "logs" / "worker.log",
+        ]
+        worker_log = None
+        for candidate in worker_log_candidates:
+            if candidate.is_file():
+                worker_log = candidate
+                break
+        if worker_log is not None:
             try:
                 content = worker_log.read_text(encoding="utf-8", errors="replace")
                 # 标记偏移为文件末尾，避免后续重复读取
@@ -2514,8 +2538,12 @@ class AicfGUI:
             except Exception as e:
                 self._log(f"读取worker.log失败: {e}", "error")
         
-        # 读取各阶段日志 - 路径相对于 _work/runtime/ 目录
-        runtime_dir = job_dir / "_work" / "runtime"
+        # 读取各阶段日志 - 兼容 _work/runtime/ 和 根目录/logs/ 两种路径
+        runtime_dir_candidates = [
+            job_dir / "_work" / "runtime",
+            job_dir,
+            job_dir / "logs",
+        ]
         stages_info = data.get("stages", {})
         if isinstance(stages_info, dict):
             for stage_key, stage_info in stages_info.items():
@@ -2524,16 +2552,19 @@ class AicfGUI:
                 log_rel = stage_info.get("log_path")
                 if not isinstance(log_rel, str) or not log_rel:
                     continue
-                # 阶段日志在 _work/runtime/ 下，尝试两种路径
-                log_path = runtime_dir / log_rel
-                if not log_path.is_file():
-                    log_path = job_dir / log_rel  # fallback到根目录
-                if not log_path.is_file():
+                # 在多个候选目录中查找日志文件
+                log_path = None
+                for base_dir in runtime_dir_candidates:
+                    candidate = base_dir / log_rel
+                    if candidate.is_file():
+                        log_path = candidate
+                        break
+                if log_path is None:
                     continue
                 try:
                     content = log_path.read_text(encoding="utf-8", errors="replace")
                     self._log_file_offsets[f"{job_id}/{log_rel}"] = log_path.stat().st_size
-                    stage_name = stage_info.get("name", stage_key)
+                    stage_name = self._translate_stage(stage_key)
                     self._log(f"--- 阶段: {stage_name} ---", "info")
                     for line in content.splitlines():
                         if line.strip():
@@ -2582,22 +2613,32 @@ class AicfGUI:
                         self._polling_job_id = ""  # 先清空，避免_tail重复追加
                         self._log_file_offsets.clear()
                         self._load_job_logs(job_id)
-                        # 设置偏移为当前文件末尾，避免重复读取
-                        worker_log = job_dir / "_work" / "runtime" / "worker.log"
-                        if worker_log.is_file():
-                            self._log_file_offsets[f"{job_id}/worker.log"] = worker_log.stat().st_size
+                        # 设置偏移为当前文件末尾，避免重复读取 - 兼容多路径
+                        worker_log_candidates = [
+                            job_dir / "_work" / "runtime" / "worker.log",
+                            job_dir / "worker.log",
+                            job_dir / "logs" / "worker.log",
+                        ]
+                        for wlog in worker_log_candidates:
+                            if wlog.is_file():
+                                self._log_file_offsets[f"{job_id}/worker.log"] = wlog.stat().st_size
+                                break
                         stages_info = data.get("stages", {})
-                        runtime_dir_offset = job_dir / "_work" / "runtime"
+                        runtime_dir_candidates = [
+                            job_dir / "_work" / "runtime",
+                            job_dir,
+                            job_dir / "logs",
+                        ]
                         if isinstance(stages_info, dict):
                             for stage_info in stages_info.values():
                                 if isinstance(stage_info, dict):
                                     log_rel = stage_info.get("log_path")
                                     if isinstance(log_rel, str) and log_rel:
-                                        log_path = runtime_dir_offset / log_rel
-                                        if not log_path.is_file():
-                                            log_path = job_dir / log_rel
-                                        if log_path.is_file():
-                                            self._log_file_offsets[f"{job_id}/{log_rel}"] = log_path.stat().st_size
+                                        for base_dir in runtime_dir_candidates:
+                                            log_path = base_dir / log_rel
+                                            if log_path.is_file():
+                                                self._log_file_offsets[f"{job_id}/{log_rel}"] = log_path.stat().st_size
+                                                break
                         self._polling_job_id = job_id
                     else:
                         self._set_buttons_running(self._polling_job_id != "")
@@ -2763,7 +2804,23 @@ class AicfGUI:
             if sp.is_file():
                 try:
                     d = json.loads(sp.read_text(encoding="utf-8"))
+                    # 正确识别真正失败的阶段（避免把状态名当成阶段名）
+                    terminal_states = {"COMPLETED", "INIT", "FAILED_RETRYABLE", "FAILED_NEEDS_ATTENTION"}
                     failed_stage = d.get("current_stage", "UNKNOWN")
+                    if failed_stage in terminal_states:
+                        stages = d.get("stages", {})
+                        completed = set(d.get("completed_stages", []))
+                        found = None
+                        for stage_enum in [s[0].value for s in STAGES]:
+                            if stage_enum in stages and stage_enum not in completed:
+                                stage_data = stages[stage_enum]
+                                if isinstance(stage_data, dict) and stage_data.get("started_at"):
+                                    found = stage_enum
+                                    break
+                        if found:
+                            failed_stage = found
+                        elif d.get("failed_stage") and d["failed_stage"] not in terminal_states:
+                            failed_stage = d["failed_stage"]
                     d["failed_stage"] = failed_stage
                     d["current_stage"] = "FAILED_RETRYABLE"
                     d["last_error"] = "用户手动强制清理，可点击继续/恢复"
@@ -2790,8 +2847,19 @@ class AicfGUI:
         stages_info = data.get("stages", {})
         if not isinstance(stages_info, dict):
             return
-        worker_log = job_dir / "_work" / "runtime" / "worker.log"
-        if worker_log.is_file():
+        
+        # worker.log - 兼容多个位置
+        worker_log_candidates = [
+            job_dir / "_work" / "runtime" / "worker.log",
+            job_dir / "worker.log",
+            job_dir / "logs" / "worker.log",
+        ]
+        worker_log = None
+        for candidate in worker_log_candidates:
+            if candidate.is_file():
+                worker_log = candidate
+                break
+        if worker_log is not None:
             cache_key = f"{job_id}/worker.log"
             last_pos = self._log_file_offsets.get(cache_key, 0)
             try:
@@ -2810,18 +2878,26 @@ class AicfGUI:
                             self._log_raw(line.rstrip())
             except OSError:
                 pass
-        # 读取所有有 log_path 的阶段日志 - 路径相对于 _work/runtime/ 目录
-        runtime_dir = job_dir / "_work" / "runtime"
+        
+        # 读取所有有 log_path 的阶段日志 - 兼容多个目录位置
+        runtime_dir_candidates = [
+            job_dir / "_work" / "runtime",
+            job_dir,
+            job_dir / "logs",
+        ]
         for stage_key, stage_info in stages_info.items():
             if not isinstance(stage_info, dict):
                 continue
             log_rel = stage_info.get("log_path")
             if not isinstance(log_rel, str) or not log_rel:
                 continue
-            log_path = runtime_dir / log_rel
-            if not log_path.is_file():
-                log_path = job_dir / log_rel  # fallback
-            if not log_path.is_file():
+            log_path = None
+            for base_dir in runtime_dir_candidates:
+                candidate = base_dir / log_rel
+                if candidate.is_file():
+                    log_path = candidate
+                    break
+            if log_path is None:
                 continue
             cache_key = f"{job_id}/{log_rel}"
             last_pos = self._log_file_offsets.get(cache_key, 0)

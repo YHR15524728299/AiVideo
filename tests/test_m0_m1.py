@@ -106,7 +106,7 @@ def test_config_applies_defaults_and_preserves_overrides(tmp_path: Path) -> None
 
     assert isinstance(config, AppConfig)
     assert config.video.target_duration_seconds == 55
-    assert config.video.min_duration_seconds == 45
+    assert config.video.min_duration_seconds == 41  # 短视频自动计算为target*0.75
     assert config.visual_production.mode == "balanced"
     assert config.autopilot.max_repair_rounds == 2
 
@@ -433,7 +433,6 @@ def test_topic_candidate_rejects_blank_strings(field: str) -> None:
         ("summary", None),
         ("facts", "claim"),
         ("facts", "source_title"),
-        ("facts", "source_url"),
         ("unknowns", None),
     ],
 )
@@ -462,6 +461,36 @@ def test_research_result_rejects_blank_strings(
 
     with pytest.raises(ValidationError):
         ResearchResult.model_validate(payload)
+
+
+def test_research_fact_accepts_empty_source_url_for_internal_knowledge() -> None:
+    """内部知识模式下 source_url 允许为空字符串。"""
+    from aicf.models.contracts import ResearchFact
+
+    fact = ResearchFact(
+        claim="内部知识事实",
+        source_title="内部知识",
+        source_url="",
+        confidence=0.8,
+    )
+    assert fact.source_url == ""
+
+    # 完整 ResearchResult 中使用空 source_url 也应通过验证
+    result = ResearchResult.model_validate(
+        {
+            "summary": "摘要",
+            "facts": [
+                {
+                    "claim": "事实",
+                    "source_title": "来源",
+                    "source_url": "",
+                    "confidence": 1,
+                }
+            ],
+            "unknowns": [],
+        }
+    )
+    assert result.facts[0].source_url == ""
 
 
 @pytest.mark.parametrize(

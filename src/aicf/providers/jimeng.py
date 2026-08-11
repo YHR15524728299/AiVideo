@@ -196,7 +196,7 @@ def _capability_config(
             "timeout_seconds": 1800,
             "poll_interval_seconds": 2,
             "max_concurrency": 1,
-            "retry_count": 1,
+            "retry_count": 3,
             "cache_enabled": True,
         },
         "detection": {
@@ -296,7 +296,7 @@ class JimengCliAdapter:
         timeout_seconds: float = 1800,
         poll_interval_seconds: float = 2,
         cache_dir: str | Path | None = None,
-        retry_count: int = 1,
+        retry_count: int = 3,
         ffprobe_executable: str = "ffprobe",
         command_runner: CommandRunner = silent_run,
         sleep: Sleep = time.sleep,
@@ -317,7 +317,7 @@ class JimengCliAdapter:
         self.cache_dir = Path(cache_dir) if cache_dir is not None else None
         if self.cache_dir is not None:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.retry_count = min(max(0, retry_count), 1)
+        self.retry_count = min(max(0, retry_count), 5)  # 最多允许5次重试
         self.ffprobe_executable = ffprobe_executable
         self._command_runner = command_runner
         self._sleep = sleep

@@ -126,15 +126,16 @@ def test_interrupted_job_exposes_resume_action() -> None:
     assert "异常中断" in actions.guidance
 
 
-def test_attention_failure_requires_manual_handling() -> None:
+def test_attention_failure_allows_manual_resume() -> None:
+    """所有失败状态（包括需人工处理的QA失败）都允许用户点击恢复尝试重跑。"""
     actions = derive_job_actions(
         existing_job=True,
         current_stage="FAILED_NEEDS_ATTENTION",
         failed_stage="QA_CHECKED",
     )
 
-    assert actions.can_resume is False
-    assert "人工处理" in actions.guidance
+    assert actions.can_resume is True
+    assert "继续/恢复" in actions.guidance
 
 
 def test_attention_network_failure_exposes_resume_action() -> None:

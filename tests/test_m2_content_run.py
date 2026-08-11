@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,7 @@ from aicf.database import JobRepository
 from aicf.m2_runner import M2ContentRunner
 from aicf.providers.openrouter import StructuredResult, TokenUsage
 from aicf.research_policy import classify_source_error
+from aicf.source_discovery import DiscoveryResult, SourceCandidate
 from aicf.source_verifier import SourceVerificationError
 from aicf.state_machine import PipelineStage
 
@@ -33,6 +35,44 @@ class SequencedClient:
             cached=False,
             model="test/model:free",
         )
+
+
+class StubSourceDiscovery:
+    """返回足够数量的候选来源，触发完整来源验证流程"""
+    def __init__(self, url: str = "https://example.com/workflow") -> None:
+        self.url = url
+        self.calls = 0
+
+    def discover(self, **kwargs: object) -> DiscoveryResult:
+        self.calls += 1
+        # 返回3个候选来源（满足minimum_verified_facts=3）
+        candidates = [
+            SourceCandidate(
+                url=self.url,
+                title="Workflow",
+                published_at=date(2026, 7, 20),
+                source_type="web",
+                query="test",
+                core_eligible=True,
+            ),
+            SourceCandidate(
+                url="https://example.com/source2",
+                title="Source 2",
+                published_at=date(2026, 7, 20),
+                source_type="web",
+                query="test",
+                core_eligible=True,
+            ),
+            SourceCandidate(
+                url="https://example.com/source3",
+                title="Source 3",
+                published_at=date(2026, 7, 20),
+                source_type="web",
+                query="test",
+                core_eligible=True,
+            ),
+        ]
+        return DiscoveryResult(candidates=candidates, rejections=[])
 
 
 class StubSourceVerifier:
@@ -76,12 +116,14 @@ def _runner(
     repo: JobRepository,
     outputs_root: Path,
     verifier: StubSourceVerifier | None = None,
+    source_discovery: object | None = None,
 ) -> M2ContentRunner:
     return M2ContentRunner(
         client,
         repo,
         outputs_root,
         source_verifier=verifier or StubSourceVerifier(),
+        source_discovery=source_discovery,
     )
 
 
@@ -522,6 +564,7 @@ def test_m2_runner_repairs_research_from_specific_source_errors_and_saves_eviden
         "package": [_package()],
     })
     verifier = StubSourceVerifier([["facts[0] URL HTTP 404"]])
+    discovery = StubSourceDiscovery()
     repo = JobRepository(tmp_path / "data" / "content.db")
 
     manifest = _runner(
@@ -529,6 +572,7 @@ def test_m2_runner_repairs_research_from_specific_source_errors_and_saves_eviden
         repo,
         tmp_path / "outputs",
         verifier,
+        discovery,
     ).run("M2SOURCE001", _config())
 
     research_calls = [
@@ -562,6 +606,7 @@ def test_m2_runner_blocks_after_two_source_support_repairs(tmp_path: Path) -> No
         ["facts[0] URL 不可达"],
         ["facts[0] 最终 URL 禁止访问私网"],
     ])
+    discovery = StubSourceDiscovery()
     repo = JobRepository(tmp_path / "data" / "content.db")
 
     with pytest.raises(SourceVerificationError, match="最终 URL"):
@@ -570,6 +615,7 @@ def test_m2_runner_blocks_after_two_source_support_repairs(tmp_path: Path) -> No
             repo,
             tmp_path / "outputs",
             verifier,
+            discovery,
         ).run("M2SOURCE002", _config())
 
     assert client.calls.count("research") == 3
@@ -604,6 +650,7 @@ def test_research_resume_uses_new_attempt_id_without_repeating_earlier_stages(
         ["facts[0] URL HTTP 404"],
         ["facts[0] URL HTTP 404"],
     ])
+    discovery = StubSourceDiscovery()
 
     with pytest.raises(SourceVerificationError):
         _runner(
@@ -611,6 +658,7 @@ def test_research_resume_uses_new_attempt_id_without_repeating_earlier_stages(
             repo,
             outputs_root,
             failing_verifier,
+            discovery,
         ).run("M2ATTEMPT001", _config())
 
     rejections = json.loads(
@@ -654,6 +702,7 @@ def test_research_resume_uses_new_attempt_id_without_repeating_earlier_stages(
         repo,
         outputs_root,
         StubSourceVerifier(),
+        discovery,
     ).run("M2ATTEMPT001", _config())
 
     resumed_research = next(

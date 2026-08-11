@@ -577,6 +577,9 @@ class JobRepository:
             "credentials_restored",
             "external_service_restored",
             "dependency_restored",
+            "auto_retry",  # 自动重试恢复（瞬态错误）
+            "transient_error",  # 瞬态错误（网络/服务临时不可用）
+            "user_requested_retry",  # 用户主动点击恢复
         }
 
         def mutate(status: JobStatus) -> None:

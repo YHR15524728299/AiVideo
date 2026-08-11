@@ -357,30 +357,32 @@ def test_pending_timeout_returns_waiting_external_and_resume_never_resubmits(
     assert len(provider.submissions) == 5
 
 
-def test_failed_video_retries_once_then_raises_error_no_degradation(
+def test_failed_video_retries_then_degrades_to_image(
     tmp_path: Path,
 ) -> None:
-    """视频模式下，视频生成失败重试1次后仍失败则抛出异常，不降级为图片。"""
+    """视频模式下，视频生成失败重试后降级为图片，图片也失败则抛出异常。"""
     plan_path = tmp_path / "visual_plan.json"
     _write_plan(plan_path, ["video"])
     provider = FakeDreamina(
         {
             "video-1": ["failed"],
             "video-2": ["failed"],
+            "image-3": ["failed"],  # 降级为图片后也失败（注意：id按提交顺序递增）
         }
     )
 
     with pytest.raises(RuntimeError, match="VIS001 生成失败"):
         M4AssetRunner(provider, media_probe=_probe).run(plan_path)
 
-    # 总共提交了2次（1次初始 + 1次重试），没有降级为图片
-    assert [kind for kind, _, _ in provider.submissions] == ["video", "video"]
+    # 总共提交了3次：2次视频（初始+重试），1次图片（降级）
+    submission_kinds = [kind for kind, _, _ in provider.submissions]
+    assert submission_kinds == ["video", "video", "image"]
     tasks = json.loads(
         (tmp_path / "assets" / "tasks.json").read_text(encoding="utf-8")
     )
     task = tasks["tasks"][0]
-    assert task["attempts"] == 2
-    assert task.get("degraded_from") is None
+    assert task["attempts"] == 3
+    assert task.get("degraded_from") == "video"
 
 
 def test_writes_durable_intent_before_submit_with_request_and_model_parameters(

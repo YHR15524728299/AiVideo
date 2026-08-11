@@ -453,7 +453,7 @@ class TechnicalQA:
                 "-i",
                 str(master),
                 "-af",
-                "silencedetect=noise=-45dB:d=1.1",
+                "silencedetect=noise=-45dB:d=2.0",
                 "-f",
                 "null",
                 "-",

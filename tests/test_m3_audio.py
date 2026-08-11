@@ -146,7 +146,7 @@ def test_batch_synthesize_creates_segments_voiceover_timeline_and_subtitles(
     class FakeService:
         def synthesize(self, text: str, output_path: Path):
             synthesized_texts.append(text)
-            _write_wav(output_path, duration=0.75)
+            _write_wav(output_path, duration=50.0)
             return type("Result", (), {"provider": "fake", "degraded": False})()
 
     ffmpeg_commands: list[list[str]] = []
@@ -154,7 +154,7 @@ def test_batch_synthesize_creates_segments_voiceover_timeline_and_subtitles(
     def fake_run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
         ffmpeg_commands.append(command)
         if command[0] == "full-ffprobe":
-            return subprocess.CompletedProcess(command, 0, "1.45\n", "")
+            return subprocess.CompletedProcess(command, 0, "55.0\n", "")
         if "-af" in command:
             source = Path(command[command.index("-i") + 1])
             target = Path(command[-1])
@@ -180,9 +180,9 @@ def test_batch_synthesize_creates_segments_voiceover_timeline_and_subtitles(
             ]
         },
         tmp_path,
-        target_duration_seconds=1.0,
-        min_duration_seconds=1.0,
-        max_duration_seconds=2.0,
+        target_duration_seconds=55.0,
+        min_duration_seconds=41.0,
+        max_duration_seconds=69.0,
     )
 
     assert synthesized_texts == ["第一句。第二句！最后一句。"]
@@ -197,7 +197,7 @@ def test_batch_synthesize_creates_segments_voiceover_timeline_and_subtitles(
     ]
     assert timeline[0]["duration_seconds"] > 0
     assert timeline[1]["start_seconds"] == pytest.approx(timeline[0]["end_seconds"])
-    assert timeline[-1]["end_seconds"] == pytest.approx(1.45)
+    assert timeline[-1]["end_seconds"] == pytest.approx(55.0)
     assert (tmp_path / "subtitles.srt").exists()
     assert (tmp_path / "subtitles.ass").exists()
     assert any(
@@ -207,21 +207,21 @@ def test_batch_synthesize_creates_segments_voiceover_timeline_and_subtitles(
     )
 
 
-def test_batch_synthesize_compresses_to_target_and_rescales_timeline(
+def test_batch_synthesize_rescales_timeline_for_in_range_duration(
     tmp_path: Path,
 ) -> None:
+    """30-300秒范围内的旁白直接接受，时间轴按实际探测时长缩放，不做atempo变速。"""
     class FakeService:
         def synthesize(self, text: str, output_path: Path):
-            _write_wav(output_path, duration=1.0)
+            _write_wav(output_path, duration=50.0)
             return SimpleNamespace(provider="fake", degraded=False)
 
     ffmpeg_commands: list[list[str]] = []
-    probe_durations = iter(("8.0", "6.0"))
 
     def fake_run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
         ffmpeg_commands.append(command)
         if command[0] == "full-ffprobe":
-            return subprocess.CompletedProcess(command, 0, next(probe_durations), "")
+            return subprocess.CompletedProcess(command, 0, "60.0\n", "")
         source = Path(command[command.index("-i") + 1])
         target = Path(command[-1])
         target.write_bytes(source.read_bytes())
@@ -240,76 +240,79 @@ def test_batch_synthesize_compresses_to_target_and_rescales_timeline(
     ).batch_synthesize(
         {"segments": [{"segment_id": "S1", "narration": "第一句。第二句。"}]},
         tmp_path,
-        target_duration_seconds=6.0,
-        min_duration_seconds=5.0,
-        max_duration_seconds=7.0,
-    )
-
-    atempo_command = next(
-        command
-        for command in ffmpeg_commands
-        if "-af" in command and command[command.index("-af") + 1].startswith("atempo=")
-    )
-    assert atempo_command[atempo_command.index("-af") + 1] == "atempo=1.333333"
-    assert result.voiceover_path.exists()
-    timeline = json.loads(result.timeline_path.read_text(encoding="utf-8"))
-    assert timeline[0]["duration_seconds"] == pytest.approx(3.0)
-    assert timeline[1]["start_seconds"] == pytest.approx(3.0)
-    assert timeline[1]["end_seconds"] == pytest.approx(6.0)
-    assert "00:00:03,000" in result.srt_path.read_text(encoding="utf-8-sig")
-
-
-def test_batch_synthesize_uses_max_when_target_would_exceed_atempo_limit(
-    tmp_path: Path,
-) -> None:
-    class FakeService:
-        def synthesize(self, text: str, output_path: Path):
-            _write_wav(output_path)
-            return SimpleNamespace(provider="fake", degraded=False)
-
-    filters: list[str] = []
-    probe_durations = iter(("90.0", "75.0"))
-
-    def fake_run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
-        if command[0] == "full-ffprobe":
-            return subprocess.CompletedProcess(command, 0, next(probe_durations), "")
-        source = Path(command[command.index("-i") + 1])
-        target = Path(command[-1])
-        target.write_bytes(source.read_bytes())
-        if "-af" in command:
-            filters.append(command[command.index("-af") + 1])
-        return subprocess.CompletedProcess(
-            command,
-            0,
-            "",
-            '{"input_i":"-20","input_tp":"-4","input_lra":"1",'
-            '"input_thresh":"-30","target_offset":"0"}',
-        )
-
-    NarrationPipeline(
-        service=FakeService(),
-        toolchain=FfmpegToolchain("full-ffmpeg", "full-ffprobe"),
-        command_runner=fake_run,
-    ).batch_synthesize(
-        {"segments": [{"segment_id": "S1", "narration": "测试。"}]},
-        tmp_path,
         target_duration_seconds=60.0,
         min_duration_seconds=45.0,
         max_duration_seconds=75.0,
     )
 
-    assert "atempo=1.200000" in filters
+    # 30-300秒范围内不应使用atempo变速压缩
+    assert not any(
+        command[command.index("-af") + 1].startswith("atempo=")
+        for command in ffmpeg_commands
+        if "-af" in command
+    )
+    assert result.voiceover_path.exists()
+    timeline = json.loads(result.timeline_path.read_text(encoding="utf-8"))
+    # TTS产出50秒，探测到60秒（loudnorm后自然差异），scale=1.2
+    # 两句各4字，权重1:1，各25秒→缩放后各30秒
+    assert timeline[0]["duration_seconds"] == pytest.approx(30.0)
+    assert timeline[1]["start_seconds"] == pytest.approx(30.0)
+    assert timeline[1]["end_seconds"] == pytest.approx(60.0)
+    assert "00:00:30,000" in result.srt_path.read_text(encoding="utf-8-sig")
+
+
+def test_batch_synthesize_rejects_duration_above_absolute_max(
+    tmp_path: Path,
+) -> None:
+    """超过300秒绝对上限时必须要求修订脚本，不做atempo极限压缩。"""
+    class FakeService:
+        def synthesize(self, text: str, output_path: Path):
+            _write_wav(output_path)
+            return SimpleNamespace(provider="fake", degraded=False)
+
+    def fake_run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        if command[0] == "full-ffprobe":
+            return subprocess.CompletedProcess(command, 0, "350.0\n", "")
+        source = Path(command[command.index("-i") + 1])
+        target = Path(command[-1])
+        target.write_bytes(source.read_bytes())
+        if "-af" in command:
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                "",
+                '{"input_i":"-20","input_tp":"-4","input_lra":"1",'
+                '"input_thresh":"-30","target_offset":"0"}',
+            )
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    with pytest.raises(NeedsScriptDurationRevision, match="超过绝对最大时长"):
+        NarrationPipeline(
+            service=FakeService(),
+            toolchain=FfmpegToolchain("full-ffmpeg", "full-ffprobe"),
+            command_runner=fake_run,
+        ).batch_synthesize(
+            {"segments": [{"segment_id": "S1", "narration": "测试。"}]},
+            tmp_path,
+            target_duration_seconds=60.0,
+            min_duration_seconds=45.0,
+            max_duration_seconds=75.0,
+        )
 
 
 @pytest.mark.parametrize(
     ("probed_duration", "message"),
-    [("44.9", "低于最小时长"), ("102.0", "atempo")],
+    [
+        ("8.0", "短于绝对最小时长"),
+        ("350.0", "超过绝对最大时长"),
+    ],
 )
-def test_batch_synthesize_requires_script_revision_instead_of_faking_duration(
+def test_batch_synthesize_requires_script_revision_for_out_of_range_duration(
     tmp_path: Path,
     probed_duration: str,
     message: str,
 ) -> None:
+    """超出30-300秒绝对范围时必须要求修订脚本，而不是伪造时长。"""
     class FakeService:
         def synthesize(self, text: str, output_path: Path):
             _write_wav(output_path)
@@ -320,13 +323,15 @@ def test_batch_synthesize_requires_script_revision_instead_of_faking_duration(
             return subprocess.CompletedProcess(command, 0, probed_duration, "")
         source = Path(command[command.index("-i") + 1])
         Path(command[-1]).write_bytes(source.read_bytes())
-        return subprocess.CompletedProcess(
-            command,
-            0,
-            "",
-            '{"input_i":"-20","input_tp":"-4","input_lra":"1",'
-            '"input_thresh":"-30","target_offset":"0"}',
-        )
+        if "-af" in command:
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                "",
+                '{"input_i":"-20","input_tp":"-4","input_lra":"1",'
+                '"input_thresh":"-30","target_offset":"0"}',
+            )
+        return subprocess.CompletedProcess(command, 0, "", "")
 
     with pytest.raises(NeedsScriptDurationRevision, match=message):
         NarrationPipeline(

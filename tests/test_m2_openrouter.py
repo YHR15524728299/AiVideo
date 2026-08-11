@@ -131,7 +131,7 @@ def test_openrouter_proves_selected_model_is_free_from_live_catalog_before_chat(
             "Authorization": "Bearer secret",
             "Accept": "application/json",
         },
-        "timeout": 120.0,
+        "timeout": 180.0,
     }]
     assert len(chat_transport.requests) == 1
 

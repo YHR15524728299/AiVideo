@@ -219,11 +219,25 @@ class M4AssetRunner:
                     task["status"] = "failed"
                     self._write_json(tasks_path, tasks_document)
                     reason = self.provider.failure_reason(payload)
-                    if (
-                        active_kind == shot.asset_type
-                        and int(task["attempts"]) < 2
-                    ):
+                    max_attempts = 4  # 最多尝试4次（初始提交+3次重试）
+                    current_attempts = int(task["attempts"])
+                    
+                    # 重试策略：同一provider重试2次，然后切换provider，最后降级为图片
+                    can_retry_same_provider = current_attempts < 2
+                    can_switch_provider = (
+                        current_attempts < 3 
+                        and len(self.providers) > 1 
+                        and active_kind == "video"
+                    )
+                    can_degrade_to_image = (
+                        current_attempts < max_attempts
+                        and active_kind == "video"
+                    )
+                    
+                    if can_retry_same_provider:
+                        # 同一provider重试
                         task["submit_id"] = None
+                        task["last_error"] = reason
                         self._submit_with_intent(
                             tasks_path,
                             tasks_document,
@@ -235,7 +249,50 @@ class M4AssetRunner:
                             budget_guard,
                         )
                         continue
-                    raise RuntimeError(f"{shot.shot_id} 生成失败：{reason}")
+                    elif can_switch_provider:
+                        # 切换到下一个provider
+                        provider_keys = list(self.providers.keys())
+                        current_idx = provider_keys.index(self._current_provider_key)
+                        next_idx = (current_idx + 1) % len(provider_keys)
+                        self._current_provider_key = provider_keys[next_idx]
+                        task["submit_id"] = None
+                        task["provider_switched_from"] = provider_keys[current_idx]
+                        task["last_error"] = reason
+                        self._write_json(tasks_path, tasks_document)
+                        self._submit_with_intent(
+                            tasks_path,
+                            tasks_document,
+                            task,
+                            active_kind,
+                            shot.prompt,
+                            shot.duration_seconds,
+                            usage_recorder,
+                            budget_guard,
+                        )
+                        continue
+                    elif can_degrade_to_image:
+                        # 视频生成持续失败，降级为图片+Ken Burns效果
+                        task["submit_id"] = None
+                        task["degraded_from"] = "video"
+                        task["last_error"] = reason
+                        target = original_target.with_suffix(".keyframe.png")
+                        shot.asset_type = "image"
+                        shot.expected_path = self._relative_path(root, target)
+                        active_kind = "image"
+                        task["active_kind"] = "image"
+                        self._write_json(tasks_path, tasks_document)
+                        self._submit_with_intent(
+                            tasks_path,
+                            tasks_document,
+                            task,
+                            "image",
+                            shot.prompt,
+                            shot.duration_seconds,
+                            usage_recorder,
+                            budget_guard,
+                        )
+                        continue
+                    raise RuntimeError(f"{shot.shot_id} 生成失败（已尝试{current_attempts}次）：{reason}")
                 if state not in _PENDING_STATES:
                     provider_label = self._provider_display_name()
                     raise RuntimeError(

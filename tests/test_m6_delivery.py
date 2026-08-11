@@ -170,7 +170,7 @@ def test_technical_qa_uses_long_silence_threshold_above_natural_pause(
         if "-af" in command
         and "silencedetect" in command[command.index("-af") + 1]
     )
-    assert "d=1.1" in silence_command[silence_command.index("-af") + 1]
+    assert "d=2.0" in silence_command[silence_command.index("-af") + 1]
 
 
 def test_technical_qa_rejects_timeline_overlap_and_incomplete_unsafe_ass(

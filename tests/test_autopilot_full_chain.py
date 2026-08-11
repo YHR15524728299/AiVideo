@@ -539,7 +539,7 @@ def test_fake_autopilot_runs_real_m2_to_m6_stage_chain(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(
     ("actual_duration", "expected_action"),
-    [(30.0, "expand"), (110.0, "compress")],
+    [(30.0, "expand"), (250.0, "compress")],
 )
 def test_autopilot_revises_duration_then_invalidates_and_reruns_full_chain(
     tmp_path: Path,
@@ -612,7 +612,7 @@ def test_duration_revision_retries_transient_upstream_error(
 ) -> None:
     repository, autopilot, dependencies = _autopilot(
         tmp_path,
-        narration_durations=[110.0],
+        narration_durations=[30.0],  # 30秒<42秒容差，会触发修订
     )
     output = tmp_path / "outputs" / "FAKE001"
     runner = TransientDurationRevisionRunner(repository, output, failures=1)

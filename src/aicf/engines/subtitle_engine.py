@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from aicf.production_settings import get_resolution
 
 
-def split_subtitle_text(text: str, max_chars: int = 18) -> list[str]:
+def split_subtitle_text(text: str, max_chars: int = 22) -> list[str]:
     if max_chars < 1:
         raise ValueError("max_chars 必须大于 0")
     normalized = re.sub(r"\s+", "", text).strip()

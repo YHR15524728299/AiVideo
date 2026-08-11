@@ -59,9 +59,9 @@ COMMON_FAILURE_STATES: frozenset[str] = frozenset({
 # 自动驾驶重试配置
 # ---------------------------------------------------------------------------
 
-AUTOPILOT_MAX_RETRIES: int = 3
-AUTOPILOT_RETRY_BACKOFF_BASE_SECONDS: float = 10.0
-AUTOPILOT_RETRY_MAX_WAIT_SECONDS: float = 60.0
+AUTOPILOT_MAX_RETRIES: int = 5
+AUTOPILOT_RETRY_BACKOFF_BASE_SECONDS: float = 5.0
+AUTOPILOT_RETRY_MAX_WAIT_SECONDS: float = 120.0
 
 
 # ---------------------------------------------------------------------------

@@ -15,11 +15,38 @@ AUTO_REOPEN_ERROR_MARKERS = (
     "不可达",
     "403",
     "429",
+    "500",
     "502",
     "503",
     "504",
     "拦截",
     "验证",
+    # Provider 临时错误
+    "dreamina",
+    "jimeng",
+    "kling",
+    "任务失败",
+    "生成失败",
+    "提交失败",
+    "provider error",
+    "rate limit",
+    "too many requests",
+    "繁忙",
+    "排队中",
+    "系统繁忙",
+    # ffmpeg/IO 临时错误
+    "ffmpeg",
+    "no such file",
+    "invalid data",
+    "permission denied",
+    "access denied",
+    "disk",
+    "space",
+    "temporary",
+    "unavailable",
+    "overloaded",
+    "connection reset",
+    "broken pipe",
 )
 
 ZOMBIE_RECOVERY_TERMINAL_STAGES = {
@@ -107,20 +134,18 @@ def derive_job_actions(
         )
 
     if current_stage == "FAILED_NEEDS_ATTENTION":
-        if recoverable:
-            return JobActionState(
-                can_start=False,
-                can_resume=True,
-                can_stop=False,
-                can_open_video=can_open_video,
-                guidance="临时服务错误已可重试，点击“继续/恢复”。",
-            )
+        # 所有失败状态都允许用户点击"继续/恢复"尝试重跑
+        # 即使是"需人工处理"，也给用户重试的机会，不要完全禁用按钮
         return JobActionState(
             can_start=False,
-            can_resume=False,
+            can_resume=True,
             can_stop=False,
             can_open_video=can_open_video,
-            guidance="任务失败且需要人工处理，请查看日志中的修复提示。",
+            guidance=(
+                "临时服务错误已可重试，点击“继续/恢复”。"
+                if recoverable
+                else "任务失败，可点击“继续/恢复”尝试重跑失败阶段；如问题持续请查看日志。"
+            ),
         )
 
     if (

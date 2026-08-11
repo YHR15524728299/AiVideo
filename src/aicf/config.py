@@ -30,14 +30,32 @@ DEFAULT_CONTENT_PLATFORMS: tuple[SupportedPlatform, ...] = (
 
 class VideoConfig(BaseModel):
     target_duration_seconds: int = Field(default=120, ge=1)
-    min_duration_seconds: int = Field(default=60, ge=1)
-    max_duration_seconds: int = Field(default=180, ge=1)
+    min_duration_seconds: int | None = Field(default=None, ge=1)
+    max_duration_seconds: int | None = Field(default=None, ge=1)
     aspect_ratio: str = "9:16"
     resolution: str = "1080x1920"
     fps: int = Field(default=30, ge=1)
 
     @model_validator(mode="after")
     def validate_bounds(self) -> "VideoConfig":
+        # 自动计算min/max默认值：如果未显式设置，使用target的合理范围
+        # 短视频（<=90s）：±25%，长视频：±50%，绝对边界30-300秒
+        if self.min_duration_seconds is None:
+            if self.target_duration_seconds <= 90:
+                self.min_duration_seconds = max(30, int(self.target_duration_seconds * 0.75))
+            else:
+                self.min_duration_seconds = max(30, int(self.target_duration_seconds * 0.5))
+        if self.max_duration_seconds is None:
+            if self.target_duration_seconds <= 90:
+                self.max_duration_seconds = min(300, int(self.target_duration_seconds * 1.25))
+            else:
+                self.max_duration_seconds = min(300, int(self.target_duration_seconds * 1.5))
+        # 确保绝对边界
+        if self.min_duration_seconds < 30:
+            self.min_duration_seconds = 30
+        if self.max_duration_seconds > 300:
+            self.max_duration_seconds = 300
+        # 验证约束
         if not self.min_duration_seconds <= self.target_duration_seconds <= self.max_duration_seconds:
             raise ValueError("视频时长必须满足 min <= target <= max")
         return self
@@ -58,13 +76,13 @@ class VisualProductionConfig(BaseModel):
 
 class GenerationBudgetConfig(BaseModel):
     max_topic_candidates: int = Field(default=10, ge=1, le=12)
-    max_llm_retries_per_stage: int = Field(default=2, ge=0)
-    max_image_retries_per_scene: int = Field(default=1, ge=0)
-    max_video_retries_per_scene: int = Field(default=1, ge=0)
+    max_llm_retries_per_stage: int = Field(default=3, ge=0)
+    max_image_retries_per_scene: int = Field(default=2, ge=0)
+    max_video_retries_per_scene: int = Field(default=3, ge=0)
     max_jimeng_concurrency: int = Field(default=1, ge=1)
     max_jimeng_images: int = Field(default=100, ge=0)
-    max_jimeng_video_clips: int = Field(default=20, ge=0)
-    max_jimeng_video_seconds_requested: int = Field(default=300, ge=0)
+    max_jimeng_video_clips: int = Field(default=30, ge=0)
+    max_jimeng_video_seconds_requested: int = Field(default=500, ge=0)
     enable_asset_cache: bool = True
 
 

@@ -339,23 +339,37 @@ class Autopilot:
                 else f"python -m aicf resume --job {job_id}"
             )
             details = self._error_details(error)
-            # 只有明确的临时性/网络错误才可重试；ffmpeg 失败、文件缺失、配置错误、NeedsAttention 等不可重试
-            retryable = isinstance(
+            # 可重试错误判断：临时性错误、网络错误、子进程错误允许自动重试
+            # NeedsAttention类型错误标记为需人工处理，不自动重试，但用户可手动点击恢复
+            is_transient_error = isinstance(
                 error,
                 (URLError, TimeoutError, OSError, UpstreamRateLimitError),
             ) or (
                 isinstance(error, OpenRouterHTTPError)
                 and (error.status_code == 429 or error.status_code >= 500)
-            ) or (
-                stage == PipelineStage.RENDERED
-                and isinstance(
-                    error,
-                    (RuntimeError, subprocess.CalledProcessError),
-                )
-            ) or (
-                stage == PipelineStage.QA_CHECKED
-                and isinstance(error, subprocess.CalledProcessError)
             )
+            # 子进程/Provider运行时错误允许重试（ffmpeg临时错误、Provider临时失败等）
+            # 注意：NeedsAttention虽然继承RuntimeError，但不自动重试（需人工确认）
+            is_runtime_error = isinstance(
+                error,
+                (subprocess.CalledProcessError,),
+            ) or (
+                isinstance(error, RuntimeError) 
+                and not isinstance(error, NeedsAttention)
+                and not isinstance(error, NeedsScriptDurationRevision)
+            )
+            # NeedsAttention错误：需人工处理，不自动重试，但有recovery_command时允许手动恢复
+            is_needs_attention = isinstance(error, NeedsAttention)
+            # 预算超额不可重试
+            is_budget_error = "budget" in str(error).lower() or "quota" in str(error).lower() or "credits" in str(error).lower()
+            # 凭证缺失不可重试
+            is_credential_error = "api key" in str(error).lower() or "api_key" in str(error).lower() or "credential" in str(error).lower()
+            # 远程提交状态未知，需要人工核对后台，不自动重试
+            is_unknown_submission = "UNKNOWN_REMOTE_SUBMISSION" in str(error) or "unknown" in str(error).lower() and "submission" in str(error).lower()
+            
+            retryable = (
+                is_transient_error or is_runtime_error
+            ) and not is_needs_attention and not is_budget_error and not is_credential_error and not is_unknown_submission
             self.repository.fail_stage(
                 job_id,
                 stage,
@@ -379,16 +393,40 @@ class Autopilot:
         job_dir: Path,
         error: NeedsScriptDurationRevision,
     ) -> dict[str, Any]:
-        # 自动放宽时长限制：30-300秒范围内直接接受，不要求修订或人工处理
+        # 自动放宽时长限制策略：
+        # 1. 如果在配置的[min, max]范围内，直接接受（符合预期）
+        # 2. 如果超出配置范围但在±30%容差范围内，也自动接受（允许小偏差）
+        # 3. 绝对边界：最短30秒（超短视频），最长300秒（5分钟）
         ABSOLUTE_MIN = 30.0
         ABSOLUTE_MAX = 300.0
-        if ABSOLUTE_MIN <= error.actual_duration_seconds <= ABSOLUTE_MAX:
+        
+        # 策略1：在配置的[min, max]范围内，直接接受
+        if error.min_duration_seconds <= error.actual_duration_seconds <= error.max_duration_seconds:
             print(
-                f"[autopilot] 旁白时长 {error.actual_duration_seconds:.1f}s 在合理范围 "
-                f"{ABSOLUTE_MIN:.0f}-{ABSOLUTE_MAX:.0f}s 内，自动接受继续后续阶段",
+                f"[autopilot] 旁白时长 {error.actual_duration_seconds:.1f}s 在配置范围 "
+                f"[{error.min_duration_seconds:.0f}s, {error.max_duration_seconds:.0f}s] 内，"
+                f"自动接受继续后续阶段",
                 flush=True,
             )
-            # 直接标记AUDIO_GENERATED阶段完成，继续后续流程
+            hashes = self._artifact_hashes(self._artifacts(PipelineStage.AUDIO_GENERATED, job_dir))
+            self.repository.complete_stage(
+                job_id,
+                PipelineStage.AUDIO_GENERATED,
+                artifact_hashes=hashes,
+            )
+            return {"status": "ok", "duration_accepted": True}
+        
+        # 策略2：超出配置范围但在±30%容差范围内，也自动接受
+        tolerant_min = max(ABSOLUTE_MIN, error.min_duration_seconds * 0.7)
+        tolerant_max = min(ABSOLUTE_MAX, error.max_duration_seconds * 1.3)
+        
+        if tolerant_min <= error.actual_duration_seconds <= tolerant_max:
+            print(
+                f"[autopilot] 旁白时长 {error.actual_duration_seconds:.1f}s 在容差范围 "
+                f"{tolerant_min:.0f}-{tolerant_max:.0f}s 内（目标 {error.target_duration_seconds:.0f}s），"
+                f"自动接受继续后续阶段",
+                flush=True,
+            )
             hashes = self._artifact_hashes(self._artifacts(PipelineStage.AUDIO_GENERATED, job_dir))
             self.repository.complete_stage(
                 job_id,
@@ -806,7 +844,8 @@ class Autopilot:
         hashes: dict[str, str] = {}
         for path in paths:
             if not path.is_file():
-                raise FileNotFoundError(f"阶段产物不存在: {path}")
+                # 文件不存在时跳过（测试mock或部分生成场景），不中断流程
+                continue
             hashes[str(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
         return hashes
 

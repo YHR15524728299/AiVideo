@@ -195,7 +195,7 @@ def build_autopilot(job_repository: JobRepository) -> Autopilot:
         config=config,
         voice_validator=VoiceValidator(build_optional_asr()),
         user_output_root=root / "outputs",
-        content_output_root=root / "outputs",
+        content_output_root=None,  # 使用job_dir（数据库中记录的output_dir），避免路径不一致
     )
 
 

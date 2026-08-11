@@ -314,6 +314,89 @@ def test_subprocess_utils(result: SelfTestResult):
         result.fail("subprocess_utils 导入/执行", str(e))
 
 
+def test_preflight_module(result: SelfTestResult):
+    """测试 preflight 健康检查模块可导入并正常工作。"""
+    print("\n[额外] 测试 preflight 健康检查模块...")
+    
+    try:
+        from aicf.preflight import run_preflight_checks, HealthCheckResult, HealthCheckIssue
+        result.ok("preflight 模块可导入")
+        
+        # 运行检查（不测试模型连通性，避免网络依赖）
+        check_result = run_preflight_checks(check_model_reachability=False, check_ffmpeg=True)
+        if isinstance(check_result, HealthCheckResult):
+            result.ok("run_preflight_checks 返回 HealthCheckResult")
+            
+            # 错误应该只包含配置类问题（如API Key未配置是正常的）
+            errors = check_result.errors()
+            non_config_errors = [e for e in errors if e.category != "配置"]
+            if len(non_config_errors) == 0:
+                result.ok("preflight 检查无系统性错误（API Key未配置属正常）")
+            else:
+                for err in non_config_errors:
+                    result.fail(f"preflight: {err.category}", err.message)
+        else:
+            result.fail("run_preflight_checks", f"返回类型错误: {type(check_result)}")
+    except Exception as e:
+        result.fail("preflight 模块导入/执行", str(e))
+
+
+def test_path_consistency(result: SelfTestResult):
+    """检查代码中是否存在路径硬编码不一致问题。"""
+    print("\n[额外] 检查路径硬编码一致性...")
+    
+    import re
+    
+    src_dir = PROJECT_ROOT / "src" / "aicf"
+    issues_found = []
+    
+    # 扫描所有Python文件
+    for py_file in src_dir.rglob("*.py"):
+        try:
+            content = py_file.read_text(encoding="utf-8")
+            rel_path = py_file.relative_to(PROJECT_ROOT)
+            
+            # 检查是否有直接硬编码 "outputs" / job_id 的路径（可能导致不一致）
+            # 排除已知正确的位置：
+            # - user_output_root = root / "outputs" (最终用户输出目录，正确)
+            # - final_video_for_job 的 user_output_dir 参数 (正确)
+            # - 删除任务时同时清理两个目录 (正确)
+            # - 打开输出文件夹功能 (正确)
+            
+            lines = content.split("\n")
+            for i, line in enumerate(lines, 1):
+                # 跳过注释
+                if line.strip().startswith("#"):
+                    continue
+                
+                # 检查是否有错误地将中间产物写到 outputs 的模式
+                # 模式: "outputs" / job_id / xxx.json (非最终视频文件)
+                if '/ "outputs"' in line and '/ job_id' in line:
+                    # 检查是不是已知的正确位置
+                    is_user_output = (
+                        "final_video_for_job" in line 
+                        or "_open_outputs_folder" in line 
+                        or "_delete_selected_job" in line
+                        or "output_dir =" in line and "最终视频" in lines[max(0,i-5):i+5]
+                        or "user_output_root" in line
+                        or "_open_final_video" in lines[max(0,i-10):i+2]
+                    )
+                    if not is_user_output:
+                        # 进一步检查是不是.json等中间产物文件
+                        if any(ext in line for ext in [".json", "_request", "_sources", "research_"]):
+                            issues_found.append(f"{rel_path}:{i}: 可能错误地将中间产物路径硬编码到 outputs 目录")
+        except (OSError, UnicodeDecodeError):
+            continue
+    
+    if issues_found:
+        for issue in issues_found[:5]:  # 最多显示5个
+            result.fail("路径一致性检查", issue)
+        if len(issues_found) > 5:
+            result.warn(f"还有 {len(issues_found)-5} 个类似路径问题")
+    else:
+        result.ok("未发现明显的路径硬编码不一致问题")
+
+
 def main():
     print("=" * 60)
     print("AI Content Factory 标准自测")
@@ -327,6 +410,8 @@ def main():
     test_path_utils(result)
     test_models_exports(result)
     test_subprocess_utils(result)
+    test_preflight_module(result)
+    test_path_consistency(result)
     test_unit_tests(result)
 
     success = result.summary()

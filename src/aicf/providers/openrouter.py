@@ -352,17 +352,19 @@ class OpenRouterClient:
             
             for index, mode in enumerate(modes):
                 messages = [dict(message) for message in body["messages"]]  # type: ignore[arg-type]
-                body["messages"] = messages
+                # 为每次请求创建body副本，避免修改影响已记录的请求（也避免transport引用问题）
+                request_body = dict(body)
+                request_body["messages"] = messages
                 if mode == "json_schema":
-                    body["response_format"] = {
+                    request_body["response_format"] = {
                         "type": "json_schema",
                         "json_schema": json_schema,
                     }
                 elif mode == "json_object":
-                    body["response_format"] = {"type": "json_object"}
+                    request_body["response_format"] = {"type": "json_object"}
                 else:
                     # strict_prompt模式下移除response_format
-                    body.pop("response_format", None)
+                    request_body.pop("response_format", None)
                     schema_text = json.dumps(json_schema.get("schema", {}), ensure_ascii=False)
                     messages[0]["content"] = (
                         f"{messages[0]['content']}\n"
@@ -370,7 +372,7 @@ class OpenRouterClient:
                         f"输出必须符合此 JSON Schema：{schema_text}"
                     )
                 try:
-                    result = self._request_with_retry(headers, body)
+                    result = self._request_with_retry(headers, request_body)
                     # 如果使用了fallback模型，记录一下并更新self.model
                     if current_model != self.model:
                         import logging

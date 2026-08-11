@@ -1271,12 +1271,7 @@ class AicfGUI:
         )
         research_failure_summary = ""
         if failed_stage == "RESEARCHED":
-            evidence_path = (
-                project_root()
-                / "outputs"
-                / job_id
-                / "research_sources.json"
-            )
+            evidence_path = job_dir / "research_sources.json"
             if evidence_path.is_file():
                 try:
                     evidence = json.loads(
@@ -2149,12 +2144,7 @@ class AicfGUI:
         ):
             messagebox.showwarning("无法重试", "当前任务不是资料研究失败状态")
             return
-        marker_path = (
-            project_root()
-            / "outputs"
-            / job_id
-            / "research_retry_request.json"
-        )
+        marker_path = self._get_job_dir(job_id) / "research_retry_request.json"
         atomic_write_text(
             marker_path,
             json.dumps(
@@ -2689,4 +2679,51 @@ def launch() -> None:
     load_runtime_secrets()
     
     app = AicfGUI()
+    
+    # 启动后延迟运行健康检查（避免阻塞窗口显示）
+    app.root.after(500, lambda: _run_startup_health_check(app))
+    
     app.run()
+
+
+def _run_startup_health_check(app: AicfGUI) -> None:
+    """在GUI启动后运行健康检查，有问题则提示用户。"""
+    import threading
+    
+    def _check():
+        try:
+            from .preflight import run_preflight_checks
+            result = run_preflight_checks(check_model_reachability=True, check_ffmpeg=True)
+            
+            if not result.ok:
+                # 有严重错误，在主线程显示对话框
+                errors = result.errors()
+                warnings = result.warnings()
+                msg_parts = []
+                if errors:
+                    msg_parts.append(f"检测到 {len(errors)} 个严重问题，可能导致任务失败：\n")
+                    for err in errors:
+                        msg_parts.append(f"• [{err.category}] {err.message}")
+                        if err.fix_hint:
+                            msg_parts.append(f"  → {err.fix_hint}")
+                if warnings:
+                    if msg_parts:
+                        msg_parts.append("")
+                    msg_parts.append(f"警告 ({len(warnings)} 项)：")
+                    for warn in warnings:
+                        msg_parts.append(f"• [{warn.category}] {warn.message}")
+                
+                msg_parts.append("\n建议打开设置面板检查配置。")
+                
+                # 在主线程显示
+                full_msg = "\n".join(msg_parts)
+                app.root.after(0, lambda: messagebox.showwarning(
+                    "系统健康检查",
+                    full_msg,
+                ))
+        except Exception as e:
+            # 健康检查本身失败了，不要阻断启动
+            app._log(f"健康检查执行失败: {e}", "debug")
+    
+    # 在后台线程运行，避免阻塞UI
+    threading.Thread(target=_check, daemon=True).start()

@@ -2556,7 +2556,23 @@ class AicfGUI:
                     is_running = self._is_job_display_running(job_id, data)
                     if is_running:
                         self._set_buttons_running(True)
-                        # 如果是正在运行的任务，切换到实时跟踪模式
+                        # 正在运行的任务：先加载已有日志，然后继续实时跟踪
+                        self._polling_job_id = ""  # 先清空，避免_tail重复追加
+                        self._log_file_offsets.clear()
+                        self._load_job_logs(job_id)
+                        # 设置偏移为当前文件末尾，避免重复读取
+                        worker_log = job_dir / "_work" / "runtime" / "worker.log"
+                        if worker_log.is_file():
+                            self._log_file_offsets[f"{job_id}/worker.log"] = worker_log.stat().st_size
+                        stages_info = data.get("stages", {})
+                        if isinstance(stages_info, dict):
+                            for stage_info in stages_info.values():
+                                if isinstance(stage_info, dict):
+                                    log_rel = stage_info.get("log_path")
+                                    if isinstance(log_rel, str) and log_rel:
+                                        log_path = job_dir / log_rel
+                                        if log_path.is_file():
+                                            self._log_file_offsets[f"{job_id}/{log_rel}"] = log_path.stat().st_size
                         self._polling_job_id = job_id
                     else:
                         self._set_buttons_running(self._polling_job_id != "")

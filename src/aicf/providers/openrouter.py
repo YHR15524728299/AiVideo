@@ -137,8 +137,8 @@ class OpenRouterClient:
         model: str | None = None,
         cache: FileCache | None = None,
         *,
-        max_retries: int = 4,
-        timeout: float = 60.0,
+        max_retries: int = 6,
+        timeout: float = 120.0,
         transport: Transport = _http_transport,
         model_catalog_transport: ModelCatalogTransport | None = None,
         sleep: Callable[[float], None] = time.sleep,
@@ -455,10 +455,15 @@ class OpenRouterClient:
                 retryable = error.code in {408, 409, 429} or error.code >= 500
                 if not retryable or attempt >= self.max_retries:
                     raise
+                # 对于5xx错误（504超时等），使用更长的等待时间
+                if error.code >= 500:
+                    wait = float(min(120, 5 * (2**attempt)))  # 5s, 10s, 20s, 40s, 80s, 120s
+                else:
+                    wait = float(min(60, 2**attempt))  # 原有退避
             except (URLError, TimeoutError, OSError):
                 if attempt >= self.max_retries:
                     raise
-            wait = float(min(60, 2**attempt))
+                wait = float(min(120, 5 * (2**attempt)))
             self.sleep(wait)
         raise RuntimeError("OpenRouter 重试流程异常结束")
 

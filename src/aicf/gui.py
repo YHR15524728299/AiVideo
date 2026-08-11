@@ -776,15 +776,17 @@ class AicfGUI:
 
         self.job_tree = ttk.Treeview(
             history_frame,
-            columns=("job_id", "status", "stage", "updated"),
+            columns=("job_id", "direction", "status", "stage", "updated"),
             show="headings",
             height=12,
         )
         self.job_tree.heading("job_id", text="任务ID")
+        self.job_tree.heading("direction", text="内容方向")
         self.job_tree.heading("status", text="状态")
         self.job_tree.heading("stage", text="当前阶段")
         self.job_tree.heading("updated", text="更新时间")
-        self.job_tree.column("job_id", width=100, anchor="w")
+        self.job_tree.column("job_id", width=120, anchor="w")
+        self.job_tree.column("direction", width=150, anchor="w")
         self.job_tree.column("status", width=90, anchor="w")
         self.job_tree.column("stage", width=110, anchor="w")
         self.job_tree.column("updated", width=130, anchor="w")
@@ -2060,10 +2062,20 @@ class AicfGUI:
         self._logged_stages.clear()
         self._log_file_offsets.clear()
         job_id = self.job_id_var.get().strip() or self._auto_job_id()
-        # 校验任务ID：只允许字母、数字、下划线、短横线
+        # 校验任务ID：禁止Windows文件非法字符和控制字符，允许中文、字母、数字、下划线、短横线等
         import re
-        if not re.match(r'^[a-zA-Z0-9_-]+$', job_id):
-            messagebox.showwarning("任务ID无效", "任务ID只能包含字母、数字、下划线(_)和短横线(-)")
+        _INVALID_JOB_ID = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+        if (
+            not job_id
+            or job_id != job_id.strip()
+            or job_id in {".", ".."}
+            or _INVALID_JOB_ID.search(job_id)
+        ):
+            messagebox.showwarning(
+                "任务ID无效",
+                "任务ID不能为空，不能包含前后空格，不能是 . 或 ..，\n"
+                "且不能包含以下Windows文件非法字符：< > : \" / \\ | ? *"
+            )
             return
         if self._job_id_taken(job_id):
             messagebox.showwarning(
@@ -2294,6 +2306,23 @@ class AicfGUI:
             status_text = "未开始"
             stage_text = "-"
             updated = "-"
+            direction_text = "-"
+            
+            # 读取内容方向信息
+            dp = job_dir / "direction.json"
+            if dp.is_file():
+                try:
+                    direction_data = json.loads(dp.read_text(encoding="utf-8"))
+                    series_name = direction_data.get("series_name", "")
+                    core_direction = direction_data.get("core_direction", "")
+                    if series_name:
+                        direction_text = series_name
+                    elif core_direction:
+                        # 核心方向较长，截断显示
+                        direction_text = core_direction[:20] + "..." if len(core_direction) > 20 else core_direction
+                except Exception:
+                    direction_text = "-"
+            
             if sp.is_file():
                 try:
                     d = json.loads(sp.read_text(encoding="utf-8"))
@@ -2331,7 +2360,7 @@ class AicfGUI:
 
             self.job_tree.insert(
                 "", "end", iid=status.job_id,
-                values=(status.job_id, status_text, stage_text, updated),
+                values=(status.job_id, direction_text, status_text, stage_text, updated),
             )
         if current_selection:
             existing = [item for item in current_selection if self.job_tree.exists(item)]

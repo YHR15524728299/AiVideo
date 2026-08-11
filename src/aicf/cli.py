@@ -85,7 +85,7 @@ def build_m2_runner(
     return M2ContentRunner(
         client,
         job_repository or repository(),
-        root / "outputs",
+        root / "data" / "jobs",
         source_verifier=verifier,
         source_discovery=discovery,
     )

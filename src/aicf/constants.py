@@ -70,3 +70,15 @@ AUTOPILOT_RETRY_MAX_WAIT_SECONDS: float = 60.0
 
 OPENROUTER_API_BASE_URL: str = "https://openrouter.ai/api/v1"
 OPENROUTER_MODELS_URL: str = f"{OPENROUTER_API_BASE_URL}/models"
+
+# 默认免费模型（经过验证可用）
+OPENROUTER_DEFAULT_MODEL: str = "nvidia/nemotron-3-super-120b-a12b:free"
+
+# 模型fallback列表：当主模型返回provider错误/404时按顺序尝试
+# 按能力从强到弱排序，都是经过验证可用的免费模型
+OPENROUTER_FALLBACK_MODELS: tuple[str, ...] = (
+    "nvidia/nemotron-3-super-120b-a12b:free",
+    "google/gemma-4-26b-a4b-it:free",
+    "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+    "nvidia/nemotron-3-nano-30b-a3b:free",
+)

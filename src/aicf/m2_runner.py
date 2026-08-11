@@ -71,10 +71,11 @@ class M2ContentRunner:
     def run(self, job_id: str, config: AppConfig) -> dict[str, Any]:
         self._run_start_counters = self._client_counters()
         self._synced_run_counters = {"calls": 0, "prompt": 0, "completion": 0}
-        output_dir = self.outputs_root / job_id
         try:
             status = self.repository.get_job(job_id)
+            output_dir = Path(status.output_dir)
         except KeyError:
+            output_dir = self.outputs_root / job_id
             status = self.repository.create_job(job_id, output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         reusable_stages = set(status.completed_stages)
@@ -358,7 +359,8 @@ class M2ContentRunner:
         error: NeedsScriptDurationRevision,
         round_number: int,
     ) -> dict[str, object]:
-        output_dir = self.outputs_root / job_id
+        status = self.repository.get_job(job_id)
+        output_dir = Path(status.output_dir)
         profile = DirectionProfile.model_validate(
             self._read_json(output_dir / "direction.json")
         )

@@ -30,7 +30,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from .atomic_io import atomic_write_text
-from .background_worker import WorkerIdentityError, read_worker_record, stop_worker
+from .background_worker import WorkerIdentityError, force_kill_worker, read_worker_record, stop_worker
 from .config import load_config
 from .database import JobRepository
 from .file_lock import lock_is_active
@@ -2192,8 +2192,38 @@ class AicfGUI:
             try:
                 stop_worker(self._get_job_dir(job_id))
             except WorkerIdentityError as error:
-                self._log(str(error), "error")
-                messagebox.showerror("停止失败", str(error))
+                self._log(f"正常停止失败: {error}", "warning")
+                # 身份校验失败时，提供强制清理选项
+                if messagebox.askyesno(
+                    "强制清理",
+                    "检测到Worker进程异常（可能已崩溃或PID被复用）。\n"
+                    "是否强制清理任务状态？\n\n"
+                    "这将标记任务为停止状态并允许创建新任务。",
+                    icon="warning",
+                ):
+                    try:
+                        # 清理.autopilot.lock
+                        lock_file = self._get_job_dir(job_id) / ".autopilot.lock"
+                        if lock_file.exists():
+                            lock_file.unlink()
+                        # 强制清理worker记录
+                        force_kill_worker(self._get_job_dir(job_id))
+                        # 更新status.json
+                        sp = self._get_job_dir(job_id) / "status.json"
+                        if sp.is_file():
+                            try:
+                                d = json.loads(sp.read_text(encoding="utf-8"))
+                                d["failed_stage"] = d.get("current_stage", "UNKNOWN")
+                                d["current_stage"] = "FAILED_NEEDS_ATTENTION"
+                                d["last_error"] = "任务被用户强制停止"
+                                atomic_write_text(sp, json.dumps(d, ensure_ascii=False, indent=2))
+                            except Exception:
+                                pass
+                        self._log("已强制清理任务状态", "info")
+                        messagebox.showinfo("清理完成", "任务状态已清理，可以创建新任务了。")
+                    except Exception as e:
+                        self._log(f"强制清理失败: {e}", "error")
+                        messagebox.showerror("清理失败", str(e))
                 return
             except OSError as error:
                 self._log(f"停止Worker失败: {error}", "error")
@@ -2281,12 +2311,31 @@ class AicfGUI:
         return stage_value
 
     def _is_job_really_running(self, job_dir: Path, data: dict) -> bool:
-        """按统一 PID/时间/心跳协议判断任务是否运行，不修改锁文件。"""
+        """按统一 PID/时间/心跳协议判断任务是否运行，不修改锁文件。
+        
+        判断逻辑：
+        1. 锁文件是否活跃（120秒内心跳）
+        2. Worker记录是否存在且未标记为finished
+        3. Worker进程PID是否真实存在且身份匹配
+        """
         del data
-        return lock_is_active(
+        # 首先检查锁文件
+        if not lock_is_active(
             job_dir / ".autopilot.lock",
             stale_after=120.0,
-        )
+        ):
+            return False
+        
+        # 锁文件活跃的情况下，再验证worker进程真实存在
+        from .background_worker import _identity_matches, read_worker_record
+        from .process_identity import get_process_identity
+        
+        record = read_worker_record(job_dir)
+        if record is None or record.finished_at is not None:
+            return False
+        
+        identity = get_process_identity(record.pid) if record.pid else None
+        return _identity_matches(record, identity)
 
     def _highlight_selected_job(self) -> None:
         """给历史任务列表中的当前选中项加显式高亮。"""

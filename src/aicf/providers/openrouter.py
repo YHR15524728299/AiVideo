@@ -11,13 +11,18 @@ from urllib.request import Request, urlopen
 
 from aicf.cache import FileCache
 from aicf.path_utils import project_root
-from aicf.constants import OPENROUTER_API_BASE_URL, OPENROUTER_MODELS_URL
+from aicf.constants import (
+    OPENROUTER_API_BASE_URL,
+    OPENROUTER_MODELS_URL,
+    OPENROUTER_DEFAULT_MODEL,
+    OPENROUTER_FALLBACK_MODELS,
+)
 
 # 注意：.env 加载由应用入口点（__main__.py 或 gui.launch()）统一处理
 # 不再在模块级别执行 load_dotenv
 
-# 默认使用 OpenRouter 免费模型（强制 :free 后缀，优先能力强的中文模型）
-DEFAULT_FREE_MODEL = "deepseek/deepseek-chat-v3-0324:free"
+# 默认使用 OpenRouter 免费模型（从constants导入，已验证可用）
+DEFAULT_FREE_MODEL = OPENROUTER_DEFAULT_MODEL
 
 
 class UpstreamRateLimitError(RuntimeError):
@@ -333,32 +338,67 @@ class OpenRouterClient:
     ) -> dict[str, object]:
         modes = ("json_schema", "json_object", "strict_prompt")
         last_error: HTTPError | None = None
-        for index, mode in enumerate(modes):
+        
+        # 构建模型尝试列表：主模型 + fallback模型（去重）
+        models_to_try: list[str] = [self.model]
+        for fb_model in OPENROUTER_FALLBACK_MODELS:
+            if fb_model not in models_to_try:
+                models_to_try.append(fb_model)
+        
+        for model_index, current_model in enumerate(models_to_try):
+            # 更新body中的model
             body = dict(base_body)
-            messages = [dict(message) for message in base_body["messages"]]  # type: ignore[arg-type]
-            body["messages"] = messages
-            if mode == "json_schema":
-                body["response_format"] = {
-                    "type": "json_schema",
-                    "json_schema": json_schema,
-                }
-            elif mode == "json_object":
-                body["response_format"] = {"type": "json_object"}
-            else:
-                schema_text = json.dumps(json_schema.get("schema", {}), ensure_ascii=False)
-                messages[0]["content"] = (
-                    f"{messages[0]['content']}\n"
-                    "只允许输出一个严格 JSON 对象，不得输出 Markdown、解释或额外文本。"
-                    f"输出必须符合此 JSON Schema：{schema_text}"
-                )
-            try:
-                return self._request_with_retry(headers, body)
-            except HTTPError as error:
-                last_error = error
-                detail = self._read_http_error(error)
-                if index < len(modes) - 1 and self._response_format_unsupported(detail):
-                    continue
-                raise self._sanitized_http_error(error, detail) from None
+            body["model"] = current_model
+            
+            for index, mode in enumerate(modes):
+                messages = [dict(message) for message in body["messages"]]  # type: ignore[arg-type]
+                body["messages"] = messages
+                if mode == "json_schema":
+                    body["response_format"] = {
+                        "type": "json_schema",
+                        "json_schema": json_schema,
+                    }
+                elif mode == "json_object":
+                    body["response_format"] = {"type": "json_object"}
+                else:
+                    # strict_prompt模式下移除response_format
+                    body.pop("response_format", None)
+                    schema_text = json.dumps(json_schema.get("schema", {}), ensure_ascii=False)
+                    messages[0]["content"] = (
+                        f"{messages[0]['content']}\n"
+                        "只允许输出一个严格 JSON 对象，不得输出 Markdown、解释或额外文本。"
+                        f"输出必须符合此 JSON Schema：{schema_text}"
+                    )
+                try:
+                    result = self._request_with_retry(headers, body)
+                    # 如果使用了fallback模型，记录一下并更新self.model
+                    if current_model != self.model:
+                        import logging
+                        logging.getLogger(__name__).warning(
+                            "主模型 %s 失败，已自动切换到备用模型 %s",
+                            self.model, current_model
+                        )
+                        self.model = current_model
+                    return result
+                except HTTPError as error:
+                    last_error = error
+                    detail = self._read_http_error(error)
+                    # 判断是否是模型/provider问题，可以尝试下一个模型
+                    is_provider_error = (
+                        error.code == 404
+                        or "Provider returned error" in detail
+                        or "model not found" in detail.lower()
+                        or "provider is currently unavailable" in detail.lower()
+                    )
+                    # 如果是response_format不支持，尝试下一个format mode
+                    if index < len(modes) - 1 and self._response_format_unsupported(detail):
+                        continue
+                    # 如果是provider错误且还有其他模型可以尝试，跳出format循环，尝试下一个模型
+                    if is_provider_error and model_index < len(models_to_try) - 1:
+                        break
+                    # 否则抛出错误
+                    raise self._sanitized_http_error(error, detail) from None
+        
         assert last_error is not None
         raise self._sanitized_http_error(last_error, self._read_http_error(last_error))
 

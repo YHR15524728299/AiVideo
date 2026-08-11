@@ -463,6 +463,65 @@ def stop_worker(
         return record
 
 
+def force_kill_worker(job_dir: str | Path) -> WorkerRecord:
+    """强制清理僵尸worker记录，用于进程异常退出、身份校验失败的情况。
+    
+    当正常停止失败（Worker进程身份校验失败）时使用此函数：
+    1. 如果PID进程仍在运行，先尝试taskkill强制终止
+    2. 更新worker.json标记为已强制停止
+    3. 清理锁文件和stop请求文件
+    """
+    from .subprocess_utils import silent_run
+    
+    destination = Path(job_dir)
+    runtime_dir = destination / "_work" / "runtime"
+    
+    with os_file_lock(
+        runtime_dir / "worker-start.lock",
+        timeout=5.0,
+        timeout_message="Worker生命周期正在变更，请稍后重试",
+    ):
+        record = read_worker_record(destination)
+        if record is None:
+            raise WorkerIdentityError("没有找到Worker记录")
+        
+        # 如果进程还在运行，尝试强制终止
+        if record.pid and process_is_running(record.pid):
+            try:
+                silent_run(
+                    ["taskkill", "/PID", str(record.pid), "/T", "/F"],
+                    capture_output=True,
+                    timeout=10,
+                )
+            except Exception:
+                pass  # 忽略终止错误，继续清理记录
+        
+        # 清理stop请求文件
+        if runtime_dir.is_dir():
+            for f in runtime_dir.glob("stop-*.request"):
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+            for f in runtime_dir.glob("stop-*.ack"):
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+            for f in runtime_dir.glob("stop-*.error"):
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+        
+        # 更新记录
+        record.finished_at = _now()
+        record.terminal_status = "FORCE_STOPPED"
+        record.error = "用户强制停止"
+        write_worker_record(destination, record)
+        return record
+
+
 def worker_status(job_dir: str | Path) -> dict[str, Any]:
     record = read_worker_record(job_dir)
     if record is None:

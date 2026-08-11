@@ -1,0 +1,12 @@
+{
+  "video_provider": "jimeng",
+  "jimeng_model": "seedance2.0fast",
+  "kling_model": "kling-video-v2_6",
+  "video_resolution": "720p",
+  "motion_mode": "video",
+  "orientation": "portrait",
+  "narration_voice": "kokoro:zm_yunyang",
+  "selected_platforms": [
+    "youtube"
+  ]
+}

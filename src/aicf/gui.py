@@ -797,6 +797,9 @@ class AicfGUI:
 
         # 历史任务右键菜单
         self.job_context_menu = Menu(self.root, tearoff=0)
+        self.job_context_menu.add_command(label="📂 打开任务目录", command=self._open_job_dir)
+        self.job_context_menu.add_command(label="🔄 强制清理僵尸任务", command=self._force_clean_job)
+        self.job_context_menu.add_separator()
         self.job_context_menu.add_command(label="🗑 删除任务", command=self._delete_selected_job)
 
         # 日志区
@@ -2252,19 +2255,26 @@ class AicfGUI:
                             lock_file.unlink()
                         # 强制清理worker记录
                         force_kill_worker(self._get_job_dir(job_id))
-                        # 更新status.json
+                        # 更新status.json - 标记为可恢复的失败状态
                         sp = self._get_job_dir(job_id) / "status.json"
                         if sp.is_file():
                             try:
                                 d = json.loads(sp.read_text(encoding="utf-8"))
-                                d["failed_stage"] = d.get("current_stage", "UNKNOWN")
-                                d["current_stage"] = "FAILED_NEEDS_ATTENTION"
-                                d["last_error"] = "任务被用户强制停止"
+                                failed_stage = d.get("current_stage", "UNKNOWN")
+                                d["failed_stage"] = failed_stage
+                                d["current_stage"] = "FAILED_RETRYABLE"
+                                d["last_error"] = "任务被用户强制停止，可点击继续/恢复"
+                                # 标记当前失败阶段为可恢复
+                                stages = d.get("stages", {})
+                                if isinstance(stages, dict) and failed_stage in stages:
+                                    stages[failed_stage]["recoverable"] = True
                                 atomic_write_text(sp, json.dumps(d, ensure_ascii=False, indent=2))
                             except Exception:
                                 pass
-                        self._log("已强制清理任务状态", "info")
-                        messagebox.showinfo("清理完成", "任务状态已清理，可以创建新任务了。")
+                        self._log("已强制清理任务状态，可以点击继续/恢复", "info")
+                        messagebox.showinfo("清理完成", "任务状态已清理，可以点击「继续/恢复」从断点继续，或创建新任务。")
+                        self._refresh_job_list()
+                        self._update_button_states()
                     except Exception as e:
                         self._log(f"强制清理失败: {e}", "error")
                         messagebox.showerror("清理失败", str(e))
@@ -2602,11 +2612,12 @@ class AicfGUI:
     def _open_output(self) -> None:
         job_id = self._current_job_id()
         if not job_id:
-            path = project_root() / "outputs"
+            # 没有选中任务时，打开jobs根目录
+            path = project_root() / "data" / "jobs"
         else:
-            path = project_root() / "outputs" / job_id
+            path = self._get_job_dir(job_id)
             if not path.is_dir():
-                path = project_root() / "outputs"
+                path = project_root() / "data" / "jobs"
         path.mkdir(parents=True, exist_ok=True)
         os.startfile(str(path))  # type: ignore[attr-defined]
 
@@ -2615,12 +2626,9 @@ class AicfGUI:
         if not job_id:
             messagebox.showwarning("提示", "请先选择任务")
             return
-        video = final_video_for_job(
-            self._get_job_dir(job_id),
-            project_root() / "outputs" / job_id,
-        )
+        video = final_video_for_job(self._get_job_dir(job_id))
         if video is None:
-            messagebox.showwarning("提示", "所选平台尚无最终视频")
+            messagebox.showwarning("提示", "所选任务尚无最终视频，请等待任务完成")
             return
         os.startfile(str(video))  # type: ignore[attr-defined]
 
@@ -2643,16 +2651,20 @@ class AicfGUI:
             messagebox.showwarning("提示", "请先选择要删除的任务")
             return
         job_dir = self._get_job_dir(job_id)
-        output_dir = project_root() / "outputs" / job_id
-        # 如果任务正在运行，不允许删除
-        if self._polling_job_id == job_id and self.running:
+        # 如果任务正在运行（PID真实存在），不允许删除
+        sp = job_dir / "status.json"
+        is_running = False
+        if sp.is_file():
+            try:
+                d = json.loads(sp.read_text(encoding="utf-8"))
+                is_running = self._is_job_really_running(job_dir, d)
+            except Exception:
+                pass
+        if is_running:
             messagebox.showwarning("提示", "任务正在运行中，请先停止后再删除")
             return
-        locations = [
-            str(path)
-            for path in (job_dir, output_dir)
-            if path.exists()
-        ]
+        # 收集要删除的路径：任务目录本身（包含outputs）
+        locations = [str(job_dir)] if job_dir.exists() else []
         location_text = "\n".join(locations) if locations else "任务文件已不存在，仅清理列表记录"
         confirm = messagebox.askyesno(
             "确认删除",
@@ -2664,13 +2676,11 @@ class AicfGUI:
         try:
             self._get_repo().delete_job(job_id)
             cleanup_errors: list[str] = []
-            unique_paths = {job_dir.resolve(), output_dir.resolve()}
-            for path in unique_paths:
-                if path.is_dir():
-                    try:
-                        shutil.rmtree(path)
-                    except OSError as error:
-                        cleanup_errors.append(f"{path}: {error}")
+            if job_dir.is_dir():
+                try:
+                    shutil.rmtree(job_dir)
+                except OSError as error:
+                    cleanup_errors.append(f"{job_dir}: {error}")
             self._log(f"已删除任务: {job_id}", "info")
             self._refresh_job_list()
             self._reset_stages()
@@ -2688,6 +2698,88 @@ class AicfGUI:
                 self._set_status(f"任务 [{job_id}] 已彻底删除")
         except Exception as e:
             messagebox.showerror("错误", f"删除失败: {e}")
+
+    def _open_job_dir(self) -> None:
+        """打开选中任务的目录。"""
+        job_id = self._current_job_id()
+        if not job_id:
+            messagebox.showwarning("提示", "请先选择一个任务")
+            return
+        job_dir = self._get_job_dir(job_id)
+        if not job_dir.is_dir():
+            messagebox.showwarning("提示", f"任务目录不存在: {job_dir}")
+            return
+        try:
+            os.startfile(str(job_dir))
+        except Exception as e:
+            messagebox.showerror("错误", f"打开目录失败: {e}")
+
+    def _force_clean_job(self) -> None:
+        """右键菜单直接强制清理僵尸任务。"""
+        job_id = self._current_job_id()
+        if not job_id:
+            messagebox.showwarning("提示", "请先选择一个任务")
+            return
+        job_dir = self._get_job_dir(job_id)
+        if not job_dir.is_dir():
+            messagebox.showwarning("提示", f"任务目录不存在: {job_dir}")
+            return
+        
+        # 检查是否真的是僵尸任务
+        sp = job_dir / "status.json"
+        if sp.is_file():
+            try:
+                d = json.loads(sp.read_text(encoding="utf-8"))
+                is_running = self._is_job_really_running(job_dir, d)
+                if is_running:
+                    if not messagebox.askyesno(
+                        "任务正在运行",
+                        "检测到任务进程真实存在且正在运行！\n"
+                        "强制清理可能导致进程残留，是否仍要继续？",
+                        icon="warning",
+                    ):
+                        return
+            except Exception:
+                pass
+        
+        confirm = messagebox.askyesno(
+            "强制清理僵尸任务",
+            f"将强制清理任务 [{job_id}] 的运行状态，\n"
+            "清理后可以点击「继续/恢复」从断点继续。\n\n"
+            "是否继续？",
+            icon="warning",
+        )
+        if not confirm:
+            return
+        
+        try:
+            # 清理.autopilot.lock
+            lock_file = job_dir / ".autopilot.lock"
+            if lock_file.exists():
+                lock_file.unlink()
+            # 强制清理worker记录
+            force_kill_worker(job_dir)
+            # 更新status.json - 标记为可恢复
+            if sp.is_file():
+                try:
+                    d = json.loads(sp.read_text(encoding="utf-8"))
+                    failed_stage = d.get("current_stage", "UNKNOWN")
+                    d["failed_stage"] = failed_stage
+                    d["current_stage"] = "FAILED_RETRYABLE"
+                    d["last_error"] = "用户手动强制清理，可点击继续/恢复"
+                    stages = d.get("stages", {})
+                    if isinstance(stages, dict) and failed_stage in stages:
+                        stages[failed_stage]["recoverable"] = True
+                    atomic_write_text(sp, json.dumps(d, ensure_ascii=False, indent=2))
+                except Exception:
+                    pass
+            self._log(f"已强制清理任务 [{job_id}]", "info")
+            messagebox.showinfo("清理完成", "任务状态已清理，可以点击「继续/恢复」从断点继续。")
+            self._refresh_job_list()
+            self._update_button_states()
+        except Exception as e:
+            self._log(f"强制清理失败: {e}", "error")
+            messagebox.showerror("清理失败", str(e))
 
     def _tail_log_files(self, data: dict) -> None:
         """增量读取当前及已完成阶段的日志文件，追加到运行日志窗口。"""

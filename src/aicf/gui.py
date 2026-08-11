@@ -813,10 +813,11 @@ class AicfGUI:
             state="disabled",
         )
         self.log_text.pack(fill="both", expand=True)
-        self.log_text.tag_configure("error", foreground="#ff6b6b")
+        # 日志颜色标签 - error用红底白字更醒目
+        self.log_text.tag_configure("error", foreground="#ff5252", background="#4a1515", font=("Consolas", 9, "bold"))
         self.log_text.tag_configure("success", foreground="#51cf66")
         self.log_text.tag_configure("info", foreground="#74c0fc")
-        self.log_text.tag_configure("warning", foreground="#ffa94d")
+        self.log_text.tag_configure("warning", foreground="#ffd43b", background="#3d3000")
         self._log_auto_scroll = True
         self._auto_scroll_var = BooleanVar(value=True)
 
@@ -906,6 +907,40 @@ class AicfGUI:
     def _log(self, msg: str, tag: str = "") -> None:
         ts = datetime.now().strftime("%H:%M:%S")
         self.log_queue.put(f"[{ts}] {sanitize_error(msg)}\n{tag}")
+
+    def _detect_log_tag(self, line: str) -> str:
+        """根据日志内容自动检测日志级别，返回对应的tag颜色。"""
+        line_lower = line.lower()
+        # 错误级别：最高优先级
+        if any(kw in line for kw in ("ERROR", "Error", "错误", "失败", "Traceback", "Exception", "CRITICAL", "FATAL")):
+            return "error"
+        if any(kw in line_lower for kw in ("error", "failed", "exception", "traceback")):
+            return "error"
+        # 警告级别
+        if any(kw in line for kw in ("WARNING", "Warning", "警告", "WARN", "重试", "降级", "fallback")):
+            return "warning"
+        if any(kw in line_lower for kw in ("warning", "warn", "retry", "fallback")):
+            return "warning"
+        # 成功级别
+        if any(kw in line for kw in ("完成", "成功", "✓", "DONE", "COMPLETED", "通过")):
+            return "success"
+        if any(kw in line_lower for kw in ("success", "completed", "done", "passed")):
+            return "success"
+        # 信息级别（阶段开始等）
+        if any(kw in line for kw in ("开始", "启动", "▶", ">>>", "==>", "阶段")):
+            return "info"
+        if any(kw in line_lower for kw in ("start", "begin", "stage", "running")):
+            return "info"
+        return ""
+
+    def _log_raw(self, line: str, add_timestamp: bool = False) -> None:
+        """直接输出日志行，自动检测颜色tag。"""
+        tag = self._detect_log_tag(line)
+        if add_timestamp:
+            self._log(line, tag)
+        else:
+            # 不带时间戳，用于worker.log已有时间戳的情况
+            self.log_queue.put(f"{sanitize_error(line)}\n{tag}")
 
     def _toggle_auto_scroll(self) -> None:
         """切换日志自动滚动开关。"""
@@ -2094,6 +2129,12 @@ class AicfGUI:
         # 新任务启动，显示切到新任务
         self._display_job_id = job_id
         self._user_selected_job = False
+        # 清空日志并准备实时跟踪
+        self.log_text.configure(state="normal")
+        self.log_text.delete("1.0", "end")
+        self.log_text.configure(state="disabled")
+        self._log_file_offsets.clear()
+        self._polling_job_id = job_id
         try:
             repo = self._get_repo()
             settings = self._collect_production_settings()
@@ -2121,6 +2162,11 @@ class AicfGUI:
         self._display_job_id = job_id
         self._user_selected_job = False
         self._load_job_production_settings(job_id)
+        # 清空日志并准备实时跟踪
+        self.log_text.configure(state="normal")
+        self.log_text.delete("1.0", "end")
+        self.log_text.configure(state="disabled")
+        self._polling_job_id = job_id
         self._log(f"任务 [{job_id}] 继续/恢复", "info")
         self._run_command_async(
             worker_start_command(job_id),
@@ -2408,6 +2454,89 @@ class AicfGUI:
                 self.job_tree.focus(existing[0])
         self._highlight_selected_job()
 
+    def _load_job_logs(self, job_id: str) -> None:
+        """加载指定任务的完整日志到日志面板（用于查看历史任务）。"""
+        job_dir = self._get_job_dir(job_id)
+        if not job_dir.is_dir():
+            return
+        
+        # 清空当前日志
+        self.log_text.configure(state="normal")
+        self.log_text.delete("1.0", "end")
+        self.log_text.configure(state="disabled")
+        # 重置日志偏移
+        for key in list(self._log_file_offsets.keys()):
+            if key.startswith(f"{job_id}/"):
+                del self._log_file_offsets[key]
+        
+        self._log(f"{'='*60}", "info")
+        self._log(f"任务 [{job_id}] 日志", "info")
+        self._log(f"{'='*60}", "info")
+        
+        # 读取status.json获取阶段信息
+        sp = self._get_status_path(job_id)
+        data = {}
+        if sp.is_file():
+            try:
+                data = json.loads(sp.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        
+        # 读取worker.log
+        worker_log = job_dir / "_work" / "runtime" / "worker.log"
+        if worker_log.is_file():
+            try:
+                content = worker_log.read_text(encoding="utf-8", errors="replace")
+                # 标记偏移为文件末尾，避免后续重复读取
+                self._log_file_offsets[f"{job_id}/worker.log"] = worker_log.stat().st_size
+                self._log("--- Worker 主日志 ---", "info")
+                for line in content.splitlines():
+                    if line.strip():
+                        self._log_raw(line)
+            except Exception as e:
+                self._log(f"读取worker.log失败: {e}", "error")
+        
+        # 读取各阶段日志
+        stages_info = data.get("stages", {})
+        if isinstance(stages_info, dict):
+            for stage_key, stage_info in stages_info.items():
+                if not isinstance(stage_info, dict):
+                    continue
+                log_rel = stage_info.get("log_path")
+                if not isinstance(log_rel, str) or not log_rel:
+                    continue
+                log_path = job_dir / log_rel
+                if not log_path.is_file():
+                    continue
+                try:
+                    content = log_path.read_text(encoding="utf-8", errors="replace")
+                    self._log_file_offsets[f"{job_id}/{log_rel}"] = log_path.stat().st_size
+                    stage_name = stage_info.get("name", stage_key)
+                    self._log(f"--- 阶段: {stage_name} ---", "info")
+                    for line in content.splitlines():
+                        if line.strip():
+                            self._log_raw(line)
+                except Exception:
+                    pass
+        
+        # 如果任务失败，显示错误摘要
+        failed_stage = data.get("failed_stage", "")
+        error_msg = ""
+        if failed_stage and isinstance(stages_info, dict):
+            stage_info = stages_info.get(failed_stage, {})
+            if isinstance(stage_info, dict):
+                error_msg = stage_info.get("error", "")
+        
+        if error_msg:
+            self._log("", "")
+            self._log(f"{'!'*60}", "error")
+            self._log(f"任务失败于阶段: {failed_stage}", "error")
+            self._log(f"错误信息: {sanitize_error(error_msg)}", "error")
+            self._log(f"{'!'*60}", "error")
+        
+        # 滚动到顶部方便查看
+        self.log_text.see("1.0")
+
     def _on_job_select(self, _event: object = None) -> None:
         sel = self.job_tree.selection()
         if sel:
@@ -2427,8 +2556,13 @@ class AicfGUI:
                     is_running = self._is_job_display_running(job_id, data)
                     if is_running:
                         self._set_buttons_running(True)
+                        # 如果是正在运行的任务，切换到实时跟踪模式
+                        self._polling_job_id = job_id
                     else:
                         self._set_buttons_running(self._polling_job_id != "")
+                        # 如果是已完成/失败的任务，加载完整历史日志
+                        self._polling_job_id = ""
+                        self._load_job_logs(job_id)
                 except Exception:
                     pass
             self._update_button_states()
@@ -2550,7 +2684,7 @@ class AicfGUI:
                     self._log_file_offsets[cache_key] = size
                     for line in content.splitlines():
                         if line.strip():
-                            self._log(line.rstrip(), "")
+                            self._log_raw(line.rstrip())
             except OSError:
                 pass
         # 读取所有有 log_path 的阶段日志
@@ -2578,7 +2712,7 @@ class AicfGUI:
                         for line in new_content.strip().splitlines():
                             line = line.rstrip()
                             if line:
-                                self._log(line, "")
+                                self._log_raw(line)
             except Exception:
                 pass
 

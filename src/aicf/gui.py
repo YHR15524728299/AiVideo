@@ -14,6 +14,7 @@ import tkinter as tk
 import yaml
 from datetime import datetime
 from pathlib import Path
+from threading import Event
 from tkinter import (
     BooleanVar,
     Label,
@@ -495,6 +496,7 @@ class AicfGUI:
         self._last_refresh_ts: float = 0.0  # 上次刷新任务列表的时间戳
         self._pid_cache: dict[str, tuple[float, bool]] = {}  # PID运行状态缓存，避免重复系统调用
         self._poll_in_progress: bool = False  # 轮询防重入标志
+        self._force_refresh_event: Event = Event()  # 强制刷新事件：给后台线程发信号立即刷新
 
         # 字体
         default_font = tkfont.nametofont("TkDefaultFont")
@@ -509,11 +511,8 @@ class AicfGUI:
             self._apply_production_settings(default_settings)
         except Exception:
             pass
-        self._refresh_job_list()
-        self._poll_log_queue()
-        self._poll_ui_queue()
-        self._auto_detect_and_poll()  # 自动检测后台运行的任务并启动实时轮询
-        self._poll_progress()  # 启动全局实时状态刷新
+        # 注意：任务列表刷新、日志轮询、状态检测全部由后台线程 + _poll_progress统一处理
+        # 不在UI线程做任何文件IO
         self._update_button_states()  # 初始化按钮状态
         # 后台异步检测视频提供商和环境状态（不阻塞UI启动）
         for lbl in self.env_labels.values():
@@ -936,9 +935,10 @@ class AicfGUI:
             return "info"
         return ""
 
-    def _log_raw(self, line: str, add_timestamp: bool = False) -> None:
-        """直接输出日志行，自动检测颜色tag。"""
-        tag = self._detect_log_tag(line)
+    def _log_raw(self, line: str, tag: str = "", add_timestamp: bool = False) -> None:
+        """直接输出日志行，可指定tag或自动检测颜色。"""
+        if not tag:
+            tag = self._detect_log_tag(line)
         if add_timestamp:
             self._log(line, tag)
         else:
@@ -1829,119 +1829,386 @@ class AicfGUI:
                 self._refresh_status_for_job(self._display_job_id)
 
     def _poll_progress(self) -> None:
-        """全局实时状态轮询（每3秒），自动检测运行任务、刷新进度和任务列表。
+        """UI线程只做一件事：从ui_queue取后台线程准备好的数据更新界面，绝对不做文件IO。
         
-        性能优化：
-        - 轮询间隔3秒，列表刷新间隔8秒（手动刷新立即执行）
-        - 所有进程检查使用light_check模式，避免系统调用阻塞
-        - 防重入：上次轮询未完成时直接跳过
+        架构：
+        - _bg_worker_thread：后台守护线程，做所有文件IO、状态检测、日志读取
+        - ui_queue：后台线程 → UI线程的消息队列
+        - UI线程（本方法）：每100ms处理队列消息，纯控件渲染，不碰文件
         """
-        # 防重入保护：上次轮询还没完成就跳过，避免UI线程阻塞
-        if getattr(self, '_poll_in_progress', False):
-            self.root.after(3000, self._poll_progress)
-            return
-        self._poll_in_progress = True
-        
-        try:
-            now = time.time()
-
-            # 1. 自动检测/更新正在运行的任务（用于日志跟踪和按钮状态）- 使用light_check
-            self._detect_running_job()
-
-            # 2. 更新进度条显示（显示 _display_job_id 的阶段状态）
-            if self._display_job_id:
-                self._update_display_job_stages()
-
-            # 3. 实时读取运行任务的日志
-            if self._polling_job_id:
-                self._tail_running_job_logs()
-
-            # 4. 每8秒刷新任务列表（手动点击"立即刷新"会立即执行）
-            if now - self._last_refresh_ts >= 8.0:
-                self._refresh_job_list()
-                self._sync_display_after_refresh()
-                # 如果当前没有选中任何任务，自动选中第一个（最新的）任务并加载日志
-                if not self.job_tree.selection() and not self._user_selected_job:
-                    children = self.job_tree.get_children()
-                    if children:
-                        first_job = children[0]
-                        self.job_tree.selection_set(first_job)
-                        self.job_tree.focus(first_job)
-                        self._on_job_select()
-                self._last_refresh_ts = now
-        finally:
-            self._poll_in_progress = False
-
-        self.root.after(3000, self._poll_progress)
-
-    def _detect_running_job(self) -> None:
-        """检测当前是否有正在运行的任务，更新 _polling_job_id 和按钮状态。
-        
-        性能优化：所有运行状态检查使用light_check模式，避免系统调用。
-        完整PID验证只在手动操作（启动/停止/删除）时执行。
-        """
-        terminal_states = {"COMPLETED", "INIT", "FAILED_RETRYABLE", "FAILED_NEEDS_ATTENTION"}
-        newest_running: tuple[float, str] | None = None
-        # 僵尸任务恢复检查节流：每30秒最多检查一次
-        now_ts = time.time()
-        should_check_zombie = now_ts - getattr(self, '_last_zombie_check_ts', 0) >= 30.0
-        if should_check_zombie:
-            self._last_zombie_check_ts = now_ts
-        
-        for status in self._get_repo().list_jobs():
-            job_dir = Path(status.output_dir)
-            sp = job_dir / "status.json"
-            if not sp.is_file():
-                continue
+        # 处理所有待处理的UI消息
+        processed = 0
+        while processed < 100:  # 一次最多处理100条，避免UI阻塞
             try:
-                data = json.loads(sp.read_text(encoding="utf-8"))
-                cur = data.get("current_stage", "")
-                failed = data.get("failed_stage", "")
-                # 自动检测并恢复僵尸任务（节流，不每次轮询都检查）
-                if should_check_zombie and cur and cur not in terminal_states and not failed:
-                    if self._recover_zombie_job(job_dir.name, data):
-                        data = json.loads(sp.read_text(encoding="utf-8"))
-                        cur = data.get("current_stage", "")
-                        failed = data.get("failed_stage", "")
-                # 使用light_check模式：只检查锁文件+worker记录，不做系统调用
-                is_running = bool(
-                    cur
-                    and cur not in terminal_states
-                    and not failed
-                    and self._is_job_really_running(job_dir, data, light_check=True)
-                )
-                if is_running:
-                    mtime = sp.stat().st_mtime
-                    if newest_running is None or mtime > newest_running[0]:
-                        newest_running = (mtime, job_dir.name)
-            except Exception:
-                pass
+                msg = self.ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            
+            # 兼容两种消息格式：
+            # 新格式：(msg_type: str, payload) - 2元组
+            # 旧格式：(action: str, arg1, arg2) - 3元组（环境检测等后台操作）
+            if len(msg) == 2:
+                msg_type, payload = msg
+                if msg_type == "job_list":
+                    self._apply_job_list_update(payload)
+                elif msg_type == "display_stages":
+                    self._update_stages_from_status(payload)
+                elif msg_type == "log_lines":
+                    for line, tag in payload:
+                        self._log_raw(line, tag)
+                elif msg_type == "running_job":
+                    if payload and not self._user_selected_job:
+                        job_id = payload
+                        if self._polling_job_id != job_id:
+                            self._polling_job_id = job_id
+                            self._logged_stages.clear()
+                            self._log_file_offsets.clear()
+                            self._set_buttons_running(True)
+                            self._log(f"检测到任务 [{job_id}] 开始运行，正在跟踪进度", "info")
+                            self._display_job_id = job_id
+                            self.job_id_var.set(job_id)
+                    elif not payload and self._polling_job_id:
+                        self._polling_job_id = ""
+                        self._set_buttons_running(False)
+            elif len(msg) == 3:
+                # 旧格式3元组：(action, arg1, arg2)
+                action, arg1, arg2 = msg
+                if action == "env_update":
+                    self._update_env_lights(str(arg1), bool(arg2))
+                elif action == "set_status":
+                    self._set_status(str(arg1))
+                elif action == "preview_done":
+                    self._on_preview_done()
+                elif action == "show_error":
+                    messagebox.showerror(str(arg1), str(arg2))
+                elif action == "providers_detected":
+                    self._on_providers_detected(list(arg1) if arg1 else [])
+            processed += 1
+        
+        # 同时处理日志队列
+        self._poll_log_queue_inner()
+        
+        # 100ms后继续处理（高频但极轻量，只处理内存中的队列消息）
+        self.root.after(100, self._poll_progress)
+    
+    def _poll_log_queue_inner(self) -> None:
+        """处理日志队列消息（内联到_poll_progress，不需要单独轮询）。"""
+        try:
+            while True:
+                item = self.log_queue.get_nowait()
+                if "\n" in item:
+                    text, tag = item.rsplit("\n", 1)
+                else:
+                    text, tag = item, ""
+                self.log_text.configure(state="normal")
+                if tag:
+                    self.log_text.insert("end", text + "\n", tag)
+                else:
+                    self.log_text.insert("end", text + "\n")
+                if self._log_auto_scroll:
+                    self.log_text.see("end")
+                self.log_text.configure(state="disabled")
+        except queue.Empty:
+            pass
 
-        if newest_running:
-            job_id = newest_running[1]
-            if self._polling_job_id != job_id:
-                # 新的运行任务开始了
-                self._polling_job_id = job_id
-                self._logged_stages.clear()
-                self._log_file_offsets.clear()
-                self._set_buttons_running(True)
-                self._log(f"检测到任务 [{job_id}] 开始运行，正在跟踪进度", "info")
-                # 如果用户没有手动选中其他任务，自动切换显示到运行中的任务
-                if not self._user_selected_job:
-                    self._display_job_id = job_id
-                    self.job_id_var.set(job_id)
-                    self.job_tree.selection_set(job_id)
-                    self.job_tree.focus(job_id)
-                    self._highlight_selected_job()
-        else:
-            # 没有运行中的任务了
-            if self._polling_job_id:
-                finished_id = self._polling_job_id
-                self._polling_job_id = ""
-                self._set_buttons_running(False)
-                # 如果显示的就是刚结束的任务，更新最终状态文字
-                if self._display_job_id == finished_id:
-                    self._update_display_job_stages()
+    def _start_background_poll_thread(self) -> None:
+        """启动后台轮询线程，所有耗时IO都在这里做，UI线程只负责渲染。"""
+        def bg_poll_loop():
+            last_list_refresh = 0.0
+            last_zombie_check = 0.0
+            terminal_states = {"COMPLETED", "INIT", "FAILED_RETRYABLE", "FAILED_NEEDS_ATTENTION"}
+            
+            while True:
+                try:
+                    now = time.time()
+                    
+                    # 1. 检测是否需要立即刷新（用户手动点了立即刷新）
+                    force_refresh = self._force_refresh_event.is_set()
+                    if force_refresh:
+                        self._force_refresh_event.clear()
+                    
+                    # 2. 检测运行中的任务 + 僵尸恢复（30秒检查一次僵尸）
+                    should_check_zombie = now - last_zombie_check >= 30.0
+                    if should_check_zombie:
+                        last_zombie_check = now
+                    
+                    newest_running_id = None
+                    newest_running_mtime = 0.0
+                    
+                    try:
+                        jobs = list(self._get_repo().list_jobs())
+                    except Exception:
+                        jobs = []
+                    
+                    for status in jobs:
+                        try:
+                            job_dir = Path(status.output_dir)
+                            sp = job_dir / "status.json"
+                            if not sp.is_file():
+                                continue
+                            data = json.loads(sp.read_text(encoding="utf-8"))
+                            cur = data.get("current_stage", "")
+                            failed = data.get("failed_stage", "")
+                            
+                            # 僵尸恢复检查（节流）
+                            if should_check_zombie and cur and cur not in terminal_states and not failed:
+                                try:
+                                    if self._recover_zombie_job(job_dir.name, data):
+                                        data = json.loads(sp.read_text(encoding="utf-8"))
+                                        cur = data.get("current_stage", "")
+                                        failed = data.get("failed_stage", "")
+                                except Exception:
+                                    pass
+                            
+                            # 轻量检查：只看锁文件+worker记录，不做系统调用
+                            is_running = bool(
+                                cur
+                                and cur not in terminal_states
+                                and not failed
+                                and lock_is_active(job_dir / ".autopilot.lock", stale_after=120.0)
+                            )
+                            if is_running:
+                                # 再检查worker记录
+                                try:
+                                    from .background_worker import read_worker_record
+                                    record = read_worker_record(job_dir)
+                                    is_running = record is not None and record.finished_at is None
+                                except Exception:
+                                    is_running = False
+                            
+                            if is_running:
+                                mtime = sp.stat().st_mtime
+                                if mtime > newest_running_mtime:
+                                    newest_running_mtime = mtime
+                                    newest_running_id = job_dir.name
+                        except Exception:
+                            pass
+                    
+                    # 通知UI线程运行任务变化
+                    if newest_running_id != self._polling_job_id:
+                        self.ui_queue.put(("running_job", newest_running_id))
+                    
+                    # 3. 跟踪运行中任务的日志（增量读取）
+                    if newest_running_id:
+                        try:
+                            job_dir = self._get_job_dir(newest_running_id)
+                            log_lines: list[tuple[str, str]] = []
+                            
+                            # worker.log增量读取
+                            for wlog_path in [
+                                job_dir / "_work" / "runtime" / "worker.log",
+                                job_dir / "worker.log",
+                                job_dir / "logs" / "worker.log",
+                            ]:
+                                if wlog_path.is_file():
+                                    cache_key = f"{newest_running_id}/worker.log"
+                                    last_pos = self._log_file_offsets.get(cache_key, 0)
+                                    try:
+                                        size = wlog_path.stat().st_size
+                                        if size < last_pos:
+                                            last_pos = 0
+                                        if size > last_pos:
+                                            with open(wlog_path, "r", encoding="utf-8", errors="replace") as f:
+                                                f.seek(last_pos)
+                                                content = f.read()
+                                            self._log_file_offsets[cache_key] = size
+                                            for line in content.splitlines():
+                                                line = line.rstrip()
+                                                if line:
+                                                    tag = self._get_log_tag(line)
+                                                    log_lines.append((line, tag))
+                                    except Exception:
+                                        pass
+                                    break
+                            
+                            # 阶段日志增量读取
+                            sp = job_dir / "status.json"
+                            if sp.is_file():
+                                try:
+                                    data = json.loads(sp.read_text(encoding="utf-8"))
+                                    stages = data.get("stages", {})
+                                    if isinstance(stages, dict):
+                                        for stage_key, stage_info in stages.items():
+                                            if not isinstance(stage_info, dict):
+                                                continue
+                                            log_rel = stage_info.get("log_path")
+                                            if not isinstance(log_rel, str) or not log_rel:
+                                                continue
+                                            log_path = None
+                                            for base_dir in [job_dir / "_work" / "runtime", job_dir, job_dir / "logs"]:
+                                                candidate = base_dir / log_rel
+                                                if candidate.is_file():
+                                                    log_path = candidate
+                                                    break
+                                            if log_path is None:
+                                                continue
+                                            cache_key = f"{newest_running_id}/{log_rel}"
+                                            last_pos = self._log_file_offsets.get(cache_key, 0)
+                                            try:
+                                                fsize = log_path.stat().st_size
+                                                if fsize < last_pos:
+                                                    last_pos = 0
+                                                if fsize > last_pos:
+                                                    with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                                                        f.seek(last_pos)
+                                                        new_content = f.read()
+                                                    self._log_file_offsets[cache_key] = fsize
+                                                    for line in new_content.splitlines():
+                                                        line = line.rstrip()
+                                                        if line:
+                                                            tag = self._get_log_tag(line)
+                                                            log_lines.append((line, tag))
+                                            except Exception:
+                                                pass
+                                except Exception:
+                                    pass
+                            
+                            if log_lines:
+                                self.ui_queue.put(("log_lines", log_lines))
+                        except Exception:
+                            pass
+                    
+                    # 4. 刷新显示中任务的进度条状态
+                    display_id = self._display_job_id
+                    if display_id:
+                        try:
+                            sp = self._get_status_path(display_id)
+                            if sp.is_file():
+                                data = json.loads(sp.read_text(encoding="utf-8"))
+                                self.ui_queue.put(("display_stages", data))
+                        except Exception:
+                            pass
+                    
+                    # 5. 刷新任务列表（每8秒一次，或强制刷新）
+                    if force_refresh or now - last_list_refresh >= 8.0:
+                        last_list_refresh = now
+                        try:
+                            job_list_data = []
+                            for status in jobs:
+                                try:
+                                    job_dir = Path(status.output_dir)
+                                    sp = job_dir / "status.json"
+                                    status_text = "未开始"
+                                    stage_text = "-"
+                                    updated = "-"
+                                    direction_text = "-"
+                                    
+                                    # 读取方向信息
+                                    direction_file = job_dir / "direction.json"
+                                    if direction_file.is_file():
+                                        try:
+                                            ddata = json.loads(direction_file.read_text(encoding="utf-8"))
+                                            series_name = ddata.get("series_name", "")
+                                            core_direction = ddata.get("core_direction", "")
+                                            if series_name:
+                                                direction_text = series_name
+                                            elif core_direction:
+                                                direction_text = core_direction[:20] + "..." if len(core_direction) > 20 else core_direction
+                                        except Exception:
+                                            pass
+                                    
+                                    if sp.is_file():
+                                        try:
+                                            d = json.loads(sp.read_text(encoding="utf-8"))
+                                            st = d.get("status", "")
+                                            cur = d.get("current_stage", "")
+                                            failed = d.get("failed_stage", "")
+                                            # 轻量检查运行状态
+                                            is_running = bool(
+                                                cur
+                                                and cur not in terminal_states
+                                                and not failed
+                                                and lock_is_active(job_dir / ".autopilot.lock", stale_after=120.0)
+                                            )
+                                            if is_running:
+                                                try:
+                                                    from .background_worker import read_worker_record
+                                                    record = read_worker_record(job_dir)
+                                                    is_running = record is not None and record.finished_at is None
+                                                except Exception:
+                                                    is_running = False
+                                            
+                                            if cur == "FAILED_NEEDS_ATTENTION":
+                                                status_text = "✗ 需人工处理"
+                                            elif cur == "FAILED_RETRYABLE":
+                                                status_text = "⚠ 可重试失败"
+                                            elif st == "ready_to_publish" or cur == "COMPLETED":
+                                                status_text = "✓ 已完成"
+                                            elif failed:
+                                                status_text = "✗ 失败/等待"
+                                            elif cur and cur != "INIT":
+                                                status_text = "▶ 进行中" if is_running else "⚠ 异常中断"
+                                            else:
+                                                status_text = "○ 待启动"
+                                            
+                                            raw = failed or cur or ""
+                                            stage_text = self._translate_stage(raw) if raw else "-"
+                                            ts = d.get("updated_at") or d.get("started_at") or ""
+                                            if ts:
+                                                updated = str(ts)[:16].replace("T", " ")
+                                            else:
+                                                updated = datetime.fromtimestamp(sp.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+                                        except Exception:
+                                            status_text = "状态异常"
+                                    
+                                    job_list_data.append({
+                                        "job_id": status.job_id,
+                                        "direction": direction_text,
+                                        "status": status_text,
+                                        "stage": stage_text,
+                                        "updated": updated,
+                                    })
+                                except Exception:
+                                    pass
+                            self.ui_queue.put(("job_list", job_list_data))
+                        except Exception:
+                            pass
+                    
+                    # 休眠2秒，后台线程不占CPU
+                    time.sleep(2.0)
+                except Exception:
+                    # 后台线程任何异常都不崩溃，休眠后继续
+                    time.sleep(3.0)
+        
+        import threading
+        self._bg_thread = threading.Thread(target=bg_poll_loop, daemon=True, name="AICF-BG-Poll")
+        self._bg_thread.start()
+
+    def _apply_job_list_update(self, job_list_data: list[dict]) -> None:
+        """UI线程：应用后台线程准备好的任务列表数据（纯控件操作，无IO）。"""
+        current_selection = self.job_tree.selection()
+        self.job_tree.delete(*self.job_tree.get_children())
+        for item in job_list_data:
+            self.job_tree.insert(
+                "", "end", iid=item["job_id"],
+                values=(item["job_id"], item["direction"], item["status"], item["stage"], item["updated"]),
+            )
+        if current_selection:
+            existing = [item for item in current_selection if self.job_tree.exists(item)]
+            if existing:
+                self.job_tree.selection_set(existing)
+                self.job_tree.focus(existing[0])
+        self._highlight_selected_job()
+        # 自动选中第一个任务
+        if not self.job_tree.selection() and not self._user_selected_job:
+            children = self.job_tree.get_children()
+            if children:
+                first_job = children[0]
+                self.job_tree.selection_set(first_job)
+                self.job_tree.focus(first_job)
+                self._on_job_select()
+        self._update_button_states()
+
+    def _get_log_tag(self, line: str) -> str:
+        """根据日志内容判断标签颜色。"""
+        line_lower = line.lower()
+        if any(kw in line for kw in [" ERROR ", "错误", "失败", "Exception", "Traceback", "CRITICAL"]):
+            return "error"
+        if any(kw in line for kw in [" WARNING ", "警告", "Retry", "timeout", "超时"]):
+            return "warning"
+        if any(kw in line for kw in [" ✓ ", "成功", "完成", "passed", "SUCCESS"]):
+            return "success"
+        return ""
 
     def _update_display_job_stages(self) -> None:
         """根据 _display_job_id 更新进度条阶段颜色、状态文字。"""
@@ -2338,14 +2605,10 @@ class AicfGUI:
     # 状态刷新
     # ------------------------------------------------------------------
     def _refresh_all(self) -> None:
+        """立即刷新：给后台线程发信号，不做任何IO（UI线程纯操作）。"""
         self._set_status("正在刷新...")
-        self._refresh_job_list()
-        job_id = self._current_job_id() or self._display_job_id
-        if job_id:
-            self._display_job_id = job_id
-            self._refresh_status_for_job(job_id)
-        self._set_status("刷新完成")
-        self._update_button_states()
+        self._force_refresh_event.set()  # 通知后台线程立即刷新
+        self._set_status("刷新请求已发送")
 
     def _refresh_status(self) -> None:
         job_id = self._current_job_id()
@@ -3071,6 +3334,10 @@ class AicfGUI:
         self.root.destroy()
 
     def run(self) -> None:
+        # 启动后台IO轮询线程（所有文件IO、状态检测、日志读取都在后台）
+        self._start_background_poll_thread()
+        # 启动UI消息轮询（每100ms处理队列消息，纯控件渲染，无IO）
+        self.root.after(100, self._poll_progress)
         # 延迟检查是否需要初始配置（等后台环境检测完成后）
         self.root.after(3000, self._check_first_run)
         self.root.mainloop()

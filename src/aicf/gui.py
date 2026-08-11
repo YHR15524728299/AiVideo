@@ -494,6 +494,7 @@ class AicfGUI:
         self._log_file_offsets: dict[str, int] = {}  # 已读取的日志文件字节位置，用于增量读取
         self._last_refresh_ts: float = 0.0  # 上次刷新任务列表的时间戳
         self._pid_cache: dict[str, tuple[float, bool]] = {}  # PID运行状态缓存，避免重复系统调用
+        self._poll_in_progress: bool = False  # 轮询防重入标志
 
         # 字体
         default_font = tkfont.nametofont("TkDefaultFont")
@@ -1828,41 +1829,65 @@ class AicfGUI:
                 self._refresh_status_for_job(self._display_job_id)
 
     def _poll_progress(self) -> None:
-        """全局实时状态轮询（每1.5秒），自动检测运行任务、刷新进度和任务列表。"""
-        import time
-        now = time.time()
+        """全局实时状态轮询（每3秒），自动检测运行任务、刷新进度和任务列表。
+        
+        性能优化：
+        - 轮询间隔3秒，列表刷新间隔8秒（手动刷新立即执行）
+        - 所有进程检查使用light_check模式，避免系统调用阻塞
+        - 防重入：上次轮询未完成时直接跳过
+        """
+        # 防重入保护：上次轮询还没完成就跳过，避免UI线程阻塞
+        if getattr(self, '_poll_in_progress', False):
+            self.root.after(3000, self._poll_progress)
+            return
+        self._poll_in_progress = True
+        
+        try:
+            now = time.time()
 
-        # 1. 自动检测/更新正在运行的任务（用于日志跟踪和按钮状态）
-        self._detect_running_job()
+            # 1. 自动检测/更新正在运行的任务（用于日志跟踪和按钮状态）- 使用light_check
+            self._detect_running_job()
 
-        # 2. 更新进度条显示（显示 _display_job_id 的阶段状态）
-        if self._display_job_id:
-            self._update_display_job_stages()
+            # 2. 更新进度条显示（显示 _display_job_id 的阶段状态）
+            if self._display_job_id:
+                self._update_display_job_stages()
 
-        # 3. 实时读取运行任务的日志
-        if self._polling_job_id:
-            self._tail_running_job_logs()
+            # 3. 实时读取运行任务的日志
+            if self._polling_job_id:
+                self._tail_running_job_logs()
 
-        # 4. 每2秒刷新任务列表
-        if now - self._last_refresh_ts >= 2.0:
-            self._refresh_job_list()
-            self._sync_display_after_refresh()
-            # 如果当前没有选中任何任务，自动选中第一个（最新的）任务并加载日志
-            if not self.job_tree.selection() and not self._user_selected_job:
-                children = self.job_tree.get_children()
-                if children:
-                    first_job = children[0]
-                    self.job_tree.selection_set(first_job)
-                    self.job_tree.focus(first_job)
-                    self._on_job_select()
-            self._last_refresh_ts = now
+            # 4. 每8秒刷新任务列表（手动点击"立即刷新"会立即执行）
+            if now - self._last_refresh_ts >= 8.0:
+                self._refresh_job_list()
+                self._sync_display_after_refresh()
+                # 如果当前没有选中任何任务，自动选中第一个（最新的）任务并加载日志
+                if not self.job_tree.selection() and not self._user_selected_job:
+                    children = self.job_tree.get_children()
+                    if children:
+                        first_job = children[0]
+                        self.job_tree.selection_set(first_job)
+                        self.job_tree.focus(first_job)
+                        self._on_job_select()
+                self._last_refresh_ts = now
+        finally:
+            self._poll_in_progress = False
 
-        self.root.after(1500, self._poll_progress)
+        self.root.after(3000, self._poll_progress)
 
     def _detect_running_job(self) -> None:
-        """检测当前是否有正在运行的任务，更新 _polling_job_id 和按钮状态。"""
+        """检测当前是否有正在运行的任务，更新 _polling_job_id 和按钮状态。
+        
+        性能优化：所有运行状态检查使用light_check模式，避免系统调用。
+        完整PID验证只在手动操作（启动/停止/删除）时执行。
+        """
         terminal_states = {"COMPLETED", "INIT", "FAILED_RETRYABLE", "FAILED_NEEDS_ATTENTION"}
         newest_running: tuple[float, str] | None = None
+        # 僵尸任务恢复检查节流：每30秒最多检查一次
+        now_ts = time.time()
+        should_check_zombie = now_ts - getattr(self, '_last_zombie_check_ts', 0) >= 30.0
+        if should_check_zombie:
+            self._last_zombie_check_ts = now_ts
+        
         for status in self._get_repo().list_jobs():
             job_dir = Path(status.output_dir)
             sp = job_dir / "status.json"
@@ -1872,17 +1897,18 @@ class AicfGUI:
                 data = json.loads(sp.read_text(encoding="utf-8"))
                 cur = data.get("current_stage", "")
                 failed = data.get("failed_stage", "")
-                # 自动检测并恢复僵尸任务
-                if cur and cur not in terminal_states and not failed:
+                # 自动检测并恢复僵尸任务（节流，不每次轮询都检查）
+                if should_check_zombie and cur and cur not in terminal_states and not failed:
                     if self._recover_zombie_job(job_dir.name, data):
                         data = json.loads(sp.read_text(encoding="utf-8"))
                         cur = data.get("current_stage", "")
                         failed = data.get("failed_stage", "")
+                # 使用light_check模式：只检查锁文件+worker记录，不做系统调用
                 is_running = bool(
                     cur
                     and cur not in terminal_states
                     and not failed
-                    and self._is_job_really_running(job_dir, data)
+                    and self._is_job_really_running(job_dir, data, light_check=True)
                 )
                 if is_running:
                     mtime = sp.stat().st_mtime
@@ -2512,6 +2538,33 @@ class AicfGUI:
                 self.job_tree.focus(existing[0])
         self._highlight_selected_job()
 
+    def _read_tail_lines(self, file_path: Path, max_lines: int) -> list[str]:
+        """高效读取文件最后N行，避免加载整个大文件。"""
+        try:
+            with open(file_path, "rb") as f:
+                # 从文件末尾向前找换行符
+                block_size = 8192
+                f.seek(0, 2)  # 移动到文件末尾
+                file_size = f.tell()
+                blocks: list[bytes] = []
+                lines_found = 0
+                block_end = file_size
+                
+                while block_end > 0 and lines_found <= max_lines:
+                    block_start = max(0, block_end - block_size)
+                    f.seek(block_start)
+                    block = f.read(block_end - block_start)
+                    blocks.append(block)
+                    lines_found += block.count(b'\n')
+                    block_end = block_start
+                
+                # 反向拼接，按行分割，取最后max_lines行
+                content = b''.join(reversed(blocks))
+                lines = content.decode('utf-8', errors='replace').splitlines()
+                return lines[-max_lines:] if len(lines) > max_lines else lines
+        except Exception:
+            return []
+
     def _load_job_logs(self, job_id: str) -> None:
         """加载指定任务的完整日志到日志面板（用于查看历史任务）。"""
         job_dir = self._get_job_dir(job_id)
@@ -2553,11 +2606,11 @@ class AicfGUI:
                 break
         if worker_log is not None:
             try:
-                content = worker_log.read_text(encoding="utf-8", errors="replace")
-                # 标记偏移为文件末尾，避免后续重复读取
+                # 只读最后500行，避免大文件卡死UI
+                lines = self._read_tail_lines(worker_log, 500)
                 self._log_file_offsets[f"{job_id}/worker.log"] = worker_log.stat().st_size
-                self._log("--- Worker 主日志 ---", "info")
-                for line in content.splitlines():
+                self._log("--- Worker 主日志（最近500行） ---", "info")
+                for line in lines:
                     if line.strip():
                         self._log_raw(line)
             except Exception as e:
@@ -2587,11 +2640,12 @@ class AicfGUI:
                 if log_path is None:
                     continue
                 try:
-                    content = log_path.read_text(encoding="utf-8", errors="replace")
+                    # 每个阶段日志只读最后200行
+                    lines = self._read_tail_lines(log_path, 200)
                     self._log_file_offsets[f"{job_id}/{log_rel}"] = log_path.stat().st_size
                     stage_name = self._translate_stage(stage_key)
-                    self._log(f"--- 阶段: {stage_name} ---", "info")
-                    for line in content.splitlines():
+                    self._log(f"--- 阶段: {stage_name}（最近200行） ---", "info")
+                    for line in lines:
                         if line.strip():
                             self._log_raw(line)
                 except Exception:

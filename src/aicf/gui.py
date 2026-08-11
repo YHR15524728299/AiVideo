@@ -1845,6 +1845,14 @@ class AicfGUI:
         if now - self._last_refresh_ts >= 2.0:
             self._refresh_job_list()
             self._sync_display_after_refresh()
+            # 如果当前没有选中任何任务，自动选中第一个（最新的）任务并加载日志
+            if not self.job_tree.selection() and not self._user_selected_job:
+                children = self.job_tree.get_children()
+                if children:
+                    first_job = children[0]
+                    self.job_tree.selection_set(first_job)
+                    self.job_tree.focus(first_job)
+                    self._on_job_select()
             self._last_refresh_ts = now
 
         self.root.after(1500, self._poll_progress)
@@ -2496,7 +2504,8 @@ class AicfGUI:
             except Exception as e:
                 self._log(f"读取worker.log失败: {e}", "error")
         
-        # 读取各阶段日志
+        # 读取各阶段日志 - 路径相对于 _work/runtime/ 目录
+        runtime_dir = job_dir / "_work" / "runtime"
         stages_info = data.get("stages", {})
         if isinstance(stages_info, dict):
             for stage_key, stage_info in stages_info.items():
@@ -2505,7 +2514,10 @@ class AicfGUI:
                 log_rel = stage_info.get("log_path")
                 if not isinstance(log_rel, str) or not log_rel:
                     continue
-                log_path = job_dir / log_rel
+                # 阶段日志在 _work/runtime/ 下，尝试两种路径
+                log_path = runtime_dir / log_rel
+                if not log_path.is_file():
+                    log_path = job_dir / log_rel  # fallback到根目录
                 if not log_path.is_file():
                     continue
                 try:
@@ -2565,12 +2577,15 @@ class AicfGUI:
                         if worker_log.is_file():
                             self._log_file_offsets[f"{job_id}/worker.log"] = worker_log.stat().st_size
                         stages_info = data.get("stages", {})
+                        runtime_dir_offset = job_dir / "_work" / "runtime"
                         if isinstance(stages_info, dict):
                             for stage_info in stages_info.values():
                                 if isinstance(stage_info, dict):
                                     log_rel = stage_info.get("log_path")
                                     if isinstance(log_rel, str) and log_rel:
-                                        log_path = job_dir / log_rel
+                                        log_path = runtime_dir_offset / log_rel
+                                        if not log_path.is_file():
+                                            log_path = job_dir / log_rel
                                         if log_path.is_file():
                                             self._log_file_offsets[f"{job_id}/{log_rel}"] = log_path.stat().st_size
                         self._polling_job_id = job_id
@@ -2703,14 +2718,17 @@ class AicfGUI:
                             self._log_raw(line.rstrip())
             except OSError:
                 pass
-        # 读取所有有 log_path 的阶段日志
+        # 读取所有有 log_path 的阶段日志 - 路径相对于 _work/runtime/ 目录
+        runtime_dir = job_dir / "_work" / "runtime"
         for stage_key, stage_info in stages_info.items():
             if not isinstance(stage_info, dict):
                 continue
             log_rel = stage_info.get("log_path")
             if not isinstance(log_rel, str) or not log_rel:
                 continue
-            log_path = job_dir / log_rel
+            log_path = runtime_dir / log_rel
+            if not log_path.is_file():
+                log_path = job_dir / log_rel  # fallback
             if not log_path.is_file():
                 continue
             cache_key = f"{job_id}/{log_rel}"

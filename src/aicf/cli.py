@@ -15,6 +15,7 @@ from .autopilot import Autopilot
 from .background_worker import (
     WorkerIdentityError,
     WorkerLauncher,
+    authorize_current_worker_process,
     run_worker,
     worker_status,
 )
@@ -22,7 +23,6 @@ from .cache import FileCache
 from .config import load_config
 from .database import JobRepository
 from .delivery_view import finalize_user_delivery, migrate_legacy_job
-from .job_actions import failed_attention_can_auto_reopen
 from .doctor import Doctor
 from .engines.m6_engine import M6Pipeline, RepairEngine
 from .engines.narration_engine import NarrationPipeline
@@ -31,6 +31,7 @@ from .m4_asset_runner import M4AssetRunner
 from .m2_runner import M2ContentRunner
 from .m5_runner import M5VisualPlanRunner
 from .logging_utils import sanitize_error
+from .job_service import JobService, ResearchResumeStrategy
 from .path_utils import project_root, python_executable
 from .providers.jimeng import JimengCliAdapter, detect_jimeng_cli
 from .providers.kling import KlingCliAdapter, build_kling_adapter
@@ -74,19 +75,26 @@ def build_renderer() -> FfmpegRenderer:
 
 def build_m2_runner(
     job_repository: JobRepository | None = None,
+    research_strategy: ResearchResumeStrategy | None = None,
 ) -> M2ContentRunner:
     root = project_root()
     client = OpenRouterClient(cache=FileCache(root / "data" / "openrouter_cache"))
     verifier = SourceVerifier()
-    # 暂时禁用Bing RSS外部搜索：搜索结果质量差（返回首页而非具体文章）导致验证失败
-    # TODO: 改进搜索结果过滤和query质量后重新启用
-    discovery = None
+    discovery = (
+        SourceDiscovery(
+            BingRSSSearchProvider(),
+            preflight=lambda candidate: verifier.preflight(candidate.url),
+        )
+        if research_strategy == ResearchResumeStrategy.RETRY_SOURCES
+        else None
+    )
     return M2ContentRunner(
         client,
         job_repository or repository(),
         root / "data" / "jobs",
         source_verifier=verifier,
         source_discovery=discovery,
+        research_strategy=research_strategy,
     )
 
 
@@ -175,14 +183,17 @@ def build_m4_asset_runner(provider: str) -> M4AssetRunner:
     )
 
 
-def build_autopilot(job_repository: JobRepository) -> Autopilot:
+def build_autopilot(
+    job_repository: JobRepository,
+    research_strategy: ResearchResumeStrategy | None = None,
+) -> Autopilot:
     root = project_root()
     config = load_config(root / "config" / "content_direction.yaml")
     toolchain = discover_ffmpeg_toolchain()
     renderer = FfmpegRenderer(toolchain)
     return Autopilot(
         job_repository,
-        content_runner=build_m2_runner(job_repository),
+        content_runner=build_m2_runner(job_repository, research_strategy),
         narration_pipeline=build_narration_pipeline(),
         visual_plan_runner=M5VisualPlanRunner(),
         asset_runner_factory=build_m4_asset_runner,
@@ -259,6 +270,10 @@ def build_parser() -> argparse.ArgumentParser:
     rebuild_snapshot.add_argument("--job", required=True)
     resume = subparsers.add_parser("resume")
     resume.add_argument("--job", required=True)
+    resume.add_argument(
+        "--research-strategy",
+        choices=[strategy.value for strategy in ResearchResumeStrategy],
+    )
     reopen = subparsers.add_parser("reopen")
     reopen.add_argument("--job", required=True)
     reopen.add_argument("--confirm-artifacts-fixed", action="store_true")
@@ -277,8 +292,16 @@ def build_parser() -> argparse.ArgumentParser:
     autopilot.add_argument("--job", required=True)
     worker_start = subparsers.add_parser("worker-start")
     worker_start.add_argument("--job", required=True)
+    worker_start.add_argument(
+        "--research-strategy",
+        choices=[strategy.value for strategy in ResearchResumeStrategy],
+    )
     worker_run = subparsers.add_parser("worker-run")
     worker_run.add_argument("--job", required=True)
+    worker_run.add_argument(
+        "--research-strategy",
+        choices=[strategy.value for strategy in ResearchResumeStrategy],
+    )
     worker_status_parser = subparsers.add_parser("worker-status")
     worker_status_parser.add_argument("--job", required=True)
     finalize_delivery = subparsers.add_parser("finalize-delivery")
@@ -286,6 +309,10 @@ def build_parser() -> argparse.ArgumentParser:
     finalize_delivery.add_argument("--migrate-legacy", action="store_true")
     content_run = subparsers.add_parser("content-run")
     content_run.add_argument("--job", required=True)
+    content_run.add_argument(
+        "--research-strategy",
+        choices=[strategy.value for strategy in ResearchResumeStrategy],
+    )
     subparsers.add_parser("ui")
     return parser
 
@@ -296,6 +323,55 @@ def _print_status(status) -> None:
     if status.failed_stage:
         print(f"失败阶段: {status.failed_stage.value}")
         print(f"恢复命令: {status.next_resume_command}")
+
+
+def _start_worker_via_service(
+    repo: JobRepository,
+    job_id: str,
+    job_dir: Path,
+    *,
+    research_strategy: ResearchResumeStrategy | None = None,
+    expected_failed_stage: PipelineStage | None = None,
+):
+    """兼容命令的统一适配器：服务层授权后只启动后台Worker。"""
+    service = JobService(repo)
+
+    def start(
+        authorized_job_id: str,
+        authorized_strategy: ResearchResumeStrategy | None,
+    ):
+        return WorkerLauncher(
+            python_executable=sys.executable,
+            launch_guard=lambda: (
+                (
+                    lambda current: (
+                        current.allowed and not current.requires_reopen
+                    )
+                )(
+                    service.authorize_worker(
+                        authorized_job_id,
+                        requested_strategy=authorized_strategy,
+                        expected_failed_stage=expected_failed_stage,
+                    )
+                )
+            ),
+        ).start(
+            authorized_job_id,
+            job_dir,
+            project_root=project_root(),
+            research_strategy=(
+                authorized_strategy.value
+                if authorized_strategy is not None
+                else None
+            ),
+        )
+
+    return service.resume_job(
+        job_id,
+        start=start,
+        research_strategy=research_strategy,
+        expected_failed_stage=expected_failed_stage,
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -439,9 +515,64 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 0
     if args.command == "content-run":
+        requested_strategy = (
+            ResearchResumeStrategy(args.research_strategy)
+            if args.research_strategy
+            else None
+        )
+        try:
+            if os.environ.get("AICF_WORKER_LAUNCHED") != "1":
+                raise WorkerIdentityError(
+                    "content-run只能由WorkerLauncher安全启动"
+                )
+            repo = repository()
+            status = repo.get_job(args.job)
+            worker_record = authorize_current_worker_process(
+                args.job,
+                Path(status.output_dir),
+                requested_research_strategy=(
+                    requested_strategy.value
+                    if requested_strategy is not None
+                    else None
+                ),
+            )
+            recorded_strategy = (
+                ResearchResumeStrategy(worker_record.research_strategy)
+                if worker_record.research_strategy is not None
+                else None
+            )
+            decision = JobService(repo).authorize_worker(
+                args.job,
+                requested_strategy=recorded_strategy,
+            )
+            if (
+                not decision.allowed
+                or decision.requires_reopen
+                or decision.research_strategy != recorded_strategy
+            ):
+                raise WorkerIdentityError(
+                    decision.reason
+                    or "研究策略未通过JobService二次授权"
+                )
+        except Exception as error:
+            print(
+                json.dumps(
+                    {
+                        "status": "START_REJECTED",
+                        "job_id": args.job,
+                        "reason": sanitize_error(error),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 2
         config = load_config(project_root() / "config" / "content_direction.yaml")
         try:
-            result = build_m2_runner().run(args.job, config)
+            result = build_m2_runner(
+                repo,
+                decision.research_strategy,
+            ).run(args.job, config)
         except Exception as error:
             print(
                 json.dumps(
@@ -486,6 +617,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         job_dir = Path(status.output_dir)
         if args.command == "worker-start":
+            requested_strategy = (
+                ResearchResumeStrategy(args.research_strategy)
+                if args.research_strategy
+                else None
+            )
             if status.current_stage == PipelineStage.COMPLETED:
                 print(
                     json.dumps(
@@ -501,65 +637,116 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
                 return 2
             try:
-                result = WorkerLauncher(
-                    python_executable=sys.executable,
-                    launch_guard=lambda: (
-                        repo.get_job(args.job).current_stage
-                        != PipelineStage.COMPLETED
-                    ),
-                ).start(
+                outcome = _start_worker_via_service(
+                    repo,
                     args.job,
                     job_dir,
-                    project_root=project_root(),
+                    research_strategy=requested_strategy,
                 )
-            except WorkerIdentityError as error:
+            except Exception as error:
                 print(
                     json.dumps(
                         {
                             "status": "START_REJECTED",
                             "job_id": args.job,
-                            "reason": str(error),
+                            "reason": sanitize_error(error),
                         },
                         ensure_ascii=False,
                         indent=2,
                     )
                 )
                 return 2
+            if not outcome.started:
+                print(
+                    json.dumps(
+                        {
+                            "status": "START_REJECTED",
+                            "job_id": args.job,
+                            "reason": outcome.reason,
+                            "recovery_command": outcome.recovery_command,
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                )
+                return 2
+            result = outcome.value
+            assert result is not None
             print(result.model_dump_json(indent=2))
             return 0
         if args.command == "worker-status":
             print(json.dumps(worker_status(job_dir), ensure_ascii=False, indent=2))
             return 0
+        requested_strategy = (
+            ResearchResumeStrategy(args.research_strategy)
+            if args.research_strategy
+            else None
+        )
+        decision = JobService(repo).authorize_worker(
+            args.job,
+            requested_strategy=requested_strategy,
+        )
+        if not decision.allowed or decision.requires_reopen:
+            print(
+                json.dumps(
+                    {
+                        "status": "START_REJECTED",
+                        "job_id": args.job,
+                        "reason": decision.reason,
+                        "recovery_command": decision.recovery_command,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 2
         return run_worker(
             args.job,
             job_dir,
-            run_autopilot=lambda job_id: build_autopilot(repo).run(job_id),
+            run_autopilot=lambda job_id: (
+                build_autopilot(
+                    repo,
+                    decision.research_strategy,
+                )
+                if decision.research_strategy is not None
+                else build_autopilot(repo)
+            ).run(job_id),
         )
     if args.command == "autopilot":
         try:
-            repo.get_job(args.job)
+            status = repo.get_job(args.job)
         except KeyError:
-            repo.create_job(
+            status = repo.create_job(
                 args.job,
                 project_root() / "data" / "jobs" / args.job,
             )
         try:
-            result = build_autopilot(repo).run(args.job)
-        except FileNotFoundError as error:
-            recovery = "powershell -File scripts/doctor.ps1"
-            result = {
-                "status": "FAILED_NEEDS_ATTENTION",
-                "reason": sanitize_error(error),
-                "recovery_command": recovery,
-            }
+            outcome = _start_worker_via_service(
+                repo,
+                args.job,
+                Path(status.output_dir),
+            )
         except Exception as error:
             result = {
                 "status": "FAILED_NEEDS_ATTENTION",
                 "reason": sanitize_error(error),
                 "recovery_command": f"python -m aicf resume --job {args.job}",
             }
+        else:
+            if not outcome.started:
+                result = {
+                    "status": "START_REJECTED",
+                    "reason": outcome.reason,
+                    "recovery_command": outcome.recovery_command,
+                }
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+                return 2
+            worker_result = outcome.value
+            assert worker_result is not None
+            print(worker_result.model_dump_json(indent=2))
+            return 0
         print(json.dumps(result, ensure_ascii=False, indent=2))
-        return 0 if result.get("status") == "READY_TO_PUBLISH" else 1
+        return 1
     if args.command == "init-job":
         output_dir = project_root() / "data" / "jobs" / args.job
         _print_status(repo.create_job(args.job, output_dir))
@@ -579,51 +766,44 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"{status.job_id}: status.json 快照已重建（version={status.version}）")
         return 0
     if args.command == "resume":
-        status = repo.get_job(args.job)
-        if status.current_stage == PipelineStage.FAILED_NEEDS_ATTENTION:
-            # 自动尝试 reopen：外部服务/网络问题导致的失败不需要人工确认
-            failed_stage = status.failed_stage
-            can_auto_reopen = False
-            if failed_stage is not None:
-                can_auto_reopen = failed_attention_can_auto_reopen(
-                    failed_stage.value,
-                    status.stages,
-                )
-            if can_auto_reopen:
-                try:
-                    repo.reopen_failed_attention(
-                        args.job,
-                        recoverable_reason="external_service_restored",
-                    )
-                except Exception:
-                    result = {
-                        "status": PipelineStage.FAILED_NEEDS_ATTENTION.value,
-                        "reason": "自动恢复失败，请手动检查",
-                        "recovery_command": status.next_resume_command,
-                    }
-                    print(json.dumps(result, ensure_ascii=False, indent=2))
-                    return 2
-            else:
-                result = {
-                    "status": PipelineStage.FAILED_NEEDS_ATTENTION.value,
-                    "reason": (
-                        "该 Job 需要人工确认后才能重开；"
-                        "resume 不会执行不可恢复阶段"
-                    ),
-                    "recovery_command": status.next_resume_command,
-                }
-                print(json.dumps(result, ensure_ascii=False, indent=2))
-                return 2
         try:
-            result = build_autopilot(repo).run(args.job)
+            status = repo.get_job(args.job)
+            research_strategy = (
+                ResearchResumeStrategy(args.research_strategy)
+                if args.research_strategy
+                else None
+            )
+            outcome = _start_worker_via_service(
+                repo,
+                args.job,
+                Path(status.output_dir),
+                research_strategy=research_strategy,
+            )
         except Exception as error:
             result = {
                 "status": "FAILED_NEEDS_ATTENTION",
                 "reason": sanitize_error(error),
                 "recovery_command": f"python -m aicf resume --job {args.job}",
             }
+        else:
+            if not outcome.started:
+                result = {
+                    "status": (
+                        "ALREADY_COMPLETED"
+                        if outcome.mode is None
+                        else PipelineStage.FAILED_NEEDS_ATTENTION.value
+                    ),
+                    "reason": outcome.reason,
+                    "recovery_command": outcome.recovery_command,
+                }
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+                return 2
+            worker_result = outcome.value
+            assert worker_result is not None
+            print(worker_result.model_dump_json(indent=2))
+            return 0
         print(json.dumps(result, ensure_ascii=False, indent=2))
-        return 0 if result.get("status") == "READY_TO_PUBLISH" else 1
+        return 1
     if args.command == "reopen":
         try:
             status = repo.reopen_failed_attention(
@@ -664,8 +844,32 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if args.command == "retry":
         stage = PipelineStage(args.stage)
-        repo.start_stage(args.job, stage)
-        print(f"{args.job}: 重试 {stage.value}")
+        try:
+            status = repo.get_job(args.job)
+            outcome = _start_worker_via_service(
+                repo,
+                args.job,
+                Path(status.output_dir),
+                expected_failed_stage=stage,
+            )
+        except Exception as error:
+            result = {
+                "status": "START_REJECTED",
+                "reason": sanitize_error(error),
+            }
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 2
+        if not outcome.started:
+            result = {
+                "status": "START_REJECTED",
+                "reason": outcome.reason,
+                "recovery_command": outcome.recovery_command,
+            }
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 2
+        worker_result = outcome.value
+        assert worker_result is not None
+        print(worker_result.model_dump_json(indent=2))
         return 0
     if args.command == "ui":
         from .gui import launch as launch_gui

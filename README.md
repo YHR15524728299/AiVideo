@@ -11,7 +11,7 @@
 - 已完成真实旁白批量合成、时间线、SRT/ASS 字幕、双遍 loudnorm 音量标准化。
 - 已完成 1080x1920、30fps、H.264/yuv420p、AAC 48kHz 双声道的 FFmpeg 集成渲染，并由 ffprobe 自动断言交付参数与时长。
 - 已完成从 direction 到 `ready_to_publish` 的内容编排；审核不通过时停在 `needs_revision`，不会生成发布包。
-- M0-M6 已具备代码与自动化测试；真实作业 `M2REAL001` 当前等待可用的 Dreamina CLI/凭据后继续。
+- M0-M6 已具备代码与自动化测试。
 - M7 当前只生成本地发布包，不会调用任何平台上传或发布 API。
 - `worker-start` 会启动独立后台 Worker；关闭 GUI 不会中断任务。
 
@@ -99,6 +99,21 @@ Job 状态同时写入：
 
 每个阶段记录开始/完成时间、调用次数、重试次数、错误、日志路径、可恢复性和恢复命令。成功阶段保留在 `completed_stages`，失败不会清除已完成结果。
 
+### 生命周期所有权
+
+- `JobRepository` 是 Pipeline 业务状态和 `status.json` 派生快照的唯一写入
+  Owner；SQLite 是权威源。
+- `RuntimeLease` 持有项目级单 Worker 运行权，并按 Worker instance ID 获取、
+  心跳和释放。
+- `JobLifecycleCoordinator` 在同一项目生命周期锁内协调停止、强制中断和删除；
+  进程身份不匹配、探测未知或终止失败时均 fail-closed。
+- `JobService` 是 GUI、CLI 和 Worker 共用的恢复决策 Owner。
+- `JobViewModelBuilder` 与 `JobViewModelPoller` 在后台聚合状态；GUI 线程只渲染
+  不可变 ViewModel，不读取 SQLite、状态文件、日志或进程身份。
+
+完整决策、兼容取舍和旧路径退休计划见
+[`docs/adr/0001-job-lifecycle-ownership.md`](docs/adr/0001-job-lifecycle-ownership.md)。
+
 ## 最终文件
 
 每个任务完成后，用户只需打开 `outputs\<job_id>\`：
@@ -136,7 +151,8 @@ GUI 通过独立 Worker 启动任务。任务运行期间：
 
 ## 测试
 
-当前可收集 293 项自动化测试。最近一次全量执行结果为 292 passed、1 skipped。
+当前可收集 566 项自动化测试。2026-08-20 最近一次全量执行结果为
+`566 passed`，退出码 0；覆盖率为 `81.70%`，高于 80% 门槛。
 测试遵循测试先行的红-绿流程，覆盖：
 
 - 唯一必填方向与默认值
@@ -176,4 +192,9 @@ uv run --extra dev pytest --cov=aicf --cov-report=term-missing
 - Windows SAPI：作为 EdgeTTS 失败时的自动回退，默认中文语音为 `Microsoft Huihui Desktop`。
 - Dreamina CLI：`config/jimeng_cli.yaml` 使用 `dreamina` 命令名，由 `JIMENG_CLI_EXECUTABLE` 或 PATH 在运行环境解析，不包含用户名绝对路径。
 - OpenRouter：自动测试通过注入 transport，不进行网络调用；真实 M2 调用需设置 `OPENROUTER_API_KEY`，并能实时访问 `/models` 证明所选模型全部价格为 0。
-- 全量测试已连续执行两次，均为 234 passed；真实 TTS/Dreamina Smoke 仍以当前外部环境执行结果为准。
+- 2026-08-20 全量测试为 `566 passed`，覆盖率 `81.70%`；`compileall`、CLI
+  帮助冒烟和 `git diff --check` 均通过。
+- 当前分支为 `fix/job-lifecycle-consistency`，生命周期实现、测试和文档仍在
+  未提交工作区。
+- 真实 OpenRouter、Dreamina、EdgeTTS 与 FFmpeg/ffprobe 能力仍以当前外部环境
+  的凭据、网络、CLI 和本机安装结果为准；自动化通过不代表外部 Provider 可用。

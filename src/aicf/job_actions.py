@@ -6,55 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Collection, Mapping
 
-
-AUTO_REOPEN_ERROR_MARKERS = (
-    "http ",
-    "url ",
-    "timeout",
-    "connection",
-    "不可达",
-    "403",
-    "429",
-    "500",
-    "502",
-    "503",
-    "504",
-    "拦截",
-    "验证",
-    # Provider 临时错误
-    "dreamina",
-    "jimeng",
-    "kling",
-    "任务失败",
-    "生成失败",
-    "提交失败",
-    "provider error",
-    "rate limit",
-    "too many requests",
-    "繁忙",
-    "排队中",
-    "系统繁忙",
-    # ffmpeg/IO 临时错误
-    "ffmpeg",
-    "no such file",
-    "invalid data",
-    "permission denied",
-    "access denied",
-    "disk",
-    "space",
-    "temporary",
-    "unavailable",
-    "overloaded",
-    "connection reset",
-    "broken pipe",
-)
-
-ZOMBIE_RECOVERY_TERMINAL_STAGES = {
-    "COMPLETED",
-    "INIT",
-    "FAILED_RETRYABLE",
-    "FAILED_NEEDS_ATTENTION",
-}
+from .job_service import ResumeAction, ResumeDecision, ResumeMode
+from .state_machine import is_terminal_stage
 
 
 @dataclass(frozen=True)
@@ -66,6 +19,30 @@ class JobActionState:
     guidance: str
     can_retry_research: bool = False
     can_view_research_failure: bool = False
+    resume_mode: ResumeMode | None = None
+
+
+def constrain_actions_for_running_job(
+    actions: JobActionState,
+    *,
+    selected_job_id: str,
+    running_job_id: str,
+) -> JobActionState:
+    """叠加应用级运行约束，同时保留当前选择可安全执行的只读动作。"""
+    if not running_job_id:
+        return actions
+    is_selected_running = selected_job_id == running_job_id
+    return JobActionState(
+        can_start=False,
+        can_resume=False,
+        can_stop=True,
+        can_open_video=actions.can_open_video,
+        guidance=(
+            "任务运行中，可关闭窗口；需要中止时点击“停止”。"
+            if is_selected_running
+            else "已有任务正在后台运行；可查看历史任务，停止操作仍针对后台任务。"
+        ),
+    )
 
 
 def should_recover_zombie_job(
@@ -73,12 +50,25 @@ def should_recover_zombie_job(
     current_stage: str,
     failed_stage: str,
     completed_stages: Collection[str],
+    worker_record: Any | None = None,
 ) -> bool:
-    """仅按持久化状态判断任务是否可能需要僵尸恢复。"""
+    """仅按持久化状态判断任务是否可能需要僵尸恢复。
+
+    增加 worker_record 检查：如果 worker 已正常结束（有 finished_at），不做僵尸恢复。
+    """
+    # Worker 已正常结束，不需要恢复
+    if worker_record is not None:
+        finished_at = getattr(worker_record, "finished_at", None)
+        terminal_status = getattr(worker_record, "terminal_status", None)
+        stop_requested_at = getattr(worker_record, "stop_requested_at", None)
+        if finished_at is not None or stop_requested_at is not None or terminal_status in ("COMPLETED", "STOP_REQUESTED", "FORCE_STOPPED", "FAILED", "EMERGENCY_EXIT"):
+            return False
+
     return bool(
         current_stage
-        and current_stage not in ZOMBIE_RECOVERY_TERMINAL_STAGES
+        and not is_terminal_stage(current_stage)
         and not failed_stage
+        and current_stage not in {"", "INIT"}
         and current_stage not in completed_stages
     )
 
@@ -88,11 +78,11 @@ def derive_job_actions(
     existing_job: bool,
     current_stage: str = "",
     failed_stage: str = "",
-    recoverable: bool = False,
     job_is_running: bool = False,
     app_has_running_job: bool = False,
     has_final_video: bool = False,
     research_failure_summary: str = "",
+    resume_decision: ResumeDecision | None = None,
 ) -> JobActionState:
     """把后台状态转换为互斥、面向用户的下一步操作。"""
     can_open_video = existing_job and has_final_video
@@ -134,44 +124,55 @@ def derive_job_actions(
         )
 
     if current_stage == "FAILED_NEEDS_ATTENTION":
-        # 所有失败状态都允许用户点击"继续/恢复"尝试重跑
-        # 即使是"需人工处理"，也给用户重试的机会，不要完全禁用按钮
+        decision = resume_decision
+        if decision is None:
+            return JobActionState(
+                can_start=False,
+                can_resume=False,
+                can_stop=False,
+                can_open_video=can_open_video,
+                guidance="任务恢复状态未知，已安全禁用恢复操作。",
+            )
         return JobActionState(
             can_start=False,
-            can_resume=True,
+            can_resume=decision.permits(ResumeAction.START_WORKER),
             can_stop=False,
             can_open_video=can_open_video,
-            guidance=(
+            guidance=decision.reason or (
                 "临时服务错误已可重试，点击“继续/恢复”。"
-                if recoverable
-                else "任务失败，可点击“继续/恢复”尝试重跑失败阶段；如问题持续请查看日志。"
+                if decision.permits(ResumeAction.START_WORKER)
+                else "任务需要人工确认并重开，当前不会直接启动。"
             ),
+            resume_mode=decision.mode,
         )
 
     if (
         current_stage == "FAILED_RETRYABLE"
         and failed_stage == "RESEARCHED"
     ):
+        decision = resume_decision
         return JobActionState(
             can_start=False,
-            can_resume=False,
+            can_resume=bool(
+                decision and decision.permits(ResumeAction.START_WORKER)
+            ),
             can_stop=False,
             can_open_video=can_open_video,
             guidance=(
                 research_failure_summary
-                or "资料研究失败，可重新搜索一批真实资料。"
+                or "资料研究失败，可点击「重新搜索资料」换一批来源，或直接点击「继续/恢复」用内部知识模式重试。"
             ),
             can_retry_research=True,
             can_view_research_failure=True,
+            resume_mode=decision.mode if decision else None,
         )
 
-    can_resume = (
-        current_stage == "FAILED_RETRYABLE"
-        or bool(failed_stage and recoverable)
-        or current_stage not in {"", "INIT"}
+    can_resume = bool(
+        resume_decision
+        and resume_decision.permits(ResumeAction.START_WORKER)
     )
     if can_resume:
-        reason = (
+        reason = resume_decision.reason or (
             "任务可恢复，点击“继续/恢复”。"
             if current_stage == "FAILED_RETRYABLE" or failed_stage
             else "任务异常中断，点击“继续/恢复”从断点继续。"
@@ -182,6 +183,7 @@ def derive_job_actions(
             can_stop=False,
             can_open_video=can_open_video,
             guidance=reason,
+            resume_mode=resume_decision.mode,
         )
 
     return JobActionState(
@@ -191,23 +193,6 @@ def derive_job_actions(
         can_open_video=can_open_video,
         guidance="该任务已初始化；如需重新制作，请点击“新建任务”。",
     )
-
-
-def failed_attention_can_auto_reopen(
-    failed_stage: str,
-    stages: Mapping[str, Any],
-) -> bool:
-    """与 CLI 共用的临时外部服务错误判定。"""
-    record = stages.get(failed_stage)
-    if not isinstance(record, Mapping):
-        return False
-    error_message = str(record.get("error", "")).lower()
-    if (
-        failed_stage == "CONTENT_PACKAGED"
-        and "m2 内容审核未通过" in error_message
-    ):
-        return True
-    return any(marker in error_message for marker in AUTO_REOPEN_ERROR_MARKERS)
 
 
 def job_storage_exists(job_dir: Path, output_dir: Path) -> bool:

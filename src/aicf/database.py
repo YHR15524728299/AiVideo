@@ -7,14 +7,19 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Iterator
+from typing import Any, Callable, Iterator, Mapping
 
 from pydantic import BaseModel, Field
 
 from .atomic_io import atomic_replace
 from .file_lock import os_file_lock
 from .logging_utils import sanitize_error
-from .state_machine import PipelineStage, StateMachine, TransitionError
+from .state_machine import (
+    FailureKind,
+    PipelineStage,
+    StateMachine,
+    TransitionError,
+)
 
 
 _INVALID_JOB_ID = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -32,6 +37,7 @@ class JobStatus(BaseModel):
     current_stage: PipelineStage | None = None
     completed_stages: list[PipelineStage] = Field(default_factory=list)
     failed_stage: PipelineStage | None = None
+    failure_kind: FailureKind = FailureKind.UNKNOWN
     retry_count: dict[str, int] = Field(default_factory=dict)
     started_at: str
     updated_at: str
@@ -63,6 +69,41 @@ class JobStatus(BaseModel):
         return f"python -m aicf resume --job {self.job_id}"
 
 
+def normalized_snapshot_semantics(value: Any) -> dict[str, Any]:
+    """Return the canonical lifecycle meaning shared by storage and readers."""
+    if isinstance(value, BaseModel) or hasattr(value, "model_dump"):
+        payload = value.model_dump(mode="json")
+    else:
+        payload = dict(value)
+    defaults: dict[str, Any] = {
+        "job_id": "",
+        "version": 0,
+        "topic_id": "",
+        "current_stage": None,
+        "completed_stages": [],
+        "failed_stage": None,
+        "failure_kind": FailureKind.UNKNOWN.value,
+        "retry_count": {},
+        "stages": {},
+        "usage": {},
+    }
+    return _normalize_json_value(
+        {key: payload.get(key, default) for key, default in defaults.items()}
+    )
+
+
+def _normalize_json_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _normalize_json_value(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_normalize_json_value(item) for item in value]
+    enum_value = getattr(value, "value", value)
+    return enum_value
+
+
 class JobRepository:
     def __init__(self, database_path: str | Path) -> None:
         self.database_path = Path(database_path)
@@ -75,7 +116,7 @@ class JobRepository:
         return connection
 
     def _initialize(self) -> None:
-        migrated: list[JobStatus] = []
+        snapshots_to_repair: list[JobStatus] = []
         with self._connect() as connection:
             connection.execute(
                 """
@@ -114,9 +155,14 @@ class JobRepository:
                 status = JobStatus.model_validate_json(row["status_json"])
                 if self._migrate_legacy_m2_status(status):
                     status.version += 1
+                    status.snapshot_dirty = True
                     self._save_in_transaction(connection, status)
-                    migrated.append(status)
-        for status in migrated:
+                if status.snapshot_dirty or self._snapshot_needs_rebuild(status):
+                    if not status.snapshot_dirty:
+                        status.snapshot_dirty = True
+                        self._save_in_transaction(connection, status)
+                    snapshots_to_repair.append(status)
+        for status in snapshots_to_repair:
             self._sync_snapshot(status)
 
     def create_job(self, job_id: str, output_dir: str | Path) -> JobStatus:
@@ -130,6 +176,7 @@ class JobRepository:
         status = JobStatus(
             job_id=job_id,
             version=1,
+            snapshot_dirty=True,
             started_at=now,
             updated_at=now,
             output_dir=str(destination),
@@ -230,6 +277,7 @@ class JobRepository:
             )
             status.current_stage = stage
             status.failed_stage = None
+            status.failure_kind = FailureKind.UNKNOWN
 
         return self._mutate(job_id, mutate)
 
@@ -256,6 +304,7 @@ class JobRepository:
                 status.completed_stages.append(stage)
             status.current_stage = stage
             status.failed_stage = None
+            status.failure_kind = FailureKind.UNKNOWN
 
         return self._mutate(job_id, mutate)
 
@@ -381,7 +430,7 @@ class JobRepository:
             for key, delta in deltas.items():
                 status.usage[key] = int(status.usage.get(key, 0)) + delta
             status.version += 1
-            status.snapshot_dirty = False
+            status.snapshot_dirty = True
             self._save_in_transaction(connection, status)
             connection.execute(
                 """
@@ -443,7 +492,7 @@ class JobRepository:
             for key, delta in deltas.items():
                 status.usage[key] = int(status.usage.get(key, 0)) + delta
             status.version += 1
-            status.snapshot_dirty = False
+            status.snapshot_dirty = True
             self._save_in_transaction(connection, status)
             connection.execute(
                 """
@@ -463,6 +512,7 @@ class JobRepository:
         reason: str,
         *,
         retryable: bool,
+        failure_kind: FailureKind = FailureKind.UNKNOWN,
         recovery_command: str | None = None,
     ) -> JobStatus:
         safe_reason = sanitize_error(reason)
@@ -481,10 +531,12 @@ class JobRepository:
                     "error": safe_reason,
                     "retry_count": count,
                     "recoverable": retryable,
+                    "failure_kind": failure_kind.value,
                     "next_resume_command": recovery_command or status.next_resume_command,
                 }
             )
             status.failed_stage = stage
+            status.failure_kind = failure_kind
             status.current_stage = (
                 PipelineStage.FAILED_RETRYABLE
                 if retryable
@@ -492,6 +544,70 @@ class JobRepository:
             )
 
         return self._mutate(job_id, mutate)
+
+    def mark_interrupted(
+        self,
+        job_id: str,
+        expected_stage: PipelineStage,
+        reason: str,
+        expected_worker_instance_id: str,
+        *,
+        expected_version: int | None = None,
+    ) -> JobStatus:
+        """CAS-mark the active stage as interrupted and retryable.
+
+        Runtime identity is supplied by the lifecycle coordinator.  The
+        repository deliberately never reads ``worker.json``: SQLite state and
+        its snapshot are the only persistence concerns owned here.
+        """
+        self._validate_job_id(job_id)
+        safe_reason = sanitize_error(reason)
+        if not expected_worker_instance_id:
+            raise TransitionError("中断操作需要Worker实例身份")
+
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            status = self._get_job_in_transaction(connection, job_id)
+            self._assert_not_completed(status)
+            if expected_version is not None and status.version != expected_version:
+                raise TransitionError(
+                    f"中断状态版本已变化: 预期 {expected_version}，"
+                    f"当前 {status.version}"
+                )
+            if (
+                status.current_stage != expected_stage
+                or status.failed_stage is not None
+            ):
+                current = (
+                    status.current_stage.value
+                    if status.current_stage is not None
+                    else "未开始"
+                )
+                raise TransitionError(
+                    f"中断阶段已变化: 预期 {expected_stage.value}，当前 {current}"
+                )
+            record = status.stages.get(expected_stage.value)
+            if not record or not record.get("started_at"):
+                raise TransitionError(f"阶段尚未启动: {expected_stage.value}")
+
+            count = status.retry_count.get(expected_stage.value, 0) + 1
+            status.retry_count[expected_stage.value] = count
+            record.update(
+                {
+                    "error": safe_reason,
+                    "retry_count": count,
+                    "recoverable": True,
+                    "next_resume_command": status.next_resume_command,
+                    "worker_instance_id": expected_worker_instance_id,
+                }
+            )
+            status.failed_stage = expected_stage
+            status.failure_kind = FailureKind.LOCAL_ENVIRONMENT
+            status.current_stage = PipelineStage.FAILED_RETRYABLE
+            status.version += 1
+            status.snapshot_dirty = True
+            self._save_in_transaction(connection, status)
+        return self._sync_snapshot(status)
 
     def invalidate_completed_delivery(self, job_id: str, reason: str) -> JobStatus:
         safe_reason = sanitize_error(reason)
@@ -528,6 +644,7 @@ class JobRepository:
                 }
             )
             status.failed_stage = PipelineStage.COMPLETED
+            status.failure_kind = FailureKind.INVALID_ARTIFACT
             status.current_stage = PipelineStage.FAILED_NEEDS_ATTENTION
 
         return self._mutate(job_id, mutate)
@@ -558,6 +675,7 @@ class JobRepository:
                 status.stages.pop(item.value, None)
                 status.retry_count.pop(item.value, None)
             status.failed_stage = None
+            status.failure_kind = FailureKind.UNKNOWN
             status.current_stage = (
                 status.completed_stages[-1]
                 if status.completed_stages
@@ -576,10 +694,8 @@ class JobRepository:
         allowed_reasons = {
             "credentials_restored",
             "external_service_restored",
+            "external_service_retry",
             "dependency_restored",
-            "auto_retry",  # 自动重试恢复（瞬态错误）
-            "transient_error",  # 瞬态错误（网络/服务临时不可用）
-            "user_requested_retry",  # 用户主动点击恢复
         }
 
         def mutate(status: JobStatus) -> None:
@@ -617,6 +733,7 @@ class JobRepository:
                 else None
             )
             status.failed_stage = None
+            status.failure_kind = FailureKind.UNKNOWN
 
         return self._mutate(job_id, mutate)
 
@@ -631,7 +748,7 @@ class JobRepository:
             status = self._get_job_in_transaction(connection, job_id)
             mutation(status)
             status.version += 1
-            status.snapshot_dirty = False
+            status.snapshot_dirty = True
             self._save_in_transaction(connection, status)
         return self._sync_snapshot(status)
 
@@ -640,33 +757,53 @@ class JobRepository:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             status = self._get_job_in_transaction(connection, job_id)
-            status.snapshot_dirty = False
+            status.snapshot_dirty = True
             self._save_in_transaction(connection, status)
-        return self._sync_snapshot(status, force=True)
+        return self._sync_snapshot(status)
 
-    def _sync_snapshot(
-        self,
-        status: JobStatus,
-        *,
-        force: bool = False,
-    ) -> JobStatus:
+    def _sync_snapshot(self, status: JobStatus) -> JobStatus:
+        path = Path(status.output_dir) / "status.json"
         try:
-            if force:
-                self._write_status(status, force=True)
-            else:
-                self._write_status(status)
+            with self._snapshot_lock(path):
+                with self._connect() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    authoritative = self._get_job_in_transaction(
+                        connection,
+                        status.job_id,
+                    )
+                    if authoritative.version != status.version:
+                        return authoritative
+                    snapshot = authoritative.model_copy(deep=True)
+                    snapshot.snapshot_dirty = False
+                    self._write_status_locked(path, snapshot)
+                    if (
+                        authoritative.version == status.version
+                        and authoritative.snapshot_dirty
+                    ):
+                        authoritative.snapshot_dirty = False
+                        connection.execute(
+                            "UPDATE jobs SET status_json = ? WHERE job_id = ?",
+                            (
+                                authoritative.model_dump_json(),
+                                authoritative.job_id,
+                            ),
+                        )
         except OSError:
-            return self._mark_snapshot_dirty(status.job_id, status.version)
-        return status
+            return self.get_job(status.job_id)
+        return authoritative
 
-    def _mark_snapshot_dirty(self, job_id: str, version: int) -> JobStatus:
-        with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            status = self._get_job_in_transaction(connection, job_id)
-            if status.version == version:
-                status.snapshot_dirty = True
-                self._save_in_transaction(connection, status)
-        return status
+    @staticmethod
+    def _snapshot_needs_rebuild(status: JobStatus) -> bool:
+        path = Path(status.output_dir) / "status.json"
+        try:
+            snapshot = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return True
+        return (
+            normalized_snapshot_semantics(snapshot)
+            != normalized_snapshot_semantics(status)
+            or snapshot.get("snapshot_dirty") is not False
+        )
 
     @staticmethod
     def _get_job_in_transaction(
@@ -745,26 +882,25 @@ class JobRepository:
         return True
 
     @staticmethod
-    def _write_status(status: JobStatus, *, force: bool = False) -> bool:
+    def _write_status(status: JobStatus) -> bool:
         path = Path(status.output_dir) / "status.json"
         with JobRepository._snapshot_lock(path):
-            return JobRepository._write_status_locked(path, status, force=force)
+            if path.exists():
+                try:
+                    current = json.loads(path.read_text(encoding="utf-8"))
+                    current_version = int(current.get("version", 0))
+                except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                    current_version = -1
+                if current_version > status.version:
+                    return False
+            JobRepository._write_status_locked(path, status)
+        return True
 
     @staticmethod
     def _write_status_locked(
         path: Path,
         status: JobStatus,
-        *,
-        force: bool,
-    ) -> bool:
-        if not force and path.exists():
-            try:
-                current = json.loads(path.read_text(encoding="utf-8"))
-                current_version = int(current.get("version", 0))
-            except (OSError, ValueError, TypeError, json.JSONDecodeError):
-                current_version = -1
-            if current_version > status.version:
-                return False
+    ) -> None:
         temporary = path.with_name(
             f".{path.name}.v{status.version}.{uuid.uuid4().hex}.tmp"
         )
@@ -781,7 +917,6 @@ class JobRepository:
         except OSError:
             temporary.unlink(missing_ok=True)
             raise
-        return True
 
     @staticmethod
     @contextmanager

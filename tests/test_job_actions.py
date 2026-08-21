@@ -2,12 +2,25 @@ from pathlib import Path
 
 from aicf import job_actions
 from aicf.job_actions import (
+    ResumeMode,
     derive_job_actions,
-    failed_attention_can_auto_reopen,
     first_available_job_id,
     job_storage_exists,
     summarize_research_failure,
 )
+from aicf.job_service import ResumeAction, ResumeDecision
+
+
+def resume_decision(mode: ResumeMode, *, allowed: bool = True) -> ResumeDecision:
+    return ResumeDecision(
+        allowed=allowed,
+        mode=mode,
+        actions=(
+            frozenset({ResumeAction.START_WORKER})
+            if allowed
+            else frozenset()
+        ),
+    )
 
 
 def test_completed_current_stage_is_not_a_zombie_candidate() -> None:
@@ -64,15 +77,16 @@ def test_recoverable_failure_exposes_resume_action() -> None:
         existing_job=True,
         current_stage="FAILED_RETRYABLE",
         failed_stage="KEYFRAMES_GENERATED",
-        recoverable=True,
+        resume_decision=resume_decision(ResumeMode.RETRY_FAILED_STAGE),
     )
 
     assert actions.can_resume is True
+    assert actions.resume_mode == ResumeMode.RETRY_FAILED_STAGE
     assert actions.can_start is False
     assert "继续/恢复" in actions.guidance
 
 
-def test_research_failure_exposes_dedicated_retry_and_plain_summary() -> None:
+def test_research_failure_exposes_retry_mode_and_plain_summary() -> None:
     summary = summarize_research_failure([
         {"category": "PERMANENT_SOURCE_FAILURE"} for _ in range(7)
     ] + [{"category": "UNSUPPORTED_CLAIM"}])
@@ -80,13 +94,14 @@ def test_research_failure_exposes_dedicated_retry_and_plain_summary() -> None:
         existing_job=True,
         current_stage="FAILED_RETRYABLE",
         failed_stage="RESEARCHED",
-        recoverable=True,
         research_failure_summary=summary,
+        resume_decision=resume_decision(ResumeMode.RETRY_FAILED_STAGE),
     )
 
     assert actions.can_retry_research is True
     assert actions.can_view_research_failure is True
-    assert actions.can_resume is False
+    assert actions.can_resume is True
+    assert actions.resume_mode == ResumeMode.RETRY_FAILED_STAGE
     assert actions.guidance == (
         "资料研究失败：8 条资料中 7 个网页不存在，"
         "1 条内容无法证明相关说法。"
@@ -120,22 +135,28 @@ def test_interrupted_job_exposes_resume_action() -> None:
         existing_job=True,
         current_stage="RENDERED",
         job_is_running=False,
+        resume_decision=resume_decision(ResumeMode.CONTINUE),
     )
 
     assert actions.can_resume is True
+    assert actions.resume_mode == ResumeMode.CONTINUE
     assert "异常中断" in actions.guidance
 
 
-def test_attention_failure_allows_manual_resume() -> None:
-    """所有失败状态（包括需人工处理的QA失败）都允许用户点击恢复尝试重跑。"""
+def test_attention_failure_requires_confirmation_without_direct_start() -> None:
     actions = derive_job_actions(
         existing_job=True,
         current_stage="FAILED_NEEDS_ATTENTION",
         failed_stage="QA_CHECKED",
+        resume_decision=resume_decision(
+            ResumeMode.REQUIRES_CONFIRMATION,
+            allowed=False,
+        ),
     )
 
-    assert actions.can_resume is True
-    assert "继续/恢复" in actions.guidance
+    assert actions.can_resume is False
+    assert actions.resume_mode == ResumeMode.REQUIRES_CONFIRMATION
+    assert "人工确认" in actions.guidance
 
 
 def test_attention_network_failure_exposes_resume_action() -> None:
@@ -143,37 +164,31 @@ def test_attention_network_failure_exposes_resume_action() -> None:
         existing_job=True,
         current_stage="FAILED_NEEDS_ATTENTION",
         failed_stage="RESEARCHED",
-        recoverable=True,
+        resume_decision=resume_decision(ResumeMode.AUTO_REOPEN),
     )
 
     assert actions.can_resume is True
+    assert actions.resume_mode == ResumeMode.AUTO_REOPEN
     assert "继续/恢复" in actions.guidance
 
 
-def test_failed_attention_auto_reopen_uses_error_contract() -> None:
-    stages = {
-        "RESEARCHED": {
-            "error": "HTTP 503: upstream unavailable",
-            "recoverable": False,
-        }
-    }
+def test_job_actions_only_map_resume_decision() -> None:
+    decision = ResumeDecision(
+        allowed=False,
+        mode=ResumeMode.REQUIRES_CONFIRMATION,
+        reason="需要人工确认",
+        recovery_command="python -m aicf reopen --job JOB-1",
+    )
 
-    assert failed_attention_can_auto_reopen("RESEARCHED", stages) is True
-    assert failed_attention_can_auto_reopen(
-        "RESEARCHED",
-        {"RESEARCHED": {"error": "产物哈希不一致"}},
-    ) is False
+    actions = derive_job_actions(
+        existing_job=True,
+        current_stage="FAILED_NEEDS_ATTENTION",
+        resume_decision=decision,
+    )
 
-
-def test_legacy_packaging_failure_from_review_can_reopen() -> None:
-    stages = {
-        "CONTENT_PACKAGED": {
-            "error": "M2 内容审核未通过",
-            "recoverable": False,
-        }
-    }
-
-    assert failed_attention_can_auto_reopen("CONTENT_PACKAGED", stages) is True
+    assert actions.can_resume is False
+    assert actions.resume_mode == ResumeMode.REQUIRES_CONFIRMATION
+    assert actions.guidance == "需要人工确认"
 
 
 def test_initialized_job_requires_new_task_instead_of_resume() -> None:
@@ -184,6 +199,7 @@ def test_initialized_job_requires_new_task_instead_of_resume() -> None:
 
     assert actions.can_start is False
     assert actions.can_resume is False
+    assert actions.resume_mode is None
     assert "新建任务" in actions.guidance
 
 
@@ -217,7 +233,6 @@ def test_other_running_job_blocks_selected_job_resume() -> None:
         existing_job=True,
         current_stage="FAILED_RETRYABLE",
         failed_stage="KEYFRAMES_GENERATED",
-        recoverable=True,
         app_has_running_job=True,
     )
 

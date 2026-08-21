@@ -11,6 +11,7 @@ from aicf.process_identity import (
     ProcessProbeStatus,
     get_process_identity,
     probe_process_identity,
+    process_identity_matches,
     process_is_running,
 )
 
@@ -225,3 +226,30 @@ def test_identity_helpers_only_accept_running_probe(monkeypatch) -> None:
     )
     assert get_process_identity(123) is None
     assert process_is_running(123) is False
+
+
+def test_process_identity_matches_complete_normalized_identity() -> None:
+    identity = ProcessIdentity(
+        pid=123,
+        created_at_ns=456,
+        executable=r"C:\Python\PYTHON.EXE",
+    )
+
+    assert process_identity_matches(
+        identity,
+        pid=123,
+        created_at_ns=456,
+        executable=r"c:\python\python.exe",
+    )
+    assert not process_identity_matches(
+        identity,
+        pid=123,
+        created_at_ns=999,
+        executable=r"c:\python\python.exe",
+    )
+    assert not process_identity_matches(
+        None,
+        pid=123,
+        created_at_ns=456,
+        executable=r"c:\python\python.exe",
+    )

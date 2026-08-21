@@ -25,6 +25,25 @@ class ProcessProbe(BaseModel):
     identity: ProcessIdentity | None = None
 
 
+def process_identity_matches(
+    identity: ProcessIdentity | None,
+    *,
+    pid: int,
+    created_at_ns: int | None,
+    executable: str | None,
+) -> bool:
+    """Return whether a complete recorded identity matches a live process."""
+    return (
+        identity is not None
+        and created_at_ns is not None
+        and executable is not None
+        and identity.pid == pid
+        and identity.created_at_ns == created_at_ns
+        and os.path.normcase(identity.executable)
+        == os.path.normcase(executable)
+    )
+
+
 def probe_process_identity(pid: int) -> ProcessProbe:
     if pid <= 0:
         return ProcessProbe(status=ProcessProbeStatus.NOT_RUNNING)

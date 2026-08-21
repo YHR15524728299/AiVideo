@@ -601,10 +601,10 @@ def test_repository_keeps_sqlite_authoritative_when_snapshot_write_fails(
 ) -> None:
     repository = JobRepository(tmp_path / "content.db")
 
-    def fail_snapshot(_status: object) -> bool:
+    def fail_snapshot(_path: Path, _status: object) -> None:
         raise OSError("磁盘已满")
 
-    monkeypatch.setattr(repository, "_write_status", fail_snapshot)
+    monkeypatch.setattr(repository, "_write_status_locked", fail_snapshot)
     created = repository.create_job("JOB-DIRTY", tmp_path / "JOB-DIRTY")
 
     assert created.version == 1
@@ -621,6 +621,135 @@ def test_repository_keeps_sqlite_authoritative_when_snapshot_write_fails(
     )
     assert saved["version"] == 1
     assert saved["snapshot_dirty"] is False
+
+
+def test_committed_version_is_dirty_before_snapshot_and_restart_repairs_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "content.db"
+    output_dir = tmp_path / "JOB-CRASH"
+    repository = JobRepository(database_path)
+    created = repository.create_job("JOB-CRASH", output_dir)
+
+    monkeypatch.setattr(
+        repository,
+        "_sync_snapshot",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("simulated crash before snapshot")
+        ),
+    )
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        repository.start_stage("JOB-CRASH", PipelineStage.DIRECTION_LOADED)
+
+    committed = repository.get_job("JOB-CRASH")
+    stale_snapshot = json.loads(
+        (output_dir / "status.json").read_text(encoding="utf-8")
+    )
+    assert committed.version == created.version + 1
+    assert committed.snapshot_dirty is True
+    assert stale_snapshot["version"] == created.version
+
+    restarted = JobRepository(database_path)
+
+    repaired = restarted.get_job("JOB-CRASH")
+    saved = json.loads(
+        (output_dir / "status.json").read_text(encoding="utf-8")
+    )
+    assert repaired.snapshot_dirty is False
+    assert saved["snapshot_dirty"] is False
+    assert saved["version"] == repaired.version == committed.version
+    assert saved["current_stage"] == "DIRECTION_LOADED"
+    assert saved == repaired.model_dump(mode="json")
+
+
+def test_concurrent_newer_dirty_commit_waits_for_snapshot_clear_and_stays_dirty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = JobRepository(tmp_path / "content.db")
+    created = repository.create_job("JOB-CAS", tmp_path / "JOB-CAS")
+    with repository._connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        pending = repository._get_job_in_transaction(connection, "JOB-CAS")
+        pending.version += 1
+        pending.snapshot_dirty = True
+        repository._save_in_transaction(connection, pending)
+
+    snapshot_written = threading.Event()
+    allow_clear = threading.Event()
+    commit_started = threading.Event()
+    commit_finished = threading.Event()
+    original_write_locked = repository._write_status_locked
+
+    def pause_after_snapshot(path: Path, status: object) -> None:
+        original_write_locked(path, status)  # type: ignore[arg-type]
+        snapshot_written.set()
+        assert allow_clear.wait(timeout=2)
+
+    monkeypatch.setattr(repository, "_write_status_locked", pause_after_snapshot)
+    results = []
+    writer = threading.Thread(
+        target=lambda: results.append(repository._sync_snapshot(pending))
+    )
+    writer.start()
+    assert snapshot_written.wait(timeout=2)
+
+    def commit_newer_version() -> None:
+        commit_started.set()
+        with repository._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            newer = repository._get_job_in_transaction(connection, "JOB-CAS")
+            newer.version += 1
+            newer.snapshot_dirty = True
+            repository._save_in_transaction(connection, newer)
+        commit_finished.set()
+
+    committer = threading.Thread(target=commit_newer_version)
+    committer.start()
+    assert commit_started.wait(timeout=2)
+    assert not commit_finished.wait(timeout=0.2)
+    allow_clear.set()
+    writer.join(timeout=2)
+    committer.join(timeout=2)
+
+    assert not writer.is_alive()
+    assert not committer.is_alive()
+    assert len(results) == 1
+    assert repository.get_job("JOB-CAS").version == created.version + 2
+    assert repository.get_job("JOB-CAS").snapshot_dirty is True
+
+
+@pytest.mark.parametrize("snapshot_state", ["missing", "stale"])
+def test_repository_startup_repairs_missing_or_stale_snapshot(
+    tmp_path: Path,
+    snapshot_state: str,
+) -> None:
+    database_path = tmp_path / "content.db"
+    output_dir = tmp_path / f"JOB-{snapshot_state.upper()}"
+    repository = JobRepository(database_path)
+    created = repository.create_job(f"JOB-{snapshot_state.upper()}", output_dir)
+    current = repository.start_stage(
+        created.job_id,
+        PipelineStage.DIRECTION_LOADED,
+    )
+    snapshot = output_dir / "status.json"
+    if snapshot_state == "missing":
+        snapshot.unlink()
+    else:
+        snapshot.write_text(
+            json.dumps(created.model_dump(mode="json")),
+            encoding="utf-8",
+        )
+
+    restarted = JobRepository(database_path)
+
+    repaired = restarted.get_job(created.job_id)
+    saved = json.loads(snapshot.read_text(encoding="utf-8"))
+    assert repaired.snapshot_dirty is False
+    assert saved["snapshot_dirty"] is False
+    assert saved["version"] == repaired.version == current.version
+    assert saved["current_stage"] == "DIRECTION_LOADED"
 
 
 def test_status_snapshot_uses_unique_tmp_and_stale_version_cannot_overwrite(
@@ -768,7 +897,7 @@ def test_status_snapshot_lock_never_unlinks_a_stale_pid_lock_file(
     assert lock_path.exists()
 
 
-def test_rebuild_snapshot_forces_sqlite_version_over_snapshot_version(
+def test_rebuild_snapshot_uses_sqlite_version_over_snapshot_version(
     tmp_path: Path,
 ) -> None:
     repository = JobRepository(tmp_path / "content.db")
@@ -783,6 +912,94 @@ def test_rebuild_snapshot_forces_sqlite_version_over_snapshot_version(
     saved = json.loads(snapshot.read_text(encoding="utf-8"))
     assert rebuilt.snapshot_dirty is False
     assert saved["version"] == authoritative.version
+
+
+def test_repository_repairs_same_version_snapshot_semantic_drift(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "content.db"
+    output_dir = tmp_path / "JOB-SAME-VERSION-DRIFT"
+    repository = JobRepository(database_path)
+    authoritative = repository.create_job(
+        "JOB-SAME-VERSION-DRIFT",
+        output_dir,
+    )
+    snapshot_path = output_dir / "status.json"
+    drifted = authoritative.model_dump(mode="json")
+    drifted["current_stage"] = "COMPLETED"
+    drifted["failed_stage"] = "DIRECTION_LOADED"
+    drifted["stages"] = {
+        "DIRECTION_LOADED": {"error": "forged failure reason"}
+    }
+    snapshot_path.write_text(
+        json.dumps(drifted, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    restarted = JobRepository(database_path)
+
+    repaired = restarted.get_job(authoritative.job_id)
+    saved = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    assert saved == repaired.model_dump(mode="json")
+    assert saved["version"] == authoritative.version
+    assert saved["current_stage"] is None
+    assert saved["failed_stage"] is None
+    assert saved["stages"] == {}
+
+
+def test_rebuild_snapshot_cannot_overwrite_concurrent_newer_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = JobRepository(tmp_path / "content.db")
+    version_n = repository.create_job(
+        "JOB-REBUILD-RACE",
+        tmp_path / "JOB-REBUILD-RACE",
+    )
+    snapshot = tmp_path / "JOB-REBUILD-RACE" / "status.json"
+    rebuild_ready = threading.Barrier(2)
+    allow_rebuild = threading.Barrier(2)
+    original_sync = repository._sync_snapshot
+
+    def interleave_rebuild(status: object) -> object:
+        if threading.current_thread().name == "rebuild-version-n":
+            rebuild_ready.wait(timeout=2)
+            allow_rebuild.wait(timeout=2)
+        return original_sync(status)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(repository, "_sync_snapshot", interleave_rebuild)
+    rebuilt: list[object] = []
+    errors: list[BaseException] = []
+
+    def rebuild_version_n() -> None:
+        try:
+            rebuilt.append(repository.rebuild_snapshot(version_n.job_id))
+        except BaseException as error:
+            errors.append(error)
+
+    rebuild_thread = threading.Thread(
+        target=rebuild_version_n,
+        name="rebuild-version-n",
+    )
+    rebuild_thread.start()
+    rebuild_ready.wait(timeout=2)
+
+    version_n_plus_one = repository.start_stage(
+        version_n.job_id,
+        PipelineStage.DIRECTION_LOADED,
+    )
+    allow_rebuild.wait(timeout=2)
+    rebuild_thread.join(timeout=2)
+
+    assert not rebuild_thread.is_alive()
+    assert errors == []
+    assert len(rebuilt) == 1
+    authoritative = repository.get_job(version_n.job_id)
+    saved = json.loads(snapshot.read_text(encoding="utf-8"))
+    assert authoritative.version == version_n_plus_one.version
+    assert authoritative.snapshot_dirty is False
+    assert saved["version"] == version_n_plus_one.version
+    assert saved["snapshot_dirty"] is False
 
 
 def test_repository_records_retryable_failure_without_losing_completed_stages(

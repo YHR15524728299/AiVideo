@@ -9,6 +9,7 @@ from pydantic import ValidationError
 
 from aicf.config import AppConfig
 from aicf.database import JobRepository
+from aicf.job_service import ResearchResumeStrategy
 from aicf.m2_runner import M2ContentRunner
 from aicf.providers.openrouter import StructuredResult, TokenUsage
 from aicf.research_policy import classify_source_error
@@ -125,6 +126,156 @@ def _runner(
         source_verifier=verifier or StubSourceVerifier(),
         source_discovery=source_discovery,
     )
+
+
+def test_internal_knowledge_strategy_disables_injected_source_discovery(
+    tmp_path: Path,
+) -> None:
+    discovery = StubSourceDiscovery()
+    runner = M2ContentRunner(
+        SequencedClient({}),
+        JobRepository(tmp_path / "data" / "content.db"),
+        tmp_path / "outputs",
+        source_verifier=StubSourceVerifier(),
+        source_discovery=discovery,
+        research_strategy=ResearchResumeStrategy.INTERNAL_KNOWLEDGE,
+    )
+
+    assert runner.source_discovery is None
+
+
+def test_retry_sources_strategy_requires_and_enables_source_discovery(
+    tmp_path: Path,
+) -> None:
+    discovery = StubSourceDiscovery()
+    runner = M2ContentRunner(
+        SequencedClient({}),
+        JobRepository(tmp_path / "data" / "content.db"),
+        tmp_path / "outputs",
+        source_verifier=StubSourceVerifier(),
+        source_discovery=discovery,
+        research_strategy=ResearchResumeStrategy.RETRY_SOURCES,
+    )
+
+    assert runner.source_discovery is discovery
+
+    with pytest.raises(ValueError, match="必须启用 source discovery"):
+        M2ContentRunner(
+            SequencedClient({}),
+            JobRepository(tmp_path / "other" / "content.db"),
+            tmp_path / "other-outputs",
+            source_verifier=StubSourceVerifier(),
+            research_strategy=ResearchResumeStrategy.RETRY_SOURCES,
+        )
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_command"),
+    [
+        (
+            ValueError("结构化结果无效"),
+            "python -m aicf retry --job M2-RECOVERY --stage DIRECTION_LOADED",
+        ),
+        (
+            RuntimeError("未知执行错误"),
+            "python -m aicf resume --job M2-RECOVERY",
+        ),
+    ],
+)
+def test_m2_failure_recovery_commands_only_expose_resume_or_retry(
+    tmp_path: Path,
+    error: Exception,
+    expected_command: str,
+) -> None:
+    repo = JobRepository(tmp_path / "data" / "content.db")
+    repo.create_job("M2-RECOVERY", tmp_path / "outputs" / "M2-RECOVERY")
+    runner = _runner(SequencedClient({}), repo, tmp_path / "outputs")
+
+    def fail() -> None:
+        raise error
+
+    with pytest.raises(type(error), match=str(error)):
+        runner._stage("M2-RECOVERY", PipelineStage.DIRECTION_LOADED, fail)
+
+    command = repo.get_job("M2-RECOVERY").next_resume_command
+    assert command == expected_command
+    assert "content-run" not in command
+
+
+@pytest.mark.parametrize(
+    ("strategy", "expected_discovery_calls"),
+    [
+        (ResearchResumeStrategy.INTERNAL_KNOWLEDGE, 0),
+        (ResearchResumeStrategy.RETRY_SOURCES, 1),
+    ],
+)
+def test_resume_strategies_create_distinct_research_artifacts(
+    tmp_path: Path,
+    strategy: ResearchResumeStrategy,
+    expected_discovery_calls: int,
+) -> None:
+    job_id = f"M2-{strategy.value}"
+    job_dir = tmp_path / "outputs" / job_id
+    repo = JobRepository(tmp_path / strategy.value / "content.db")
+    repo.create_job(job_id, job_dir)
+    completed = [
+        PipelineStage.DIRECTION_LOADED,
+        PipelineStage.DIRECTION_ANALYZED,
+        PipelineStage.TOPICS_GENERATED,
+        PipelineStage.TOPIC_SELECTED,
+    ]
+    for stage in completed:
+        repo.start_stage(job_id, stage)
+        repo.complete_stage(job_id, stage)
+    repo.start_stage(job_id, PipelineStage.RESEARCHED)
+    repo.fail_stage(
+        job_id,
+        PipelineStage.RESEARCHED,
+        "上次研究失败",
+        retryable=True,
+    )
+    job_dir.mkdir(parents=True, exist_ok=True)
+    (job_dir / "direction.json").write_text(
+        json.dumps(_direction(), ensure_ascii=False),
+        encoding="utf-8",
+    )
+    topics = [_topic(index) for index in range(1, 9)]
+    (job_dir / "topics.json").write_text(
+        json.dumps(topics, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (job_dir / "topic.json").write_text(
+        json.dumps(topics[0], ensure_ascii=False),
+        encoding="utf-8",
+    )
+    client = SequencedClient({
+        "research": [_research()],
+        "script": [_script()],
+        "review": [_review(True)],
+        "package": [_package()],
+    })
+    discovery = StubSourceDiscovery()
+    runner = M2ContentRunner(
+        client,
+        repo,
+        tmp_path / "outputs",
+        source_verifier=StubSourceVerifier(),
+        source_discovery=discovery,
+        research_strategy=strategy,
+    )
+
+    manifest = runner.run(job_id, _config())
+
+    attempt = json.loads(
+        (job_dir / "research_attempt.json").read_text(encoding="utf-8")
+    )
+    research = json.loads(
+        (job_dir / "research.json").read_text(encoding="utf-8")
+    )
+    assert manifest["status"] == "ready_to_publish"
+    assert attempt["reason"] == strategy.value
+    assert research["summary"]
+    assert discovery.calls == expected_discovery_calls
 
 
 def _topic(index: int, score: float = 80) -> dict[str, object]:

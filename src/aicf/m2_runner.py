@@ -24,6 +24,7 @@ from aicf.engines.script_engine import (
     render_script_markdown,
 )
 from aicf.engines.topic_engine import TopicGenerationEngine, rank_topics, select_topic
+from aicf.job_service import ResearchResumeStrategy
 from aicf.models.contracts import (
     DirectionProfile,
     PackageResult,
@@ -39,7 +40,7 @@ from aicf.research_policy import (
 )
 from aicf.source_discovery import SourceDiscovery
 from aicf.source_verifier import SourceVerificationError, SourceVerifier
-from aicf.state_machine import PipelineStage
+from aicf.state_machine import FailureKind, PipelineStage
 
 
 class M2ContentRunner:
@@ -52,12 +53,23 @@ class M2ContentRunner:
         source_verifier: object | None = None,
         source_discovery: SourceDiscovery | None = None,
         research_policy: ResearchPolicy | None = None,
+        research_strategy: ResearchResumeStrategy | None = None,
     ) -> None:
         self.client = client
         self.repository = repository
         self.outputs_root = Path(outputs_root)
         self.source_verifier = source_verifier or SourceVerifier()
-        self.source_discovery = source_discovery
+        self.research_strategy = research_strategy
+        self.source_discovery = (
+            None
+            if research_strategy == ResearchResumeStrategy.INTERNAL_KNOWLEDGE
+            else source_discovery
+        )
+        if (
+            research_strategy == ResearchResumeStrategy.RETRY_SOURCES
+            and self.source_discovery is None
+        ):
+            raise ValueError("RETRY_SOURCES 必须启用 source discovery")
         self.research_policy = research_policy or ResearchPolicy()
         self._run_start_counters = self._client_counters()
         self._synced_run_counters = {"calls": 0, "prompt": 0, "completion": 0}
@@ -148,19 +160,17 @@ class M2ContentRunner:
         else:
             research_attempt_id = uuid4().hex
             attempt_reason = (
-                "automatic_retry"
-                if status.failed_stage == PipelineStage.RESEARCHED
-                else "initial"
-            )
-            retry_request_path = output_dir / "research_retry_request.json"
-            if retry_request_path.exists():
-                retry_request = self._read_json(retry_request_path)
+                self.research_strategy.value
                 if (
-                    isinstance(retry_request, dict)
-                    and retry_request.get("reason") == "user_retry"
-                ):
-                    attempt_reason = "user_retry"
-                retry_request_path.unlink(missing_ok=True)
+                    status.failed_stage == PipelineStage.RESEARCHED
+                    and self.research_strategy is not None
+                )
+                else (
+                    "automatic_retry"
+                    if status.failed_stage == PipelineStage.RESEARCHED
+                    else "initial"
+                )
+            )
             self._write_json(
                 output_dir / "research_attempt.json",
                 {
@@ -534,12 +544,34 @@ class M2ContentRunner:
                     and (error.status_code == 429 or error.status_code >= 500)
                 )
             )
+            if isinstance(
+                error,
+                (URLError, TimeoutError, UpstreamRateLimitError),
+            ) or (
+                isinstance(error, OpenRouterHTTPError)
+                and (error.status_code == 429 or error.status_code >= 500)
+            ):
+                failure_kind = FailureKind.TRANSIENT_EXTERNAL
+            elif isinstance(error, OpenRouterHTTPError):
+                failure_kind = FailureKind.PERMANENT_EXTERNAL
+            elif isinstance(error, OSError):
+                failure_kind = FailureKind.LOCAL_ENVIRONMENT
+            elif isinstance(error, (ValueError, ValidationError)):
+                failure_kind = FailureKind.INVALID_ARTIFACT
+            else:
+                failure_kind = FailureKind.UNKNOWN
+            recovery_command = (
+                f"python -m aicf retry --job {job_id} --stage {stage.value}"
+                if retryable
+                else f"python -m aicf resume --job {job_id}"
+            )
             self.repository.fail_stage(
                 job_id,
                 stage,
                 str(error),
                 retryable=retryable,
-                recovery_command=f"python -m aicf content-run --job {job_id}",
+                failure_kind=failure_kind,
+                recovery_command=recovery_command,
             )
             self._sync_usage(job_id)
             raise

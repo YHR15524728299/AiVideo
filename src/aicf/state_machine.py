@@ -3,6 +3,17 @@ from __future__ import annotations
 from enum import Enum
 
 
+class FailureKind(str, Enum):
+    """持久化失败分类；恢复授权不得从错误文本反推。"""
+
+    UNKNOWN = "UNKNOWN"
+    TRANSIENT_EXTERNAL = "TRANSIENT_EXTERNAL"
+    PERMANENT_EXTERNAL = "PERMANENT_EXTERNAL"
+    LOCAL_ENVIRONMENT = "LOCAL_ENVIRONMENT"
+    INVALID_ARTIFACT = "INVALID_ARTIFACT"
+    USER_ACTION_REQUIRED = "USER_ACTION_REQUIRED"
+
+
 class PipelineStage(str, Enum):
     DIRECTION_LOADED = "DIRECTION_LOADED"
     DIRECTION_ANALYZED = "DIRECTION_ANALYZED"
@@ -34,6 +45,33 @@ ORDERED_STAGES = [
     for stage in PipelineStage
     if stage not in {PipelineStage.FAILED_RETRYABLE, PipelineStage.FAILED_NEEDS_ATTENTION}
 ]
+
+# 统一终态定义：任务已结束，不会再自动推进
+TERMINAL_STAGES: frozenset[PipelineStage] = frozenset({
+    PipelineStage.COMPLETED,
+    PipelineStage.FAILED_RETRYABLE,
+    PipelineStage.FAILED_NEEDS_ATTENTION,
+})
+
+# 非运行状态：终态 + INIT（初始态）
+NON_RUNNING_STAGES: frozenset[PipelineStage] = TERMINAL_STAGES | frozenset({
+    # INIT 不在枚举中，用字符串判断
+})
+
+
+def is_terminal_stage(stage: str | PipelineStage | None) -> bool:
+    """判断阶段是否为终态（不会再自动推进）"""
+    if stage is None:
+        return False
+    stage_str = stage.value if isinstance(stage, PipelineStage) else str(stage)
+    return stage_str in {s.value for s in TERMINAL_STAGES}
+
+
+def is_stage_running(stage: str | PipelineStage | None, failed_stage: str | PipelineStage | None = None) -> bool:
+    """判断阶段状态是否表示任务可能在运行中（非终态、无失败阶段）"""
+    if failed_stage:
+        return False
+    return not is_terminal_stage(stage) and stage not in (None, "", "INIT")
 
 
 class TransitionError(ValueError):

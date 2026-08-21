@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import logging
+import json
 import os
 import re
+import threading
+import time
 from pathlib import Path
+from typing import Callable
 
 
 _REDACTED = "***REDACTED***"
@@ -11,6 +15,8 @@ _SENSITIVE_QUERY_KEYS = (
     "access_token|api_key|apikey|auth|authorization|"
     "cookie|signature|sig|sign|token"
 )
+_RATE_LIMIT_LOCK = threading.Lock()
+_RATE_LIMITED_EVENTS: dict[tuple[str, str, str], float] = {}
 
 
 def sanitize_error(value: object) -> str:
@@ -49,7 +55,7 @@ def sanitize_error(value: object) -> str:
             message = message.replace(home, "<USER_PATH>")
             message = message.replace(home.replace("\\", "/"), "<USER_PATH>")
     except RuntimeError:
-        pass
+        home = ""
     message = re.sub(
         r"(?i)\b[A-Z]:\\Users\\[^\\\s,;]+(?:\\[^\s,;]+)*",
         "<USER_PATH>",
@@ -61,6 +67,38 @@ def sanitize_error(value: object) -> str:
         message,
     )
     return message
+
+
+def log_state_exception(
+    logger: logging.Logger,
+    *,
+    event: str,
+    source: str,
+    error: BaseException,
+    job_id: str = "",
+    interval_seconds: float = 60.0,
+    clock: Callable[[], float] = time.monotonic,
+) -> bool:
+    """结构化且按事件/来源/任务限流记录关键状态读取异常。"""
+    key = (event, source, job_id)
+    now = clock()
+    with _RATE_LIMIT_LOCK:
+        previous = _RATE_LIMITED_EVENTS.get(key)
+        if previous is not None and now - previous < interval_seconds:
+            return False
+        _RATE_LIMITED_EVENTS[key] = now
+    payload = {
+        "event": event,
+        "source": source,
+        "job_id": job_id or None,
+        "error_type": type(error).__name__,
+        "error": sanitize_error(error),
+    }
+    logger.warning(
+        "job_state_health %s",
+        json.dumps(payload, ensure_ascii=False, sort_keys=True),
+    )
+    return True
 
 
 class SecretFilter(logging.Filter):

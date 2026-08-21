@@ -21,7 +21,7 @@ from aicf.file_lock import os_file_lock
 from aicf.logging_utils import sanitize_error
 from aicf.providers.openrouter import OpenRouterHTTPError, UpstreamRateLimitError
 from aicf.production_settings import ProductionSettings
-from aicf.state_machine import PipelineStage
+from aicf.state_machine import FailureKind, PipelineStage
 from aicf.voice_validation import VoiceValidator
 
 
@@ -105,8 +105,6 @@ class Autopilot:
                     wait = _retry_wait_seconds(retry_attempt)
                     print(f"[autopilot] 内容阶段可重试失败，{wait}s 后自动重试 (第{retry_attempt+1}次)", flush=True)
                     self.sleep(wait)
-                    # 重置失败阶段状态以重试
-                    self._reset_failed_stage(job_id)
                     continue
                 return content_result
 
@@ -147,7 +145,6 @@ class Autopilot:
                     failed_name = failed_stage_info.failed_stage.value if failed_stage_info.failed_stage else "未知"
                     print(f"[autopilot] 阶段 {failed_name} 可重试失败，{wait}s 后自动重试 (第{retry_attempt+1}次)", flush=True)
                     self.sleep(wait)
-                    self._reset_failed_stage(job_id)
                     continue
                 # 超过最大重试次数，返回 FAILED_RETRYABLE 让用户手动决定
                 status = self.repository.get_job(job_id)
@@ -176,7 +173,6 @@ class Autopilot:
                     if repair.get("status") == "FAILED_RETRYABLE" and retry_attempt < AUTOPILOT_MAX_RETRIES:
                         wait = _retry_wait_seconds(retry_attempt)
                         self.sleep(wait)
-                        self._reset_failed_stage(job_id)
                         continue
                     return repair
             packaged = self._complete_marker_stage(
@@ -189,7 +185,6 @@ class Autopilot:
                 if packaged.get("status") == "FAILED_RETRYABLE" and retry_attempt < AUTOPILOT_MAX_RETRIES:
                     wait = _retry_wait_seconds(retry_attempt)
                     self.sleep(wait)
-                    self._reset_failed_stage(job_id)
                     continue
                 return packaged
             completed = self._complete_marker_stage(
@@ -203,22 +198,6 @@ class Autopilot:
             return result
         # 理论上不会到这里
         return {"status": "FAILED_RETRYABLE", "reason": "重试耗尽", "recovery_command": f"python -m aicf resume --job {job_id}"}
-
-    def _reset_failed_stage(self, job_id: str) -> None:
-        """重置失败阶段，使其可以重新运行。"""
-        status = self.repository.get_job(job_id)
-        failed = status.failed_stage
-        if failed is None:
-            return
-        # 把失败阶段从 stages 记录中移除，重置到该阶段之前
-        # 使用 reopen 机制
-        try:
-            self.repository.reopen_failed_attention(
-                job_id,
-                recoverable_reason="auto_retry",
-            )
-        except Exception:
-            pass
 
     def _ensure_content(
         self,
@@ -370,11 +349,28 @@ class Autopilot:
             retryable = (
                 is_transient_error or is_runtime_error
             ) and not is_needs_attention and not is_budget_error and not is_credential_error and not is_unknown_submission
+            if isinstance(
+                error,
+                (URLError, TimeoutError, UpstreamRateLimitError),
+            ) or (
+                isinstance(error, OpenRouterHTTPError)
+                and (error.status_code == 429 or error.status_code >= 500)
+            ):
+                failure_kind = FailureKind.TRANSIENT_EXTERNAL
+            elif isinstance(error, OpenRouterHTTPError):
+                failure_kind = FailureKind.PERMANENT_EXTERNAL
+            elif isinstance(error, OSError):
+                failure_kind = FailureKind.LOCAL_ENVIRONMENT
+            elif is_needs_attention:
+                failure_kind = FailureKind.USER_ACTION_REQUIRED
+            else:
+                failure_kind = FailureKind.UNKNOWN
             self.repository.fail_stage(
                 job_id,
                 stage,
                 details,
                 retryable=retryable,
+                failure_kind=failure_kind,
                 recovery_command=recovery,
             )
             return {

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -10,10 +11,19 @@ from types import SimpleNamespace
 import pytest
 
 from aicf.cli import build_m4_asset_runner, main
+from aicf.background_worker import WorkerRecord, write_worker_record
 from aicf.database import JobRepository
-from aicf.logging_utils import configure_logging, sanitize_error
+from aicf.gui import worker_start_command
+from aicf.job_service import ResearchResumeStrategy
+from aicf.logging_utils import (
+    configure_logging,
+    log_state_exception,
+    sanitize_error,
+)
+from aicf.m2_runner import M2ContentRunner
+from aicf.process_identity import get_process_identity
 from aicf.production_settings import ProductionSettings
-from aicf.state_machine import ORDERED_STAGES, PipelineStage
+from aicf.state_machine import FailureKind, ORDERED_STAGES, PipelineStage
 
 
 def test_importing_cli_does_not_replace_process_streams() -> None:
@@ -35,6 +45,33 @@ def test_importing_cli_does_not_replace_process_streams() -> None:
     )
 
     assert completed.returncode == 0, completed.stderr
+
+
+def test_state_exception_logging_is_structured_and_rate_limited() -> None:
+    records: list[tuple[str, str]] = []
+
+    class Logger:
+        def warning(self, message: str, payload: str) -> None:
+            records.append((message, payload))
+
+    times = iter([10.0, 20.0, 80.0])
+    kwargs = {
+        "logger": Logger(),
+        "event": "test_unique_state_failure",
+        "source": "database",
+        "error": OSError("db unavailable"),
+        "job_id": "JOB-1",
+        "clock": lambda: next(times),
+    }
+
+    assert log_state_exception(**kwargs) is True
+    assert log_state_exception(**kwargs) is False
+    assert log_state_exception(**kwargs) is True
+    assert len(records) == 2
+    payload = json.loads(records[0][1])
+    assert payload["event"] == "test_unique_state_failure"
+    assert payload["source"] == "database"
+    assert payload["error_type"] == "OSError"
 
 
 def test_build_m4_runner_initializes_only_selected_jimeng(
@@ -90,18 +127,22 @@ def test_cli_init_job_status_and_resume_use_project_database(
     assert "JOB-中文" in status_output
     assert "尚未开始" in status_output
 
-    class FakeResumeAutopilot:
-        def run(self, job_id: str) -> dict[str, object]:
-            assert job_id == "JOB-中文"
-            return {"status": "READY_TO_PUBLISH"}
+    class FakeLauncher:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
 
-    monkeypatch.setattr(
-        "aicf.cli.build_autopilot",
-        lambda _repository: FakeResumeAutopilot(),
-    )
+        def start(self, job_id: str, _job_dir: Path, **_kwargs: object) -> SimpleNamespace:
+            assert job_id == "JOB-中文"
+            return SimpleNamespace(
+                model_dump_json=lambda **_kwargs: json.dumps(
+                    {"job_id": job_id, "pid": 321, "reused": False}
+                )
+            )
+
+    monkeypatch.setattr("aicf.cli.WorkerLauncher", FakeLauncher)
     assert main(["resume", "--job", "JOB-中文"]) == 0
     resume_output = json.loads(capsys.readouterr().out)
-    assert resume_output["status"] == "READY_TO_PUBLISH"
+    assert resume_output["pid"] == 321
     assert (tmp_path / "data" / "jobs" / "JOB-中文" / "status.json").exists()
     assert not (tmp_path / "outputs" / "JOB-中文" / "status.json").exists()
 
@@ -134,6 +175,145 @@ def test_worker_start_rejects_completed_job_before_launch(
     assert "新任务ID" in result["next_action"]
 
 
+def test_worker_start_rejects_failed_attention_before_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("AICF_PROJECT_ROOT", str(tmp_path))
+    _failed_attention_job(tmp_path, "JOB-ATTENTION-START")
+
+    class FailIfLaunched:
+        def __init__(self, **_kwargs: object) -> None:
+            pytest.fail("未确认重开的任务不应构造 WorkerLauncher")
+
+    monkeypatch.setattr("aicf.cli.WorkerLauncher", FailIfLaunched)
+
+    assert main(["worker-start", "--job", "JOB-ATTENTION-START"]) == 2
+
+    result = json.loads(capsys.readouterr().out)
+    assert result["status"] == "START_REJECTED"
+    assert "人工确认" in result["reason"]
+
+
+def test_worker_start_cannot_bypass_auto_reopen_transition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("AICF_PROJECT_ROOT", str(tmp_path))
+    repo = JobRepository(tmp_path / "data" / "content.db")
+    repo.create_job("JOB-TRANSIENT", tmp_path / "data" / "jobs" / "JOB-TRANSIENT")
+    repo.start_stage("JOB-TRANSIENT", PipelineStage.DIRECTION_LOADED)
+    repo.fail_stage(
+        "JOB-TRANSIENT",
+        PipelineStage.DIRECTION_LOADED,
+        "HTTP 503: service temporarily unavailable",
+        retryable=False,
+    )
+
+    class FailIfLaunched:
+        def __init__(self, **_kwargs: object) -> None:
+            pytest.fail("worker-start 不得绕过自动重开状态转换")
+
+    monkeypatch.setattr("aicf.cli.WorkerLauncher", FailIfLaunched)
+
+    assert main(["worker-start", "--job", "JOB-TRANSIENT"]) == 2
+    result = json.loads(capsys.readouterr().out)
+    assert result["status"] == "START_REJECTED"
+    assert "人工确认" in result["reason"]
+
+
+def test_worker_start_reports_auto_reopen_failure_without_launching(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("AICF_PROJECT_ROOT", str(tmp_path))
+    repo = JobRepository(tmp_path / "data" / "content.db")
+    job_id = "JOB-REOPEN-ERROR"
+    repo.create_job(job_id, tmp_path / "data" / "jobs" / job_id)
+    repo.start_stage(job_id, PipelineStage.DIRECTION_LOADED)
+    repo.complete_stage(job_id, PipelineStage.DIRECTION_LOADED)
+    repo.start_stage(job_id, PipelineStage.DIRECTION_ANALYZED)
+    repo.fail_stage(
+        job_id,
+        PipelineStage.DIRECTION_ANALYZED,
+        "HTTP 503",
+        retryable=False,
+        failure_kind=FailureKind.TRANSIENT_EXTERNAL,
+    )
+
+    def fail_reopen(*_args: object, **_kwargs: object) -> object:
+        raise OSError("snapshot write failed")
+
+    monkeypatch.setattr(JobRepository, "reopen_failed_attention", fail_reopen)
+    monkeypatch.setattr(
+        "aicf.cli.WorkerLauncher",
+        lambda **_kwargs: pytest.fail("重开失败时不得启动Worker"),
+    )
+
+    assert main(["worker-start", "--job", job_id]) == 2
+
+    result = json.loads(capsys.readouterr().out)
+    assert result["status"] == "START_REJECTED"
+    assert "snapshot write failed" in result["reason"]
+
+
+def test_worker_run_returns_cooperative_stop_exit_code(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = SimpleNamespace(
+        get_job=lambda job_id: SimpleNamespace(
+            job_id=job_id,
+            output_dir=str(tmp_path),
+            current_stage=None,
+            failed_stage=None,
+            failure_kind=FailureKind.UNKNOWN,
+            stages={},
+            next_resume_command=f"python -m aicf resume --job {job_id}",
+        )
+    )
+    calls: list[tuple[str, Path]] = []
+
+    def stopped_worker(job_id: str, job_dir: Path, **_kwargs: object) -> int:
+        calls.append((job_id, job_dir))
+        return 130
+
+    monkeypatch.setattr("aicf.cli.repository", lambda: repo)
+    monkeypatch.setattr("aicf.cli.run_worker", stopped_worker)
+
+    assert main(["worker-run", "--job", "JOB-STOP"]) == 130
+    assert calls == [("JOB-STOP", tmp_path)]
+
+
+def test_worker_run_second_authorization_guard_rejects_ungranted_strategy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("AICF_PROJECT_ROOT", str(tmp_path))
+    repo = JobRepository(tmp_path / "data" / "content.db")
+    repo.create_job("JOB-GUARD", tmp_path / "data" / "jobs" / "JOB-GUARD")
+    monkeypatch.setattr(
+        "aicf.cli.run_worker",
+        lambda *_args, **_kwargs: pytest.fail("未授权策略不得进入Worker"),
+    )
+
+    assert main([
+        "worker-run",
+        "--job",
+        "JOB-GUARD",
+        "--research-strategy",
+        "RETRY_SOURCES",
+    ]) == 2
+
+    result = json.loads(capsys.readouterr().out)
+    assert result["status"] == "START_REJECTED"
+    assert "研究策略" in result["reason"]
+
+
 def _failed_attention_job(tmp_path: Path, job_id: str) -> JobRepository:
     repo = JobRepository(tmp_path / "data" / "content.db")
     repo.create_job(job_id, tmp_path / "outputs" / job_id)
@@ -149,6 +329,151 @@ def _failed_attention_job(tmp_path: Path, job_id: str) -> JobRepository:
         ),
     )
     return repo
+
+
+def test_cli_resume_and_worker_start_preserve_research_strategy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("AICF_PROJECT_ROOT", str(tmp_path))
+    repo = JobRepository(tmp_path / "data" / "content.db")
+    repo.create_job("JOB-RESEARCH", tmp_path / "data" / "jobs" / "JOB-RESEARCH")
+    repo.start_stage("JOB-RESEARCH", PipelineStage.DIRECTION_LOADED)
+    repo.complete_stage("JOB-RESEARCH", PipelineStage.DIRECTION_LOADED)
+    repo.start_stage("JOB-RESEARCH", PipelineStage.DIRECTION_ANALYZED)
+    repo.complete_stage("JOB-RESEARCH", PipelineStage.DIRECTION_ANALYZED)
+    repo.start_stage("JOB-RESEARCH", PipelineStage.TOPICS_GENERATED)
+    repo.complete_stage("JOB-RESEARCH", PipelineStage.TOPICS_GENERATED)
+    repo.start_stage("JOB-RESEARCH", PipelineStage.TOPIC_SELECTED)
+    repo.complete_stage("JOB-RESEARCH", PipelineStage.TOPIC_SELECTED)
+    repo.start_stage("JOB-RESEARCH", PipelineStage.RESEARCHED)
+    repo.fail_stage(
+        "JOB-RESEARCH",
+        PipelineStage.RESEARCHED,
+        "资料不足",
+        retryable=True,
+    )
+    captured: list[str] = []
+
+    class FakeLauncher:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def start(
+            self,
+            job_id: str,
+            _job_dir: Path,
+            *,
+            research_strategy: str | None,
+            **_kwargs: object,
+        ) -> SimpleNamespace:
+            assert job_id == "JOB-RESEARCH"
+            captured.append(str(research_strategy))
+            return SimpleNamespace(
+                model_dump_json=lambda **_kwargs: json.dumps(
+                    {"job_id": job_id, "pid": 654, "reused": False}
+                )
+            )
+
+    monkeypatch.setattr("aicf.cli.WorkerLauncher", FakeLauncher)
+
+    assert main([
+        "resume",
+        "--job",
+        "JOB-RESEARCH",
+        "--research-strategy",
+        "RETRY_SOURCES",
+    ]) == 0
+    assert json.loads(capsys.readouterr().out)["pid"] == 654
+    assert captured == ["RETRY_SOURCES"]
+
+
+def test_gui_cli_worker_reaches_m2_with_service_authorized_strategy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AICF_PROJECT_ROOT", str(tmp_path))
+    repo = JobRepository(tmp_path / "data" / "content.db")
+    job_id = "JOB-GUI-CHAIN"
+    job_dir = tmp_path / "data" / "jobs" / job_id
+    repo.create_job(job_id, job_dir)
+    for stage in (
+        PipelineStage.DIRECTION_LOADED,
+        PipelineStage.DIRECTION_ANALYZED,
+        PipelineStage.TOPICS_GENERATED,
+        PipelineStage.TOPIC_SELECTED,
+    ):
+        repo.start_stage(job_id, stage)
+        repo.complete_stage(job_id, stage)
+    repo.start_stage(job_id, PipelineStage.RESEARCHED)
+    repo.fail_stage(
+        job_id,
+        PipelineStage.RESEARCHED,
+        "资料不足",
+        retryable=True,
+    )
+    reached_m2: list[ResearchResumeStrategy | None] = []
+
+    class InlineAutopilot:
+        def __init__(self, strategy: ResearchResumeStrategy | None) -> None:
+            self.runner = M2ContentRunner(
+                SimpleNamespace(),
+                repo,
+                tmp_path / "outputs",
+                source_verifier=object(),
+                source_discovery=SimpleNamespace(),
+                research_strategy=strategy,
+            )
+
+        def run(self, _job_id: str) -> dict[str, str]:
+            reached_m2.append(self.runner.research_strategy)
+            return {"status": "READY_TO_PUBLISH"}
+
+    monkeypatch.setattr(
+        "aicf.cli.build_autopilot",
+        lambda _repo, strategy=None: InlineAutopilot(strategy),
+    )
+    monkeypatch.setattr(
+        "aicf.cli.run_worker",
+        lambda worker_job_id, _job_dir, *, run_autopilot: (
+            0
+            if run_autopilot(worker_job_id)["status"] == "READY_TO_PUBLISH"
+            else 1
+        ),
+    )
+
+    class InlineLauncher:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def start(
+            self,
+            worker_job_id: str,
+            _job_dir: Path,
+            *,
+            project_root: Path,
+            research_strategy: str | None,
+        ) -> SimpleNamespace:
+            assert project_root == tmp_path
+            argv = ["worker-run", "--job", worker_job_id]
+            if research_strategy:
+                argv.extend(["--research-strategy", research_strategy])
+            assert main(argv) == 0
+            return SimpleNamespace(
+                model_dump_json=lambda **_kwargs: json.dumps(
+                    {"job_id": worker_job_id, "status": "STARTED"}
+                )
+            )
+
+    monkeypatch.setattr("aicf.cli.WorkerLauncher", InlineLauncher)
+    gui_command = worker_start_command(
+        job_id,
+        ResearchResumeStrategy.RETRY_SOURCES,
+    )
+
+    assert main(gui_command[3:]) == 0
+    assert reached_m2 == [ResearchResumeStrategy.RETRY_SOURCES]
 
 
 def test_resume_refuses_failed_needs_attention_without_running_autopilot(
@@ -231,13 +556,16 @@ def test_cli_does_not_claim_rebuild_success_when_snapshot_write_fails(
     capsys.readouterr()
 
     def fail_snapshot(
-        _repository: JobRepository,
+        _path: Path,
         _status: object,
-        **_kwargs: object,
-    ) -> bool:
+    ) -> None:
         raise OSError("磁盘已满")
 
-    monkeypatch.setattr(JobRepository, "_write_status", fail_snapshot)
+    monkeypatch.setattr(
+        JobRepository,
+        "_write_status_locked",
+        staticmethod(fail_snapshot),
+    )
 
     assert main(["rebuild-snapshot", "--job", "JOB-REBUILD-FAIL"]) == 1
 
@@ -501,10 +829,166 @@ def test_build_dreamina_adapter_allows_slow_windows_cli_help_probe(
     assert captured["timeout_seconds"] == 30
 
 
-def test_cli_content_run_loads_direction_yaml_and_runs_job(
+def _register_current_content_worker(
     tmp_path: Path,
-    monkeypatch,
-    capsys,
+    monkeypatch: pytest.MonkeyPatch,
+    job_id: str,
+    *,
+    strategy: ResearchResumeStrategy | None = None,
+    identity_offset: int = 0,
+) -> JobRepository:
+    config_dir = tmp_path / "config"
+    config_dir.mkdir(exist_ok=True)
+    config_path = config_dir / "content_direction.yaml"
+    if not config_path.exists():
+        config_path.write_text("direction: 测试方向\n", encoding="utf-8")
+    repo = JobRepository(tmp_path / "data" / "content.db")
+    job_dir = tmp_path / "data" / "jobs" / job_id
+    repo.create_job(job_id, job_dir)
+    identity = get_process_identity(os.getpid())
+    assert identity is not None
+    instance_id = "content-worker-instance"
+    write_worker_record(
+        job_dir,
+        WorkerRecord(
+            job_id=job_id,
+            pid=identity.pid,
+            started_at="2026-08-20T00:00:00+00:00",
+            log_path=str(job_dir / "_work" / "runtime" / "worker.log"),
+            instance_id=instance_id,
+            process_created_at_ns=identity.created_at_ns + identity_offset,
+            process_executable=identity.executable,
+            research_strategy=strategy.value if strategy else None,
+            ready=True,
+        ),
+    )
+    monkeypatch.setenv("AICF_PROJECT_ROOT", str(tmp_path))
+    monkeypatch.setenv("AICF_WORKER_LAUNCHED", "1")
+    monkeypatch.setenv("AICF_WORKER_INSTANCE_ID", instance_id)
+    return repo
+
+
+def test_cli_content_run_rejects_external_direct_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("AICF_PROJECT_ROOT", str(tmp_path))
+    monkeypatch.delenv("AICF_WORKER_LAUNCHED", raising=False)
+    monkeypatch.delenv("AICF_WORKER_INSTANCE_ID", raising=False)
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "content_direction.yaml").write_text(
+        "direction: 测试方向\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "aicf.cli.build_m2_runner",
+        lambda *_args, **_kwargs: pytest.fail("外部直跑不得构造M2 Runner"),
+    )
+
+    assert main(["content-run", "--job", "M2-DIRECT"]) == 2
+
+    result = json.loads(capsys.readouterr().out)
+    assert result["status"] == "START_REJECTED"
+    assert "WorkerLauncher" in result["reason"]
+
+
+def test_cli_content_run_rejects_worker_record_identity_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _register_current_content_worker(
+        tmp_path,
+        monkeypatch,
+        "M2-IDENTITY",
+        identity_offset=1,
+    )
+    monkeypatch.setattr(
+        "aicf.cli.build_m2_runner",
+        lambda *_args, **_kwargs: pytest.fail("身份不匹配不得构造M2 Runner"),
+    )
+
+    assert main(["content-run", "--job", "M2-IDENTITY"]) == 2
+
+    result = json.loads(capsys.readouterr().out)
+    assert result["status"] == "START_REJECTED"
+    assert "进程身份" in result["reason"]
+
+
+def test_cli_content_run_requires_recorded_research_strategy_consistency(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repo = _register_current_content_worker(
+        tmp_path,
+        monkeypatch,
+        "M2-STRATEGY-MISMATCH",
+        strategy=ResearchResumeStrategy.INTERNAL_KNOWLEDGE,
+    )
+    for stage in ORDERED_STAGES:
+        repo.start_stage("M2-STRATEGY-MISMATCH", stage)
+        if stage == PipelineStage.RESEARCHED:
+            break
+        repo.complete_stage("M2-STRATEGY-MISMATCH", stage)
+    repo.fail_stage(
+        "M2-STRATEGY-MISMATCH",
+        PipelineStage.RESEARCHED,
+        "资料不足",
+        retryable=True,
+    )
+    monkeypatch.setattr(
+        "aicf.cli.build_m2_runner",
+        lambda *_args, **_kwargs: pytest.fail("策略不一致不得构造M2 Runner"),
+    )
+
+    assert main([
+        "content-run",
+        "--job",
+        "M2-STRATEGY-MISMATCH",
+        "--research-strategy",
+        ResearchResumeStrategy.RETRY_SOURCES.value,
+    ]) == 2
+
+    result = json.loads(capsys.readouterr().out)
+    assert result["status"] == "START_REJECTED"
+    assert "研究策略" in result["reason"]
+
+
+def test_cli_content_run_requires_job_service_second_authorization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repo = _register_current_content_worker(
+        tmp_path,
+        monkeypatch,
+        "M2-SERVICE-GUARD",
+    )
+    repo.start_stage("M2-SERVICE-GUARD", PipelineStage.DIRECTION_LOADED)
+    repo.fail_stage(
+        "M2-SERVICE-GUARD",
+        PipelineStage.DIRECTION_LOADED,
+        "需要人工修复",
+        retryable=False,
+    )
+    monkeypatch.setattr(
+        "aicf.cli.build_m2_runner",
+        lambda *_args, **_kwargs: pytest.fail("服务层拒绝后不得构造M2 Runner"),
+    )
+
+    assert main(["content-run", "--job", "M2-SERVICE-GUARD"]) == 2
+
+    result = json.loads(capsys.readouterr().out)
+    assert result["status"] == "START_REJECTED"
+    assert "人工确认" in result["reason"]
+
+
+def test_cli_content_run_loads_direction_yaml_and_runs_authorized_job(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     config_dir = tmp_path / "config"
     config_dir.mkdir()
@@ -520,48 +1004,89 @@ def test_cli_content_run_loads_direction_yaml_and_runs_job(
             captured["direction"] = config.direction
             return {"status": "ready_to_publish", "topic_id": "T001"}
 
-    monkeypatch.setenv("AICF_PROJECT_ROOT", str(tmp_path))
+    repo = _register_current_content_worker(
+        tmp_path,
+        monkeypatch,
+        "M2CLI001",
+    )
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-secret")
-    monkeypatch.setattr("aicf.cli.build_m2_runner", lambda: FakeRunner())
+    monkeypatch.setattr(
+        "aicf.cli.build_m2_runner",
+        lambda job_repository, research_strategy: (
+            captured.update(
+                repository=job_repository,
+                research_strategy=research_strategy,
+            )
+            or FakeRunner()
+        ),
+    )
 
     exit_code = main(["content-run", "--job", "M2CLI001"])
 
     assert exit_code == 0
+    authorized_repository = captured.pop("repository")
+    assert isinstance(authorized_repository, JobRepository)
+    assert authorized_repository.get_job("M2CLI001").job_id == "M2CLI001"
     assert captured == {
         "job_id": "M2CLI001",
         "direction": "从 YAML 读取的方向",
+        "research_strategy": None,
     }
     output = json.loads(capsys.readouterr().out)
     assert output["status"] == "ready_to_publish"
 
 
-def test_cli_autopilot_creates_new_job_and_runs_full_orchestrator(
+def test_cli_autopilot_compatibility_command_starts_worker_through_service(
     tmp_path: Path,
     monkeypatch,
     capsys,
 ) -> None:
     monkeypatch.setenv("AICF_PROJECT_ROOT", str(tmp_path))
-    calls: list[str] = []
+    calls: list[tuple[str, Path, Path, str | None]] = []
 
-    class FakeAutopilot:
-        def run(self, job_id: str) -> dict[str, object]:
-            calls.append(job_id)
-            return {"status": "READY_TO_PUBLISH"}
+    class FakeLauncher:
+        def __init__(self, **kwargs: object) -> None:
+            assert callable(kwargs["launch_guard"])
 
+        def start(
+            self,
+            job_id: str,
+            job_dir: Path,
+            *,
+            project_root: Path,
+            research_strategy: str | None,
+        ) -> SimpleNamespace:
+            calls.append((job_id, job_dir, project_root, research_strategy))
+            return SimpleNamespace(
+                model_dump_json=lambda **_kwargs: json.dumps(
+                    {"job_id": job_id, "pid": 123, "reused": False}
+                )
+            )
+
+    monkeypatch.setattr("aicf.cli.WorkerLauncher", FakeLauncher)
     monkeypatch.setattr(
         "aicf.cli.build_autopilot",
-        lambda _repository: FakeAutopilot(),
+        lambda *_args, **_kwargs: pytest.fail(
+            "兼容命令不得在CLI进程中假运行Autopilot"
+        ),
     )
 
     assert main(["autopilot", "--job", "CLI-FULL-001"]) == 0
 
-    assert calls == ["CLI-FULL-001"]
+    assert calls == [
+        (
+            "CLI-FULL-001",
+            tmp_path / "data" / "jobs" / "CLI-FULL-001",
+            tmp_path,
+            None,
+        )
+    ]
     repo = JobRepository(tmp_path / "data" / "content.db")
     assert repo.get_job("CLI-FULL-001").job_id == "CLI-FULL-001"
-    assert json.loads(capsys.readouterr().out)["status"] == "READY_TO_PUBLISH"
+    assert json.loads(capsys.readouterr().out)["pid"] == 123
 
 
-def test_cli_resume_calls_real_autopilot_handlers(
+def test_cli_resume_compatibility_command_starts_worker_through_service(
     tmp_path: Path,
     monkeypatch,
     capsys,
@@ -573,17 +1098,117 @@ def test_cli_resume_calls_real_autopilot_handlers(
     )
     calls: list[str] = []
 
-    class FakeAutopilot:
-        def run(self, job_id: str) -> dict[str, object]:
-            calls.append(job_id)
-            return {"status": "READY_TO_PUBLISH"}
+    class FakeLauncher:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
 
+        def start(
+            self,
+            job_id: str,
+            _job_dir: Path,
+            **_kwargs: object,
+        ) -> SimpleNamespace:
+            calls.append(job_id)
+            return SimpleNamespace(
+                model_dump_json=lambda **_kwargs: json.dumps(
+                    {"job_id": job_id, "pid": 456, "reused": False}
+                )
+            )
+
+    monkeypatch.setattr("aicf.cli.WorkerLauncher", FakeLauncher)
     monkeypatch.setattr(
         "aicf.cli.build_autopilot",
-        lambda _repository: FakeAutopilot(),
+        lambda *_args, **_kwargs: pytest.fail(
+            "resume不得在CLI进程中直接运行Autopilot"
+        ),
     )
 
     assert main(["resume", "--job", "CLI-RESUME-001"]) == 0
 
     assert calls == ["CLI-RESUME-001"]
-    assert json.loads(capsys.readouterr().out)["status"] == "READY_TO_PUBLISH"
+    assert json.loads(capsys.readouterr().out)["pid"] == 456
+
+
+def test_cli_retry_rejects_mismatched_stage_without_mutating_or_launching(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("AICF_PROJECT_ROOT", str(tmp_path))
+    repo = JobRepository(tmp_path / "data" / "content.db")
+    job_id = "CLI-RETRY-MISMATCH"
+    repo.create_job(job_id, tmp_path / "data" / "jobs" / job_id)
+    repo.start_stage(job_id, PipelineStage.DIRECTION_LOADED)
+    repo.fail_stage(
+        job_id,
+        PipelineStage.DIRECTION_LOADED,
+        "temporary",
+        retryable=True,
+    )
+    monkeypatch.setattr(
+        "aicf.cli.WorkerLauncher",
+        lambda **_kwargs: pytest.fail("阶段不匹配时不得启动Worker"),
+    )
+
+    assert main([
+        "retry",
+        "--job",
+        job_id,
+        "--stage",
+        PipelineStage.RENDERED.value,
+    ]) == 2
+
+    persisted = repo.get_job(job_id)
+    assert persisted.current_stage == PipelineStage.FAILED_RETRYABLE
+    assert persisted.failed_stage == PipelineStage.DIRECTION_LOADED
+    result = json.loads(capsys.readouterr().out)
+    assert result["status"] == "START_REJECTED"
+    assert PipelineStage.RENDERED.value in result["reason"]
+    assert PipelineStage.DIRECTION_LOADED.value in result["reason"]
+
+
+def test_cli_retry_matching_stage_launches_before_any_state_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("AICF_PROJECT_ROOT", str(tmp_path))
+    repo = JobRepository(tmp_path / "data" / "content.db")
+    job_id = "CLI-RETRY-MATCH"
+    repo.create_job(job_id, tmp_path / "data" / "jobs" / job_id)
+    repo.start_stage(job_id, PipelineStage.DIRECTION_LOADED)
+    repo.fail_stage(
+        job_id,
+        PipelineStage.DIRECTION_LOADED,
+        "temporary",
+        retryable=True,
+    )
+    observed: list[tuple[PipelineStage, PipelineStage | None]] = []
+
+    class FakeLauncher:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def start(self, job_id: str, _job_dir: Path, **_kwargs: object) -> SimpleNamespace:
+            current = repo.get_job(job_id)
+            observed.append((current.current_stage, current.failed_stage))
+            return SimpleNamespace(
+                model_dump_json=lambda **_kwargs: json.dumps(
+                    {"job_id": job_id, "pid": 789, "reused": False}
+                )
+            )
+
+    monkeypatch.setattr("aicf.cli.WorkerLauncher", FakeLauncher)
+
+    assert main([
+        "retry",
+        "--job",
+        job_id,
+        "--stage",
+        PipelineStage.DIRECTION_LOADED.value,
+    ]) == 0
+
+    assert observed == [
+        (PipelineStage.FAILED_RETRYABLE, PipelineStage.DIRECTION_LOADED)
+    ]
+    assert json.loads(capsys.readouterr().out)["pid"] == 789

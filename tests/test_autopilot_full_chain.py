@@ -774,6 +774,37 @@ def test_failure_is_recorded_against_actual_stage(tmp_path: Path) -> None:
     assert repository.get_job("FAKE001").current_stage == PipelineStage.COMPLETED
 
 
+def test_internal_retry_uses_failed_stage_without_direct_reopen(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository, autopilot, dependencies = _autopilot(tmp_path)
+    renderer = dependencies["renderer"]
+    original_render = renderer.render_and_validate
+    attempts = 0
+
+    def fail_once(**kwargs: object) -> object:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("temporary encoder failure")
+        return original_render(**kwargs)
+
+    renderer.render_and_validate = fail_once
+    reopen_calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        repository,
+        "reopen_failed_attention",
+        lambda *args, **kwargs: reopen_calls.append((args, kwargs)),
+    )
+
+    result = autopilot.run("FAKE001")
+
+    assert result["status"] == "READY_TO_PUBLISH"
+    assert attempts == 2
+    assert reopen_calls == []
+
+
 def test_autopilot_sanitizes_persisted_and_returned_failure_reason(
     tmp_path: Path,
 ) -> None:
